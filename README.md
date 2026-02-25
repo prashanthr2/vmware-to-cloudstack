@@ -11,7 +11,48 @@ The migration process is designed to achieve near-zero downtime by:
 * A brief final sync during a controlled cutover.
 * Automated Guest OS conversion (virt-v2v).
 * Seamless import into the CloudStack environment.
-
+```text
+┌──────────────────────────┐
+│ VMware vCenter / ESXi    │
+│                          │
+│  VM (Running)            │
+│  ├─ Disk(s)              │
+│  └─ CBT + Snapshots      │
+└───────────┬──────────────┘
+            │
+            │  Base sync + CBT deltas
+            ▼
+┌──────────────────────────┐
+│ Migration Engine (Python)│
+│  (Runs on KVM Host)      │
+│                          │
+│  ├─ Auto-discover disks  │
+│  ├─ Base RAW export      │
+│  ├─ Incremental CBT sync │
+│  └─ Final CBT sync       │
+└───────────┬──────────────┘
+            │
+            │  RAW disks (bit-accurate)
+            ▼
+┌──────────────────────────┐
+│ virt-v2v (Finalizer)     │
+│                          │
+│  ├─ RAW → QCOW2          │
+│  ├─ Inject virtio drivers│
+│  ├─ Fix bootloader       │
+│  └─ Remove VMware tools  │
+└───────────┬──────────────┘
+            │
+            │  QCOW2 disks
+            ▼
+┌──────────────────────────┐
+│ CloudStack (via cmk)     │
+│                          │
+│  ├─ Import volumes       │
+│  ├─ Deploy VM            │
+│  └─ Attach networks      │
+└──────────────────────────┘
+```
 ---
 
 ## Key Features
