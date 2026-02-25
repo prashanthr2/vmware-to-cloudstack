@@ -13,6 +13,7 @@ class MigrationMetadata:
             "base_snapshot": None,
             "applied_snapshots": [],
             "firmware": None
+             "disk_count": 0  
         }
 
     def save(self):
