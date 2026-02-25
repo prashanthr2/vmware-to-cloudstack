@@ -11,16 +11,20 @@ class CBTManager:
             task = self.vm.ReconfigVM_Task(spec)
             while task.info.state not in ["success", "error"]:
                 pass
+            if task.info.state == "error":
+                raise Exception(task.info.error)
 
-    def get_changes(self, snapshot):
-        changes = []
-        for dev in self.vm.config.hardware.device:
-            if isinstance(dev, vim.vm.device.VirtualDisk):
-                res = self.vm.QueryChangedDiskAreas(
-                    snapshot=snapshot,
-                    deviceKey=dev.key,
-                    startOffset=0
-                )
-                for a in res.changedArea:
-                    changes.append({"offset": a.start, "length": a.length})
-        return changes
+    def get_changes(self, snapshot, device_key):
+        """
+        Returns list of changed blocks for a specific disk
+        """
+        res = self.vm.QueryChangedDiskAreas(
+            snapshot=snapshot,
+            deviceKey=device_key,
+            startOffset=0
+        )
+
+        return [
+            {"offset": a.start, "length": a.length}
+            for a in res.changedArea
+        ]
