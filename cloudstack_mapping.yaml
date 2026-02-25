@@ -1,0 +1,13 @@
+vm:
+  name: win2019-migrated
+  zone: zone-id
+  service_offering: offering-id
+  os_type: os-id
+
+networks:
+  - Prod-Network
+
+disks:
+  - name: root
+    path: /data/app01/final/disk0.qcow2
+    disk_offering: disk-offering-id
