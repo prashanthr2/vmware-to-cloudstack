@@ -4,6 +4,7 @@ import base64
 import hashlib
 import hmac
 import os
+from typing import Optional
 from urllib.parse import quote_plus
 
 import requests
@@ -23,7 +24,7 @@ class CloudStackClient:
         self.timeout_seconds = timeout_seconds
 
     @classmethod
-    def from_sources(cls, config: dict | None = None) -> "CloudStackClient":
+    def from_sources(cls, config: Optional[dict] = None) -> "CloudStackClient":
         cfg = (config or {}).get("cloudstack", {})
 
         endpoint = os.getenv("CLOUDSTACK_ENDPOINT", cfg.get("endpoint", ""))

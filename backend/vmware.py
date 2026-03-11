@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import ssl
 from collections.abc import Generator
+from typing import Optional
 
 try:
     from pyVim.connect import Disconnect, SmartConnect
@@ -13,7 +14,7 @@ except ImportError:  # pragma: no cover - handled at runtime
     vim = None
 
 
-def _parse_bool(raw: str | None, default: bool) -> bool:
+def _parse_bool(raw: Optional[str], default: bool) -> bool:
     if raw is None:
         return default
     return raw.strip().lower() in {"1", "true", "yes", "on"}
@@ -35,7 +36,7 @@ class VMwareClient:
         self.verify_ssl = verify_ssl
 
     @classmethod
-    def from_sources(cls, config: dict | None = None) -> "VMwareClient":
+    def from_sources(cls, config: Optional[dict] = None) -> "VMwareClient":
         cfg = (config or {}).get("vcenter", {})
 
         host = os.getenv("VMWARE_HOST", cfg.get("host", ""))

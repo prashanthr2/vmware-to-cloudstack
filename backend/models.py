@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any
+from typing import Any, Optional, Union
 
 from pydantic import BaseModel, Field
 
@@ -9,7 +9,7 @@ from pydantic import BaseModel, Field
 class VMwareDiskInfo(BaseModel):
     label: str
     size_gb: float
-    datastore: str | None = None
+    datastore: Optional[str] = None
 
 
 class VMwareVMInfo(BaseModel):
@@ -44,7 +44,7 @@ class MigrationSpecResponse(BaseModel):
 
 class MigrationStartRequest(BaseModel):
     vm_name: str
-    spec_file: str | None = None
+    spec_file: Optional[str] = None
 
 
 class MigrationStartResponse(BaseModel):
@@ -56,9 +56,9 @@ class MigrationStartResponse(BaseModel):
 
 class MigrationStatusResponse(BaseModel):
     vm_name: str
-    stage: str | None = None
-    progress: float | int | None = None
+    stage: Optional[str] = None
+    progress: Optional[Union[float, int]] = None
     disks: dict[str, Any] = Field(default_factory=dict)
-    job_id: str | None = None
-    job_status: str | None = None
-    updated_at: datetime | None = None
+    job_id: Optional[str] = None
+    job_status: Optional[str] = None
+    updated_at: Optional[datetime] = None

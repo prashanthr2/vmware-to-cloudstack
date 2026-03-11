@@ -10,6 +10,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Optional, Union
 from uuid import uuid4
 
 import yaml
@@ -24,19 +25,19 @@ class MigrationJob:
     spec_file: str
     status: str
     started_at: datetime
-    finished_at: datetime | None = None
-    return_code: int | None = None
-    error: str | None = None
+    finished_at: Optional[datetime] = None
+    return_code: Optional[int] = None
+    error: Optional[str] = None
 
 
 class MigrationManager:
     def __init__(
         self,
-        base_dir: str | Path,
-        specs_dir: str | Path,
+        base_dir: Union[str, Path],
+        specs_dir: Union[str, Path],
         python_cmd: str,
         migrate_script: str,
-        command_cwd: str | Path,
+        command_cwd: Union[str, Path],
         max_workers: int,
     ) -> None:
         self.base_dir = Path(base_dir)
@@ -53,7 +54,7 @@ class MigrationManager:
         self._jobs_by_vm: dict[str, list[str]] = {}
 
     @classmethod
-    def from_sources(cls, config: dict | None = None) -> "MigrationManager":
+    def from_sources(cls, config: Optional[dict] = None) -> "MigrationManager":
         migration_cfg = (config or {}).get("migration", {})
 
         default_base_dir = migration_cfg.get("control_dir", "/var/lib/vm-migrator")
@@ -98,7 +99,7 @@ class MigrationManager:
 
         return candidates[0]
 
-    def _resolve_spec_file(self, vm_name: str, spec_file: str | None) -> Path:
+    def _resolve_spec_file(self, vm_name: str, spec_file: Optional[str]) -> Path:
         if not spec_file:
             return self._latest_spec_for_vm(vm_name)
 
@@ -112,7 +113,7 @@ class MigrationManager:
 
         raise FileNotFoundError(f"Spec file not found: {spec_file}")
 
-    def _validated_state_path(self, vm_name: str) -> Path | None:
+    def _validated_state_path(self, vm_name: str) -> Optional[Path]:
         candidates = [self.base_dir / vm_name / "state.json", self.base_dir / self._safe_vm_name(vm_name) / "state.json"]
         base_resolved = self.base_dir.resolve()
 
@@ -160,7 +161,7 @@ class MigrationManager:
 
         return spec_path
 
-    def start_migration(self, vm_name: str, spec_file: str | None = None) -> MigrationJob:
+    def start_migration(self, vm_name: str, spec_file: Optional[str] = None) -> MigrationJob:
         resolved_spec = self._resolve_spec_file(vm_name, spec_file)
 
         job_id = str(uuid4())
@@ -223,14 +224,14 @@ class MigrationManager:
                 job.status = "failed"
                 job.error = str(exc)
 
-    def _latest_job_for_vm(self, vm_name: str) -> MigrationJob | None:
+    def _latest_job_for_vm(self, vm_name: str) -> Optional[MigrationJob]:
         with self._lock:
             ids = self._jobs_by_vm.get(vm_name, [])
             if not ids:
                 return None
             return self._jobs[ids[-1]]
 
-    def get_status(self, vm_name: str) -> dict | None:
+    def get_status(self, vm_name: str) -> Optional[dict]:
         state_path = self._validated_state_path(vm_name)
 
         state_data: dict = {}
