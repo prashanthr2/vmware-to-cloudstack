@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -85,10 +86,24 @@ class MigrationManager:
     def _safe_vm_name(vm_name: str) -> str:
         return re.sub(r"[^A-Za-z0-9._-]", "_", vm_name)
 
+    def _vm_dir(self, vm_name: str) -> Path:
+        return self.base_dir / self._safe_vm_name(vm_name)
+
+    def _vm_spec_dir(self, vm_name: str) -> Path:
+        return self._vm_dir(vm_name) / "specs"
+
     def _latest_spec_for_vm(self, vm_name: str) -> Path:
         safe_name = self._safe_vm_name(vm_name)
+
+        vm_specs_dir = self._vm_spec_dir(vm_name)
+        if vm_specs_dir.exists():
+            vm_candidates = sorted(vm_specs_dir.glob("*.yaml"), key=lambda p: p.stat().st_mtime, reverse=True)
+            if vm_candidates:
+                return vm_candidates[0]
+
+        # Backward compatibility: also look in legacy global specs folder.
         if not self.specs_dir.exists():
-            raise FileNotFoundError(f"Spec directory does not exist: {self.specs_dir}")
+            raise FileNotFoundError(f"No spec file found for VM '{vm_name}'.")
 
         candidates = sorted(self.specs_dir.glob(f"{safe_name}-*.yaml"), key=lambda p: p.stat().st_mtime, reverse=True)
         if not candidates:
@@ -110,6 +125,14 @@ class MigrationManager:
         candidate = self.specs_dir / spec_file
         if candidate.exists():
             return candidate
+
+        vm_candidate = self._vm_spec_dir(vm_name) / spec_file
+        if vm_candidate.exists():
+            return vm_candidate
+
+        vm_root_candidate = self._vm_dir(vm_name) / spec_file
+        if vm_root_candidate.exists():
+            return vm_root_candidate
 
         raise FileNotFoundError(f"Spec file not found: {spec_file}")
 
@@ -138,7 +161,9 @@ class MigrationManager:
         return None
 
     def generate_spec(self, request: MigrationSpecRequest) -> Path:
-        self.specs_dir.mkdir(parents=True, exist_ok=True)
+        vm_dir = self._vm_dir(request.vm_name)
+        vm_specs_dir = self._vm_spec_dir(request.vm_name)
+        vm_specs_dir.mkdir(parents=True, exist_ok=True)
 
         migration_block = request.migration.model_dump(exclude_none=True)
 
@@ -164,11 +189,13 @@ class MigrationManager:
         }
 
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
-        safe_name = self._safe_vm_name(request.vm_name)
-        spec_path = self.specs_dir / f"{safe_name}-{timestamp}.yaml"
+        spec_path = vm_specs_dir / f"{timestamp}.yaml"
 
         with spec_path.open("w", encoding="utf-8") as stream:
             yaml.safe_dump(spec_payload, stream, sort_keys=False)
+
+        latest_path = vm_dir / "spec.latest.yaml"
+        shutil.copyfile(spec_path, latest_path)
 
         return spec_path
 
@@ -196,7 +223,7 @@ class MigrationManager:
             job = self._jobs[job_id]
             job.status = "running"
 
-        vm_dir = self.base_dir / self._safe_vm_name(job.vm_name)
+        vm_dir = self._vm_dir(job.vm_name)
         vm_dir.mkdir(parents=True, exist_ok=True)
 
         stdout_path = vm_dir / f"{job.job_id}.stdout.log"
