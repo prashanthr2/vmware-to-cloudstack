@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import os
 import re
-import shutil
 import subprocess
 import sys
 import threading
@@ -86,33 +85,64 @@ class MigrationManager:
     def _safe_vm_name(vm_name: str) -> str:
         return re.sub(r"[^A-Za-z0-9._-]", "_", vm_name)
 
-    def _vm_dir(self, vm_name: str) -> Path:
-        return self.base_dir / self._safe_vm_name(vm_name)
+    def _candidate_vm_dirs(self, vm_name: str) -> list[Path]:
+        safe_name = self._safe_vm_name(vm_name)
+        dirs: list[Path] = []
 
-    def _vm_spec_dir(self, vm_name: str) -> Path:
-        return self._vm_dir(vm_name) / "specs"
+        pattern_dirs = list(self.base_dir.glob(f"{safe_name}_*"))
+        if vm_name != safe_name:
+            pattern_dirs.extend(self.base_dir.glob(f"{vm_name}_*"))
+
+        pattern_dirs = [d for d in pattern_dirs if d.is_dir()]
+        pattern_dirs.sort(key=lambda d: d.stat().st_mtime, reverse=True)
+
+        for item in pattern_dirs:
+            if item not in dirs:
+                dirs.append(item)
+
+        primary = self.base_dir / safe_name
+        if primary.exists() and primary.is_dir() and primary not in dirs:
+            dirs.append(primary)
+
+        if vm_name != safe_name:
+            raw = self.base_dir / vm_name
+            if raw.exists() and raw.is_dir() and raw not in dirs:
+                dirs.append(raw)
+
+        return dirs
 
     def _latest_spec_for_vm(self, vm_name: str) -> Path:
+        for vm_dir in self._candidate_vm_dirs(vm_name):
+            direct_spec = vm_dir / "spec.yaml"
+            if direct_spec.exists():
+                return direct_spec
+
+            latest_spec = vm_dir / "spec.latest.yaml"
+            if latest_spec.exists():
+                return latest_spec
+
+            specs_subdir = vm_dir / "specs"
+            if specs_subdir.exists() and specs_subdir.is_dir():
+                candidates = sorted(specs_subdir.glob("*.yaml"), key=lambda p: p.stat().st_mtime, reverse=True)
+                if candidates:
+                    return candidates[0]
+
+            root_candidates = sorted(vm_dir.glob("*.yaml"), key=lambda p: p.stat().st_mtime, reverse=True)
+            if root_candidates:
+                return root_candidates[0]
+
+        # Backward compatibility for old global specs directory.
         safe_name = self._safe_vm_name(vm_name)
+        if self.specs_dir.exists():
+            legacy = sorted(self.specs_dir.glob(f"{safe_name}-*.yaml"), key=lambda p: p.stat().st_mtime, reverse=True)
+            if legacy:
+                return legacy[0]
 
-        vm_specs_dir = self._vm_spec_dir(vm_name)
-        if vm_specs_dir.exists():
-            vm_candidates = sorted(vm_specs_dir.glob("*.yaml"), key=lambda p: p.stat().st_mtime, reverse=True)
-            if vm_candidates:
-                return vm_candidates[0]
-
-        # Backward compatibility: also look in legacy global specs folder.
-        if not self.specs_dir.exists():
-            raise FileNotFoundError(f"No spec file found for VM '{vm_name}'.")
-
-        candidates = sorted(self.specs_dir.glob(f"{safe_name}-*.yaml"), key=lambda p: p.stat().st_mtime, reverse=True)
-        if not candidates:
             direct = self.specs_dir / f"{safe_name}.yaml"
             if direct.exists():
                 return direct
-            raise FileNotFoundError(f"No spec file found for VM '{vm_name}'.")
 
-        return candidates[0]
+        raise FileNotFoundError(f"No spec file found for VM '{vm_name}'.")
 
     def _resolve_spec_file(self, vm_name: str, spec_file: Optional[str]) -> Path:
         if not spec_file:
@@ -126,28 +156,20 @@ class MigrationManager:
         if candidate.exists():
             return candidate
 
-        vm_candidate = self._vm_spec_dir(vm_name) / spec_file
-        if vm_candidate.exists():
-            return vm_candidate
+        for vm_dir in self._candidate_vm_dirs(vm_name):
+            vm_candidate = vm_dir / spec_file
+            if vm_candidate.exists():
+                return vm_candidate
 
-        vm_root_candidate = self._vm_dir(vm_name) / spec_file
-        if vm_root_candidate.exists():
-            return vm_root_candidate
+            vm_specs_candidate = vm_dir / "specs" / spec_file
+            if vm_specs_candidate.exists():
+                return vm_specs_candidate
 
         raise FileNotFoundError(f"Spec file not found: {spec_file}")
 
     def _validated_state_path(self, vm_name: str) -> Optional[Path]:
-        safe_name = self._safe_vm_name(vm_name)
         base_resolved = self.base_dir.resolve()
-
-        candidates = [
-            self.base_dir / vm_name / "state.json",
-            self.base_dir / safe_name / "state.json",
-        ]
-
-        for pattern in (f"{vm_name}_*", f"{safe_name}_*"):
-            for vm_dir in self.base_dir.glob(pattern):
-                candidates.append(vm_dir / "state.json")
+        candidates = [vm_dir / "state.json" for vm_dir in self._candidate_vm_dirs(vm_name)]
 
         for candidate in candidates:
             resolved = candidate.resolve()
@@ -160,10 +182,31 @@ class MigrationManager:
 
         return None
 
-    def generate_spec(self, request: MigrationSpecRequest) -> Path:
-        vm_dir = self._vm_dir(request.vm_name)
-        vm_specs_dir = self._vm_spec_dir(request.vm_name)
-        vm_specs_dir.mkdir(parents=True, exist_ok=True)
+    def _job_runtime_dir(self, vm_name: str, spec_file: str) -> Path:
+        spec_path = Path(spec_file)
+        try:
+            resolved_spec = spec_path.resolve()
+            base_resolved = self.base_dir.resolve()
+            rel = resolved_spec.relative_to(base_resolved)
+
+            if len(rel.parts) >= 2 and rel.parts[1] == "specs":
+                return base_resolved / rel.parts[0]
+
+            if len(rel.parts) >= 2:
+                return base_resolved / rel.parts[0]
+        except Exception:
+            pass
+
+        dirs = self._candidate_vm_dirs(vm_name)
+        if dirs:
+            return dirs[0]
+
+        return self.base_dir / self._safe_vm_name(vm_name)
+
+    def generate_spec(self, request: MigrationSpecRequest, control_dir_name: Optional[str] = None) -> Path:
+        dir_name = control_dir_name or self._safe_vm_name(request.vm_name)
+        vm_dir = self.base_dir / dir_name
+        vm_dir.mkdir(parents=True, exist_ok=True)
 
         migration_block = request.migration.model_dump(exclude_none=True)
 
@@ -188,14 +231,9 @@ class MigrationManager:
             },
         }
 
-        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
-        spec_path = vm_specs_dir / f"{timestamp}.yaml"
-
+        spec_path = vm_dir / "spec.yaml"
         with spec_path.open("w", encoding="utf-8") as stream:
             yaml.safe_dump(spec_payload, stream, sort_keys=False)
-
-        latest_path = vm_dir / "spec.latest.yaml"
-        shutil.copyfile(spec_path, latest_path)
 
         return spec_path
 
@@ -223,7 +261,7 @@ class MigrationManager:
             job = self._jobs[job_id]
             job.status = "running"
 
-        vm_dir = self._vm_dir(job.vm_name)
+        vm_dir = self._job_runtime_dir(job.vm_name, job.spec_file)
         vm_dir.mkdir(parents=True, exist_ok=True)
 
         stdout_path = vm_dir / f"{job.job_id}.stdout.log"
@@ -300,3 +338,4 @@ class MigrationManager:
             "return_code": job.return_code if job else None,
             "updated_at": datetime.now(timezone.utc),
         }
+

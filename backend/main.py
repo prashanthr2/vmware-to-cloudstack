@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -21,7 +22,7 @@ from .models import (
 )
 from .vmware import VMwareClient
 
-app = FastAPI(title="VMware to CloudStack Migration Backend", version="1.1.0")
+app = FastAPI(title="VMware to CloudStack Migration Backend", version="1.2.0")
 
 
 def _load_runtime_config() -> dict[str, Any]:
@@ -37,6 +38,50 @@ def _load_runtime_config() -> dict[str, Any]:
             return data
     except Exception as exc:
         raise RuntimeError(f"Failed to read config file '{config_path}': {exc}") from exc
+
+
+def _safe_vm_name(vm_name: str) -> str:
+    return re.sub(r"[^A-Za-z0-9._-]", "_", vm_name)
+
+
+def _resolve_vm_control_dir(payload: MigrationSpecRequest) -> str:
+    safe_name = _safe_vm_name(payload.vm_name)
+
+    if payload.vm_moref:
+        return f"{safe_name}_{payload.vm_moref}"
+
+    try:
+        vm_list = vmware_client.list_vms()
+    except Exception as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Unable to resolve VM MoRef automatically. Provide vm_moref in the request "
+                f"or fix VMware connectivity. Error: {exc}"
+            ),
+        ) from exc
+
+    matches = [vm for vm in vm_list if vm.get("name") == payload.vm_name]
+    if not matches:
+        raise HTTPException(status_code=404, detail=f"VM '{payload.vm_name}' not found in VMware.")
+
+    if len(matches) > 1:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Multiple VMware VMs named '{payload.vm_name}' found. "
+                "Please pass vm_moref in /migration/spec request."
+            ),
+        )
+
+    moref = matches[0].get("moref")
+    if not moref:
+        raise HTTPException(
+            status_code=400,
+            detail=f"VM '{payload.vm_name}' is missing MoRef in VMware response. Pass vm_moref explicitly.",
+        )
+
+    return f"{safe_name}_{moref}"
 
 
 runtime_config = _load_runtime_config()
@@ -96,12 +141,15 @@ def _cloudstack_call(fn: Callable[[], list[dict[str, Any]]]) -> list[dict[str, A
 @app.post("/migration/spec", response_model=MigrationSpecResponse)
 def generate_migration_spec(payload: MigrationSpecRequest) -> MigrationSpecResponse:
     try:
-        spec_file = migration_manager.generate_spec(payload)
+        control_dir_name = _resolve_vm_control_dir(payload)
+        spec_file = migration_manager.generate_spec(payload, control_dir_name=control_dir_name)
         return MigrationSpecResponse(
             vm_name=payload.vm_name,
             spec_file=str(spec_file),
             created_at=datetime.now(timezone.utc),
         )
+    except HTTPException:
+        raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Failed to generate spec: {exc}") from exc
 

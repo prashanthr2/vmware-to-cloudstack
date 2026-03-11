@@ -37,6 +37,7 @@ class MigrationOptions(BaseModel):
 
 class MigrationSpecRequest(BaseModel):
     vm_name: str
+    vm_moref: Optional[str] = None
     zoneid: str
     clusterid: str
     networkid: str
