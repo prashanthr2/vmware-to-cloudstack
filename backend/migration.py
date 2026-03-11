@@ -255,6 +255,23 @@ class MigrationManager:
         if not isinstance(raw_disks, dict):
             return [], 0, 0, None
 
+        def first_int(values) -> int:
+            for value in values:
+                parsed = self._safe_int(value)
+                if parsed > 0:
+                    return parsed
+            return 0
+
+        def first_float(values) -> Optional[float]:
+            for value in values:
+                try:
+                    parsed = float(value)
+                    if parsed >= 0:
+                        return parsed
+                except (TypeError, ValueError):
+                    continue
+            return None
+
         boot_unit = state_data.get("boot_unit")
         boot_unit_str = str(boot_unit) if boot_unit is not None else None
 
@@ -269,11 +286,25 @@ class MigrationManager:
                 continue
 
             unit_str = str(unit)
-            capacity = self._safe_int(disk.get("capacity"))
+            capacity = first_int([
+                disk.get("capacity"),
+                disk.get("total_bytes"),
+                disk.get("size_bytes"),
+                disk.get("bytes_total"),
+                disk.get("size"),
+            ])
             path = disk.get("path")
 
-            copied = 0
-            if isinstance(path, str) and path:
+            copied = first_int([
+                disk.get("copied_bytes"),
+                disk.get("copied"),
+                disk.get("transferred_bytes"),
+                disk.get("written_bytes"),
+                disk.get("bytes_done"),
+                disk.get("copied_size"),
+            ])
+
+            if copied <= 0 and isinstance(path, str) and path:
                 try:
                     copied = os.path.getsize(path)
                 except OSError:
@@ -283,22 +314,35 @@ class MigrationManager:
                 copied = capacity
 
             remaining = max(capacity - copied, 0) if capacity > 0 else 0
-            progress = round((copied / capacity) * 100, 2) if capacity > 0 else None
+
+            progress = None
+            progress_raw = disk.get("progress")
+            if isinstance(progress_raw, (int, float)):
+                progress = float(progress_raw)
+            elif capacity > 0:
+                progress = round((copied / capacity) * 100, 2)
 
             sample_key = f"{vm_name}:{unit_str}"
-            speed_mbps = None
-            eta_seconds = None
+            speed_mbps = first_float([
+                disk.get("speed_mbps"),
+                disk.get("throughput_mbps"),
+                disk.get("transfer_speed_mbps"),
+            ])
+            eta_seconds = first_int([disk.get("eta_seconds"), disk.get("eta")]) or None
 
-            previous = self._speed_samples.get(sample_key)
-            if previous and copied >= previous[1]:
-                delta_t = now_ts - previous[0]
-                if delta_t > 0:
-                    speed_bps = (copied - previous[1]) / delta_t
-                    if speed_bps > 0:
-                        speed_mbps = round(speed_bps / (1024 * 1024), 2)
-                        speed_values.append(speed_mbps)
-                        if remaining > 0:
-                            eta_seconds = int(remaining / speed_bps)
+            if speed_mbps is None:
+                previous = self._speed_samples.get(sample_key)
+                if previous and copied >= previous[1]:
+                    delta_t = now_ts - previous[0]
+                    if delta_t > 0:
+                        speed_bps = (copied - previous[1]) / delta_t
+                        if speed_bps > 0:
+                            speed_mbps = round(speed_bps / (1024 * 1024), 2)
+                            if remaining > 0 and eta_seconds is None:
+                                eta_seconds = int(remaining / speed_bps)
+
+            if speed_mbps is not None and speed_mbps > 0:
+                speed_values.append(speed_mbps)
 
             self._speed_samples[sample_key] = (now_ts, copied)
 
@@ -328,7 +372,14 @@ class MigrationManager:
             copied_bytes_total += copied
 
         disk_progress.sort(key=lambda d: self._safe_int(d.get("unit")))
-        transfer_speed_mbps = round(sum(speed_values), 2) if speed_values else None
+
+        transfer_speed_mbps = first_float([
+            state_data.get("transfer_speed_mbps"),
+            state_data.get("speed_mbps"),
+            state_data.get("throughput_mbps"),
+        ])
+        if transfer_speed_mbps is None and speed_values:
+            transfer_speed_mbps = round(sum(speed_values), 2)
 
         return disk_progress, total_bytes, copied_bytes_total, transfer_speed_mbps
 
@@ -435,30 +486,36 @@ class MigrationManager:
         ]
 
         try:
-            result = subprocess.run(
-                command,
-                capture_output=True,
-                text=True,
-                check=False,
-                cwd=str(self.command_cwd),
-            )
+            with stdout_path.open("w", encoding="utf-8") as stdout_file, stderr_path.open(
+                "w", encoding="utf-8"
+            ) as stderr_file:
+                stdout_file.write("$ " + " ".join(command) + "\n")
+                stdout_file.flush()
 
-            stdout_path.write_text(result.stdout or "", encoding="utf-8")
-            stderr_path.write_text(result.stderr or "", encoding="utf-8")
+                process = subprocess.Popen(
+                    command,
+                    stdout=stdout_file,
+                    stderr=stderr_file,
+                    text=True,
+                    cwd=str(self.command_cwd),
+                )
+                return_code = process.wait()
+
+            stderr_text = stderr_path.read_text(encoding="utf-8", errors="replace") if stderr_path.exists() else ""
 
             with self._lock:
-                job.return_code = result.returncode
+                job.return_code = return_code
                 job.finished_at = datetime.now(timezone.utc)
-                if result.returncode == 0:
+                if return_code == 0:
                     job.status = "completed"
                     job.error = None
                 else:
                     job.status = "failed"
-                    stderr_preview = (result.stderr or "").strip()
+                    stderr_preview = (stderr_text or "").strip()
                     if stderr_preview:
                         job.error = stderr_preview[-1000:]
                     else:
-                        job.error = f"Migration exited with return code {result.returncode}."
+                        job.error = f"Migration exited with return code {return_code}."
         except Exception as exc:  # pragma: no cover - defensive runtime handling
             with self._lock:
                 job.finished_at = datetime.now(timezone.utc)
