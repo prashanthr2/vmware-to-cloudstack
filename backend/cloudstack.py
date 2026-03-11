@@ -8,6 +8,7 @@ from typing import Optional
 from urllib.parse import quote_plus
 
 import requests
+from requests import Response
 
 
 class CloudStackClient:
@@ -41,11 +42,39 @@ class CloudStackClient:
             timeout_seconds=timeout_seconds,
         )
 
+    @staticmethod
+    def _normalize_endpoint(endpoint: str) -> str:
+        value = (endpoint or "").strip().rstrip("/")
+        if not value:
+            return value
+
+        if value.lower().endswith("/client/api"):
+            return value
+
+        return f"{value}/client/api"
+
     def _validate_config(self) -> None:
         if not self.endpoint or not self.api_key or not self.secret_key:
             raise ValueError(
                 "CloudStack config is missing. Configure cloudstack in config.yaml or set CLOUDSTACK_ENDPOINT/CLOUDSTACK_API_KEY/CLOUDSTACK_SECRET_KEY."
             )
+
+    @staticmethod
+    def _safe_json(response: Response, endpoint: str, command: str) -> dict:
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            body = (response.text or "").strip().replace("\n", " ")
+            snippet = body[:180] if body else "<empty response>"
+            raise ValueError(
+                f"CloudStack returned non-JSON response for {command} at {endpoint} "
+                f"(status={response.status_code}). Response starts with: {snippet}"
+            ) from exc
+
+        if not isinstance(payload, dict):
+            raise ValueError(f"CloudStack response for {command} is not a JSON object.")
+
+        return payload
 
     def _sign(self, params: dict[str, str]) -> str:
         ordered = sorted((key.lower(), value) for key, value in params.items())
@@ -61,6 +90,7 @@ class CloudStackClient:
 
     def _call(self, command: str, **extra_params):
         self._validate_config()
+        endpoint = self._normalize_endpoint(self.endpoint)
 
         params = {
             "command": command,
@@ -70,9 +100,16 @@ class CloudStackClient:
         params.update({k: str(v) for k, v in extra_params.items() if v is not None})
         params["signature"] = self._sign(params)
 
-        response = requests.get(self.endpoint, params=params, timeout=self.timeout_seconds)
+        response = requests.get(endpoint, params=params, timeout=self.timeout_seconds)
         response.raise_for_status()
-        return response.json()
+
+        payload = self._safe_json(response, endpoint, command)
+        if "errorresponse" in payload:
+            error = payload.get("errorresponse", {})
+            message = error.get("errortext") or error.get("errorcode") or "Unknown CloudStack API error"
+            raise ValueError(f"CloudStack API error for {command}: {message}")
+
+        return payload
 
     def _extract_list(self, payload: dict, command: str, key: str) -> list[dict]:
         response_key = f"{command.lower()}response"

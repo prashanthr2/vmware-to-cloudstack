@@ -41,8 +41,8 @@ export default function EnvironmentManager({ envState, onChange, onToast }) {
   };
 
   const saveVcenter = () => {
-    if (!vcForm.name || !vcForm.host || !vcForm.username) {
-      onToast("error", "vCenter env requires name, host, and username.");
+    if (!vcForm.name || !vcForm.host || !vcForm.username || !vcForm.password) {
+      onToast("error", "vCenter env requires name, host, username, and password.");
       return;
     }
 
@@ -294,3 +294,4 @@ export default function EnvironmentManager({ envState, onChange, onToast }) {
     </section>
   );
 }
+

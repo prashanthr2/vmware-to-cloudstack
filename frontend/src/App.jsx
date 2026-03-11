@@ -42,14 +42,26 @@ async function apiRequest(path, options = {}) {
   });
 
   const text = await response.text();
-  const payload = text ? JSON.parse(text) : null;
+  let payload = null;
+
+  if (text) {
+    try {
+      payload = JSON.parse(text);
+    } catch {
+      payload = null;
+    }
+  }
 
   if (!response.ok) {
-    const detail = payload?.detail || response.statusText;
+    const detail = payload?.detail || text || response.statusText;
     throw new Error(typeof detail === "string" ? detail : JSON.stringify(detail));
   }
 
-  return payload;
+  if (payload !== null) {
+    return payload;
+  }
+
+  return text || null;
 }
 
 export default function App() {
@@ -237,15 +249,55 @@ export default function App() {
   const loadInventory = useCallback(async () => {
     setInventoryBusy(true);
     try {
-      const [vms, zoneList, clusterList, storageList, networkList, serviceList, diskOfferingList] = await Promise.all([
-        apiRequest("/vmware/vms", { headers: vmwareHeaders }),
-        apiRequest("/cloudstack/zones", { headers: cloudstackHeaders }),
-        apiRequest("/cloudstack/clusters", { headers: cloudstackHeaders }),
-        apiRequest("/cloudstack/storage", { headers: cloudstackHeaders }),
-        apiRequest("/cloudstack/networks", { headers: cloudstackHeaders }),
-        apiRequest("/cloudstack/serviceofferings", { headers: cloudstackHeaders }),
-        apiRequest("/cloudstack/diskofferings", { headers: cloudstackHeaders }),
-      ]);
+      const requests = [
+        { key: "vms", label: "VMware VMs", path: "/vmware/vms", headers: vmwareHeaders },
+        { key: "zones", label: "CloudStack zones", path: "/cloudstack/zones", headers: cloudstackHeaders },
+        { key: "clusters", label: "CloudStack clusters", path: "/cloudstack/clusters", headers: cloudstackHeaders },
+        { key: "storage", label: "CloudStack storage", path: "/cloudstack/storage", headers: cloudstackHeaders },
+        { key: "networks", label: "CloudStack networks", path: "/cloudstack/networks", headers: cloudstackHeaders },
+        {
+          key: "serviceOfferings",
+          label: "CloudStack service offerings",
+          path: "/cloudstack/serviceofferings",
+          headers: cloudstackHeaders,
+        },
+        {
+          key: "diskOfferings",
+          label: "CloudStack disk offerings",
+          path: "/cloudstack/diskofferings",
+          headers: cloudstackHeaders,
+        },
+      ];
+
+      const responses = await Promise.all(
+        requests.map(async (req) => {
+          try {
+            const data = await apiRequest(req.path, { headers: req.headers });
+            return {
+              key: req.key,
+              label: req.label,
+              data: Array.isArray(data) ? data : [],
+              error: "",
+            };
+          } catch (err) {
+            return {
+              key: req.key,
+              label: req.label,
+              data: [],
+              error: err?.message || "request failed",
+            };
+          }
+        })
+      );
+
+      const byKey = Object.fromEntries(responses.map((item) => [item.key, item]));
+      const vms = byKey.vms?.data || [];
+      const zoneList = byKey.zones?.data || [];
+      const clusterList = byKey.clusters?.data || [];
+      const storageList = byKey.storage?.data || [];
+      const networkList = byKey.networks?.data || [];
+      const serviceList = byKey.serviceOfferings?.data || [];
+      const diskOfferingList = byKey.diskOfferings?.data || [];
 
       setVmwareVms(vms);
       setZones(zoneList);
@@ -254,6 +306,12 @@ export default function App() {
       setNetworks(networkList);
       setServiceOfferings(serviceList);
       setDiskOfferings(diskOfferingList);
+
+      const failures = responses.filter((item) => item.error);
+      if (failures.length) {
+        const msg = failures.map((item) => `${item.label}: ${item.error}`).join(" | ");
+        pushToast("error", msg);
+      }
 
       setForm((prev) => {
         const nextVmName = vms.some((vm) => vm.name === prev.vm_name) ? prev.vm_name : vms[0]?.name || "";
@@ -273,8 +331,6 @@ export default function App() {
           boot_storageid: nextBootStorage,
         };
       });
-    } catch (err) {
-      pushToast("error", err.message || "Failed to load inventory.");
     } finally {
       setInventoryBusy(false);
     }
