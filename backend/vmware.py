@@ -13,6 +13,12 @@ except ImportError:  # pragma: no cover - handled at runtime
     vim = None
 
 
+def _parse_bool(raw: str | None, default: bool) -> bool:
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
 class VMwareClient:
     def __init__(
         self,
@@ -29,12 +35,22 @@ class VMwareClient:
         self.verify_ssl = verify_ssl
 
     @classmethod
-    def from_env(cls) -> "VMwareClient":
-        host = os.getenv("VMWARE_HOST", "")
-        username = os.getenv("VMWARE_USER", "")
-        password = os.getenv("VMWARE_PASSWORD", "")
-        port = int(os.getenv("VMWARE_PORT", "443"))
-        verify_ssl = os.getenv("VMWARE_VERIFY_SSL", "false").lower() in {"1", "true", "yes"}
+    def from_sources(cls, config: dict | None = None) -> "VMwareClient":
+        cfg = (config or {}).get("vcenter", {})
+
+        host = os.getenv("VMWARE_HOST", cfg.get("host", ""))
+        username = os.getenv("VMWARE_USER", cfg.get("user", ""))
+        password = os.getenv("VMWARE_PASSWORD", cfg.get("password", ""))
+
+        cfg_port = cfg.get("port", 443)
+        port = int(os.getenv("VMWARE_PORT", str(cfg_port)))
+
+        cfg_verify_ssl = cfg.get("verify_ssl")
+        if cfg_verify_ssl is None and "insecure" in cfg:
+            cfg_verify_ssl = not bool(cfg.get("insecure"))
+
+        verify_default = bool(cfg_verify_ssl) if cfg_verify_ssl is not None else False
+        verify_ssl = _parse_bool(os.getenv("VMWARE_VERIFY_SSL"), verify_default)
 
         return cls(
             host=host,
@@ -50,7 +66,7 @@ class VMwareClient:
 
         if not self.host or not self.username or not self.password:
             raise ValueError(
-                "VMware credentials are missing. Set VMWARE_HOST, VMWARE_USER, and VMWARE_PASSWORD."
+                "VMware credentials are missing. Configure vcenter in config.yaml or set VMWARE_HOST/VMWARE_USER/VMWARE_PASSWORD."
             )
 
     def _connect(self):

@@ -1,0 +1,20 @@
+vcenter:
+  host: "10.0.35.3"
+  user: "administrator@vsphere.local"
+  password: "change-me"
+  port: 443
+  insecure: true
+
+cloudstack:
+  endpoint: "http://cloudstack.example.com/client/api"
+  api_key: "change-me"
+  secret_key: "change-me"
+  timeout_seconds: 30
+
+migration:
+  control_dir: "/var/lib/vm-migrator"
+  specs_dir: "/var/lib/vm-migrator/specs"
+  workdir: "/opt/vmware-to-cloudstack"
+  migrate_script: "migrate.py"
+  python_bin: "python3"
+  parallel_vms: 4

@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import os
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Callable
 
 import requests
+import yaml
 from fastapi import FastAPI, HTTPException
 
 from .cloudstack import CloudStackClient
@@ -18,11 +21,28 @@ from .models import (
 )
 from .vmware import VMwareClient
 
-app = FastAPI(title="VMware to CloudStack Migration Backend", version="1.0.0")
+app = FastAPI(title="VMware to CloudStack Migration Backend", version="1.1.0")
 
-vmware_client = VMwareClient.from_env()
-cloudstack_client = CloudStackClient.from_env()
-migration_manager = MigrationManager()
+
+def _load_runtime_config() -> dict[str, Any]:
+    config_path = Path(os.getenv("MIGRATOR_CONFIG_FILE", "config.yaml"))
+    if not config_path.exists():
+        return {}
+
+    try:
+        with config_path.open("r", encoding="utf-8") as stream:
+            data = yaml.safe_load(stream) or {}
+            if not isinstance(data, dict):
+                raise ValueError("config.yaml root must be a mapping/object")
+            return data
+    except Exception as exc:
+        raise RuntimeError(f"Failed to read config file '{config_path}': {exc}") from exc
+
+
+runtime_config = _load_runtime_config()
+vmware_client = VMwareClient.from_sources(runtime_config)
+cloudstack_client = CloudStackClient.from_sources(runtime_config)
+migration_manager = MigrationManager.from_sources(runtime_config)
 
 
 @app.get("/vmware/vms", response_model=list[VMwareVMInfo])

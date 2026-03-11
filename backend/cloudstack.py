@@ -23,11 +23,15 @@ class CloudStackClient:
         self.timeout_seconds = timeout_seconds
 
     @classmethod
-    def from_env(cls) -> "CloudStackClient":
-        endpoint = os.getenv("CLOUDSTACK_ENDPOINT", "")
-        api_key = os.getenv("CLOUDSTACK_API_KEY", "")
-        secret_key = os.getenv("CLOUDSTACK_SECRET_KEY", "")
-        timeout_seconds = int(os.getenv("CLOUDSTACK_TIMEOUT_SECONDS", "30"))
+    def from_sources(cls, config: dict | None = None) -> "CloudStackClient":
+        cfg = (config or {}).get("cloudstack", {})
+
+        endpoint = os.getenv("CLOUDSTACK_ENDPOINT", cfg.get("endpoint", ""))
+        api_key = os.getenv("CLOUDSTACK_API_KEY", cfg.get("api_key", ""))
+        secret_key = os.getenv("CLOUDSTACK_SECRET_KEY", cfg.get("secret_key", ""))
+
+        cfg_timeout = cfg.get("timeout_seconds", 30)
+        timeout_seconds = int(os.getenv("CLOUDSTACK_TIMEOUT_SECONDS", str(cfg_timeout)))
 
         return cls(
             endpoint=endpoint,
@@ -39,7 +43,7 @@ class CloudStackClient:
     def _validate_config(self) -> None:
         if not self.endpoint or not self.api_key or not self.secret_key:
             raise ValueError(
-                "CloudStack config is missing. Set CLOUDSTACK_ENDPOINT, CLOUDSTACK_API_KEY, and CLOUDSTACK_SECRET_KEY."
+                "CloudStack config is missing. Configure cloudstack in config.yaml or set CLOUDSTACK_ENDPOINT/CLOUDSTACK_API_KEY/CLOUDSTACK_SECRET_KEY."
             )
 
     def _sign(self, params: dict[str, str]) -> str:

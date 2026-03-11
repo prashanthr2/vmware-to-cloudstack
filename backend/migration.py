@@ -30,23 +30,55 @@ class MigrationJob:
 
 
 class MigrationManager:
-    def __init__(self) -> None:
-        base_dir = os.getenv("MIGRATOR_BASE_DIR", "/var/lib/vm-migrator")
-        specs_dir = os.getenv("MIGRATOR_SPECS_DIR", str(Path(base_dir) / "specs"))
-
+    def __init__(
+        self,
+        base_dir: str | Path,
+        specs_dir: str | Path,
+        python_cmd: str,
+        migrate_script: str,
+        command_cwd: str | Path,
+        max_workers: int,
+    ) -> None:
         self.base_dir = Path(base_dir)
         self.specs_dir = Path(specs_dir)
-        self.python_cmd = os.getenv("MIGRATOR_PYTHON", sys.executable)
-        self.migrate_script = os.getenv("MIGRATOR_SCRIPT", "migrate.py")
-        self.command_cwd = Path(os.getenv("MIGRATOR_WORKDIR", os.getcwd()))
+        self.python_cmd = python_cmd
+        self.migrate_script = migrate_script
+        self.command_cwd = Path(command_cwd)
 
-        max_workers = int(os.getenv("MIGRATOR_MAX_WORKERS", "4"))
         self.executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="migration-worker")
 
         self._lock = threading.Lock()
         self._jobs: dict[str, MigrationJob] = {}
         self._futures: dict[str, Future] = {}
         self._jobs_by_vm: dict[str, list[str]] = {}
+
+    @classmethod
+    def from_sources(cls, config: dict | None = None) -> "MigrationManager":
+        migration_cfg = (config or {}).get("migration", {})
+
+        default_base_dir = migration_cfg.get("control_dir", "/var/lib/vm-migrator")
+        base_dir = os.getenv("MIGRATOR_BASE_DIR", str(default_base_dir))
+
+        default_specs_dir = migration_cfg.get("specs_dir", str(Path(base_dir) / "specs"))
+        specs_dir = os.getenv("MIGRATOR_SPECS_DIR", str(default_specs_dir))
+
+        python_cmd = os.getenv("MIGRATOR_PYTHON", str(migration_cfg.get("python_bin", sys.executable)))
+        migrate_script = os.getenv("MIGRATOR_SCRIPT", str(migration_cfg.get("migrate_script", "migrate.py")))
+
+        default_workdir = migration_cfg.get("workdir", os.getcwd())
+        command_cwd = os.getenv("MIGRATOR_WORKDIR", str(default_workdir))
+
+        default_workers = int(migration_cfg.get("parallel_vms", 4))
+        max_workers = int(os.getenv("MIGRATOR_MAX_WORKERS", str(default_workers)))
+
+        return cls(
+            base_dir=base_dir,
+            specs_dir=specs_dir,
+            python_cmd=python_cmd,
+            migrate_script=migrate_script,
+            command_cwd=command_cwd,
+            max_workers=max_workers,
+        )
 
     @staticmethod
     def _safe_vm_name(vm_name: str) -> str:
