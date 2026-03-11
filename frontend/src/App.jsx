@@ -216,7 +216,8 @@ export default function App() {
           datastore: disk.datastore || "-",
           diskType: disk.disk_type || (index === 0 ? "os" : "data"),
           storageid: existing?.storageid || form.boot_storageid || "",
-          diskofferingid: existing?.diskofferingid || "",
+          diskofferingid:
+            (disk.disk_type || (index === 0 ? "os" : "data")) === "os" ? "" : existing?.diskofferingid || "",
         };
       });
     },
@@ -485,8 +486,7 @@ export default function App() {
   const buildSpecPayload = () => {
     const disks = {};
     detectedDisks.forEach((disk) => {
-      const shouldInclude = disk.diskType !== "os" || !!disk.diskofferingid;
-      if (!shouldInclude) {
+      if (disk.diskType === "os") {
         return;
       }
       disks[disk.unit] = {
@@ -732,7 +732,6 @@ export default function App() {
             diskOfferings={diskOfferings}
             onDiskChange={updateDisk}
             validationByUnit={validationByUnit}
-            osDiskOfferingOptional
           />
 
           <section className="panel">

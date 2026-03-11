@@ -8,7 +8,6 @@ export default function DiskTable({
   diskOfferings,
   onDiskChange,
   validationByUnit,
-  osDiskOfferingOptional,
 }) {
   return (
     <section className="panel">
@@ -33,6 +32,8 @@ export default function DiskTable({
             ) : (
               disks.map((disk) => {
                 const error = validationByUnit[disk.unit] || "";
+                const isBootDisk = disk.diskType === "os";
+
                 return (
                   <tr key={disk.unit}>
                     <td>
@@ -41,8 +42,8 @@ export default function DiskTable({
                     </td>
                     <td>{disk.sizeText}</td>
                     <td>
-                      <span className={`pill ${disk.diskType === "os" ? "queued" : "running"}`}>
-                        {disk.diskType === "os" ? "OS" : "Data"}
+                      <span className={`pill ${isBootDisk ? "queued" : "running"}`}>
+                        {isBootDisk ? "OS" : "Data"}
                       </span>
                     </td>
                     <td>{disk.datastore || "-"}</td>
@@ -60,22 +61,24 @@ export default function DiskTable({
                       </select>
                     </td>
                     <td>
-                      <select
-                        value={disk.diskofferingid}
-                        onChange={(e) => onDiskChange(disk.unit, "diskofferingid", e.target.value)}
-                      >
-                        <option value="">Select disk offering</option>
-                        {diskOfferings.map((item) => (
-                          <option key={item.id} value={item.id}>
-                            {optionLabel(item)}
-                          </option>
-                        ))}
-                      </select>
-                      <div className="hint small">
-                        {disk.diskType === "os" && osDiskOfferingOptional
-                          ? "Optional for OS disk"
-                          : "Required for data disk"}
-                      </div>
+                      {isBootDisk ? (
+                        <div className="hint small">Inherited from selected service offering</div>
+                      ) : (
+                        <>
+                          <select
+                            value={disk.diskofferingid}
+                            onChange={(e) => onDiskChange(disk.unit, "diskofferingid", e.target.value)}
+                          >
+                            <option value="">Select disk offering</option>
+                            {diskOfferings.map((item) => (
+                              <option key={item.id} value={item.id}>
+                                {optionLabel(item)}
+                              </option>
+                            ))}
+                          </select>
+                          <div className="hint small">Required for data disk</div>
+                        </>
+                      )}
                       {error ? <div className="field-error">{error}</div> : null}
                     </td>
                   </tr>
