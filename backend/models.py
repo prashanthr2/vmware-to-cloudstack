@@ -75,3 +75,31 @@ class MigrationStatusResponse(BaseModel):
     job_error: Optional[str] = None
     return_code: Optional[int] = None
     updated_at: Optional[datetime] = None
+
+
+class MigrationJobInfo(BaseModel):
+    job_id: str
+    vm_name: str
+    status: str
+    spec_file: str
+    started_at: datetime
+    finished_at: Optional[datetime] = None
+    return_code: Optional[int] = None
+    error: Optional[str] = None
+    stage: Optional[str] = None
+    progress: Optional[Union[float, int]] = None
+
+
+class MigrationFinalizeResponse(BaseModel):
+    vm_name: str
+    finalize_file: str
+    message: str
+
+
+class MigrationLogsResponse(BaseModel):
+    vm_name: str
+    job_id: Optional[str] = None
+    stdout_path: Optional[str] = None
+    stderr_path: Optional[str] = None
+    stdout: str = ""
+    stderr: str = ""

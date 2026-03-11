@@ -182,6 +182,16 @@ class MigrationManager:
 
         return None
 
+    def _load_state(self, vm_name: str) -> dict:
+        state_path = self._validated_state_path(vm_name)
+        if state_path is None:
+            return {}
+
+        try:
+            return json.loads(state_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            return {}
+
     def _job_runtime_dir(self, vm_name: str, spec_file: str) -> Path:
         spec_path = Path(spec_file)
         try:
@@ -202,6 +212,25 @@ class MigrationManager:
             return dirs[0]
 
         return self.base_dir / self._safe_vm_name(vm_name)
+
+    @staticmethod
+    def _tail_file(path: Path, lines: int) -> str:
+        if not path.exists() or lines <= 0:
+            return ""
+
+        text = path.read_text(encoding="utf-8", errors="replace")
+        parts = text.splitlines()
+        if len(parts) <= lines:
+            return text
+
+        return "\n".join(parts[-lines:])
+
+    def _latest_job_for_vm(self, vm_name: str) -> Optional[MigrationJob]:
+        with self._lock:
+            ids = self._jobs_by_vm.get(vm_name, [])
+            if not ids:
+                return None
+            return self._jobs[ids[-1]]
 
     def generate_spec(self, request: MigrationSpecRequest, control_dir_name: Optional[str] = None) -> Path:
         dir_name = control_dir_name or self._safe_vm_name(request.vm_name)
@@ -305,23 +334,8 @@ class MigrationManager:
                 job.status = "failed"
                 job.error = str(exc)
 
-    def _latest_job_for_vm(self, vm_name: str) -> Optional[MigrationJob]:
-        with self._lock:
-            ids = self._jobs_by_vm.get(vm_name, [])
-            if not ids:
-                return None
-            return self._jobs[ids[-1]]
-
     def get_status(self, vm_name: str) -> Optional[dict]:
-        state_path = self._validated_state_path(vm_name)
-
-        state_data: dict = {}
-        if state_path is not None:
-            try:
-                state_data = json.loads(state_path.read_text(encoding="utf-8"))
-            except json.JSONDecodeError:
-                state_data = {}
-
+        state_data = self._load_state(vm_name)
         job = self._latest_job_for_vm(vm_name)
 
         if not state_data and job is None:
@@ -339,3 +353,97 @@ class MigrationManager:
             "updated_at": datetime.now(timezone.utc),
         }
 
+    def list_jobs(self, vm_name: Optional[str] = None, limit: int = 100) -> list[dict]:
+        with self._lock:
+            jobs = list(self._jobs.values())
+
+        if vm_name:
+            jobs = [job for job in jobs if job.vm_name == vm_name]
+
+        jobs.sort(key=lambda j: j.started_at, reverse=True)
+
+        result = []
+        for job in jobs[:limit]:
+            state_data = self._load_state(job.vm_name)
+            result.append(
+                {
+                    "job_id": job.job_id,
+                    "vm_name": job.vm_name,
+                    "status": job.status,
+                    "spec_file": job.spec_file,
+                    "started_at": job.started_at,
+                    "finished_at": job.finished_at,
+                    "return_code": job.return_code,
+                    "error": job.error,
+                    "stage": state_data.get("stage"),
+                    "progress": state_data.get("progress"),
+                }
+            )
+
+        return result
+
+    def create_finalize_marker(self, vm_name: str) -> Path:
+        latest_job = self._latest_job_for_vm(vm_name)
+
+        if latest_job:
+            target_dir = self._job_runtime_dir(latest_job.vm_name, latest_job.spec_file)
+        else:
+            dirs = self._candidate_vm_dirs(vm_name)
+            if not dirs:
+                raise FileNotFoundError(f"Control directory not found for VM '{vm_name}'.")
+            target_dir = dirs[0]
+
+        target_dir.mkdir(parents=True, exist_ok=True)
+        finalize_file = target_dir / "FINALIZE"
+        finalize_file.touch(exist_ok=True)
+        return finalize_file
+
+    def get_logs(self, vm_name: str, lines: int = 200, job_id: Optional[str] = None) -> dict:
+        latest_job = self._latest_job_for_vm(vm_name)
+        target_dir = None
+        resolved_job_id = job_id
+
+        if job_id:
+            with self._lock:
+                explicit_job = self._jobs.get(job_id)
+            if explicit_job and explicit_job.vm_name == vm_name:
+                target_dir = self._job_runtime_dir(explicit_job.vm_name, explicit_job.spec_file)
+                resolved_job_id = explicit_job.job_id
+
+        if target_dir is None and latest_job is not None:
+            target_dir = self._job_runtime_dir(latest_job.vm_name, latest_job.spec_file)
+            resolved_job_id = latest_job.job_id
+
+        if target_dir is None:
+            dirs = self._candidate_vm_dirs(vm_name)
+            target_dir = dirs[0] if dirs else self.base_dir / self._safe_vm_name(vm_name)
+
+        stdout_path = None
+        stderr_path = None
+
+        if resolved_job_id:
+            stdout_candidate = target_dir / f"{resolved_job_id}.stdout.log"
+            stderr_candidate = target_dir / f"{resolved_job_id}.stderr.log"
+            if stdout_candidate.exists():
+                stdout_path = stdout_candidate
+            if stderr_candidate.exists():
+                stderr_path = stderr_candidate
+
+        if stdout_path is None:
+            candidates = sorted(target_dir.glob("*.stdout.log"), key=lambda p: p.stat().st_mtime, reverse=True)
+            if candidates:
+                stdout_path = candidates[0]
+
+        if stderr_path is None:
+            candidates = sorted(target_dir.glob("*.stderr.log"), key=lambda p: p.stat().st_mtime, reverse=True)
+            if candidates:
+                stderr_path = candidates[0]
+
+        return {
+            "vm_name": vm_name,
+            "job_id": resolved_job_id,
+            "stdout_path": str(stdout_path) if stdout_path else None,
+            "stderr_path": str(stderr_path) if stderr_path else None,
+            "stdout": self._tail_file(stdout_path, lines) if stdout_path else "",
+            "stderr": self._tail_file(stderr_path, lines) if stderr_path else "",
+        }

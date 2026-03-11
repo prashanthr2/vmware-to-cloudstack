@@ -4,15 +4,19 @@ import os
 import re
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Optional
 
 import requests
 import yaml
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
 
 from .cloudstack import CloudStackClient
 from .migration import MigrationManager
 from .models import (
+    MigrationFinalizeResponse,
+    MigrationJobInfo,
+    MigrationLogsResponse,
     MigrationSpecRequest,
     MigrationSpecResponse,
     MigrationStartRequest,
@@ -22,7 +26,15 @@ from .models import (
 )
 from .vmware import VMwareClient
 
-app = FastAPI(title="VMware to CloudStack Migration Backend", version="1.2.0")
+app = FastAPI(title="VMware to CloudStack Migration Backend", version="1.3.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=os.getenv("MIGRATOR_CORS_ORIGINS", "*").split(","),
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 def _load_runtime_config() -> dict[str, Any]:
@@ -178,6 +190,36 @@ def migration_status(vm: str) -> MigrationStatusResponse:
         raise HTTPException(status_code=404, detail=f"No migration state found for VM '{vm}'.")
 
     return MigrationStatusResponse(**status)
+
+
+@app.get("/migration/jobs", response_model=list[MigrationJobInfo])
+def list_migration_jobs(vm: Optional[str] = None, limit: int = Query(default=100, ge=1, le=1000)) -> list[MigrationJobInfo]:
+    jobs = migration_manager.list_jobs(vm_name=vm, limit=limit)
+    return [MigrationJobInfo(**job) for job in jobs]
+
+
+@app.post("/migration/finalize/{vm}", response_model=MigrationFinalizeResponse)
+def request_finalize(vm: str) -> MigrationFinalizeResponse:
+    try:
+        marker = migration_manager.create_finalize_marker(vm)
+        return MigrationFinalizeResponse(vm_name=vm, finalize_file=str(marker), message="Finalize marker created")
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to create finalize marker: {exc}") from exc
+
+
+@app.get("/migration/logs/{vm}", response_model=MigrationLogsResponse)
+def migration_logs(
+    vm: str,
+    lines: int = Query(default=200, ge=10, le=2000),
+    job_id: Optional[str] = None,
+) -> MigrationLogsResponse:
+    try:
+        logs = migration_manager.get_logs(vm_name=vm, lines=lines, job_id=job_id)
+        return MigrationLogsResponse(**logs)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to read logs: {exc}") from exc
 
 
 @app.get("/health")
