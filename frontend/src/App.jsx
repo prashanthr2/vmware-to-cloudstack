@@ -201,12 +201,13 @@ export default function App() {
   }, [busy, detectedDisks, form, validationByUnit]);
 
   const mapDetectedDisks = useCallback(
-    (vmDisks) => {
-      const previousByUnit = Object.fromEntries(detectedDisks.map((disk) => [disk.unit, disk]));
+    (vmDisks, previousDisks = []) => {
+      const previousByUnit = Object.fromEntries(previousDisks.map((disk) => [disk.unit, disk]));
 
       return vmDisks.map((disk, index) => {
         const unit = disk.unit !== null && disk.unit !== undefined ? String(disk.unit) : String(index);
         const existing = previousByUnit[unit];
+        const diskType = disk.disk_type || (index === 0 ? "os" : "data");
 
         return {
           unit,
@@ -214,14 +215,13 @@ export default function App() {
           sizeGb: disk.size_gb,
           sizeText: disk.size_gb ? `${disk.size_gb} GB` : "-",
           datastore: disk.datastore || "-",
-          diskType: disk.disk_type || (index === 0 ? "os" : "data"),
+          diskType,
           storageid: existing?.storageid || form.boot_storageid || "",
-          diskofferingid:
-            (disk.disk_type || (index === 0 ? "os" : "data")) === "os" ? "" : existing?.diskofferingid || "",
+          diskofferingid: diskType === "os" ? "" : existing?.diskofferingid || "",
         };
       });
     },
-    [detectedDisks, form.boot_storageid]
+    [form.boot_storageid]
   );
 
   const pickValidOrFirst = useCallback((currentId, items) => {
@@ -361,8 +361,7 @@ export default function App() {
           vm_moref: selectedVm.moref || prev.vm_moref || "",
         }));
 
-        const mapped = mapDetectedDisks(selectedVm.disks || []);
-        setDetectedDisks(mapped);
+        setDetectedDisks((prevDisks) => mapDetectedDisks(selectedVm.disks || [], prevDisks));
       } catch (err) {
         pushToast("error", err.message || "Failed to detect VM disks.");
       } finally {
