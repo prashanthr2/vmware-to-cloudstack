@@ -48,7 +48,14 @@ class CloudStackClient:
         if not value:
             return value
 
-        if value.lower().endswith("/client/api"):
+        lowered = value.lower()
+        if lowered.endswith("/client/api"):
+            return value
+
+        if lowered.endswith("/client"):
+            return f"{value}/api"
+
+        if lowered.endswith("/api"):
             return value
 
         return f"{value}/client/api"
@@ -139,3 +146,4 @@ class CloudStackClient:
     def list_service_offerings(self) -> list[dict]:
         payload = self._call("listServiceOfferings")
         return self._extract_list(payload, "listServiceOfferings", "serviceoffering")
+
