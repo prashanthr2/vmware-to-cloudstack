@@ -48,17 +48,21 @@ export default function DiskTable({
                     </td>
                     <td>{disk.datastore || "-"}</td>
                     <td>
-                      <select
-                        value={disk.storageid}
-                        onChange={(e) => onDiskChange(disk.unit, "storageid", e.target.value)}
-                      >
-                        <option value="">Select storage</option>
-                        {storagePools.map((item) => (
-                          <option key={item.id} value={item.id}>
-                            {optionLabel(item)}
-                          </option>
-                        ))}
-                      </select>
+                      {isBootDisk ? (
+                        <div className="hint small">Inherited from Boot Storage selection</div>
+                      ) : (
+                        <select
+                          value={disk.storageid}
+                          onChange={(e) => onDiskChange(disk.unit, "storageid", e.target.value)}
+                        >
+                          <option value="">Select storage</option>
+                          {storagePools.map((item) => (
+                            <option key={item.id} value={item.id}>
+                              {optionLabel(item)}
+                            </option>
+                          ))}
+                        </select>
+                      )}
                     </td>
                     <td>
                       {isBootDisk ? (

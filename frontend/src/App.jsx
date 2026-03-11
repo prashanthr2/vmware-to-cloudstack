@@ -33,12 +33,14 @@ function uniqueByVm(jobs) {
 }
 
 async function apiRequest(path, options = {}) {
+  const { headers: customHeaders = {}, ...fetchOptions } = options;
+
   const response = await fetch(`${API_BASE}${path}`, {
+    ...fetchOptions,
     headers: {
       "Content-Type": "application/json",
-      ...(options.headers || {}),
+      ...customHeaders,
     },
-    ...options,
   });
 
   const text = await response.text();
@@ -175,12 +177,16 @@ export default function App() {
   const validationByUnit = useMemo(() => {
     const errors = {};
     detectedDisks.forEach((disk) => {
-      if (!disk.storageid) {
-        errors[disk.unit] = "Storage target is required.";
+      if (disk.diskType === "os") {
         return;
       }
 
-      if (disk.diskType !== "os" && !disk.diskofferingid) {
+      if (!disk.storageid) {
+        errors[disk.unit] = "Storage target is required for data disks.";
+        return;
+      }
+
+      if (!disk.diskofferingid) {
         errors[disk.unit] = "Disk offering is required for data disks.";
       }
     });
