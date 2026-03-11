@@ -131,9 +131,11 @@ class MigrationManager:
     def generate_spec(self, request: MigrationSpecRequest) -> Path:
         self.specs_dir.mkdir(parents=True, exist_ok=True)
 
+        migration_block = request.migration.model_dump(exclude_none=True)
+
         spec_payload = {
             "vm": {"name": request.vm_name},
-            "migration": {"delta_interval": 300},
+            "migration": migration_block,
             "target": {
                 "cloudstack": {
                     "zoneid": request.zoneid,
@@ -255,3 +257,4 @@ class MigrationManager:
             "job_status": job.status if job else None,
             "updated_at": datetime.now(timezone.utc),
         }
+

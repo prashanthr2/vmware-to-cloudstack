@@ -26,6 +26,15 @@ class DiskSpecInput(BaseModel):
     diskofferingid: str
 
 
+class MigrationOptions(BaseModel):
+    delta_interval: int = 300
+    finalize_at: Optional[str] = None
+    finalize_delta_interval: Optional[int] = None
+    finalize_window: Optional[int] = None
+    shutdown_mode: Optional[str] = None
+    snapshot_quiesce: Optional[str] = None
+
+
 class MigrationSpecRequest(BaseModel):
     vm_name: str
     zoneid: str
@@ -34,6 +43,7 @@ class MigrationSpecRequest(BaseModel):
     serviceofferingid: str
     boot_storageid: str
     disks: dict[str, DiskSpecInput] = Field(default_factory=dict)
+    migration: MigrationOptions = Field(default_factory=MigrationOptions)
 
 
 class MigrationSpecResponse(BaseModel):
