@@ -71,4 +71,6 @@ class MigrationStatusResponse(BaseModel):
     disks: dict[str, Any] = Field(default_factory=dict)
     job_id: Optional[str] = None
     job_status: Optional[str] = None
+    job_error: Optional[str] = None
+    return_code: Optional[int] = None
     updated_at: Optional[datetime] = None

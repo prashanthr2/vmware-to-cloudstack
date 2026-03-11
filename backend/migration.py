@@ -114,8 +114,17 @@ class MigrationManager:
         raise FileNotFoundError(f"Spec file not found: {spec_file}")
 
     def _validated_state_path(self, vm_name: str) -> Optional[Path]:
-        candidates = [self.base_dir / vm_name / "state.json", self.base_dir / self._safe_vm_name(vm_name) / "state.json"]
+        safe_name = self._safe_vm_name(vm_name)
         base_resolved = self.base_dir.resolve()
+
+        candidates = [
+            self.base_dir / vm_name / "state.json",
+            self.base_dir / safe_name / "state.json",
+        ]
+
+        for pattern in (f"{vm_name}_*", f"{safe_name}_*"):
+            for vm_dir in self.base_dir.glob(pattern):
+                candidates.append(vm_dir / "state.json")
 
         for candidate in candidates:
             resolved = candidate.resolve()
@@ -217,9 +226,14 @@ class MigrationManager:
                 job.finished_at = datetime.now(timezone.utc)
                 if result.returncode == 0:
                     job.status = "completed"
+                    job.error = None
                 else:
                     job.status = "failed"
-                    job.error = f"Migration exited with return code {result.returncode}."
+                    stderr_preview = (result.stderr or "").strip()
+                    if stderr_preview:
+                        job.error = stderr_preview[-1000:]
+                    else:
+                        job.error = f"Migration exited with return code {result.returncode}."
         except Exception as exc:  # pragma: no cover - defensive runtime handling
             with self._lock:
                 job.finished_at = datetime.now(timezone.utc)
@@ -255,6 +269,7 @@ class MigrationManager:
             "disks": state_data.get("disks") or state_data.get("disk_status") or {},
             "job_id": job.job_id if job else None,
             "job_status": job.status if job else None,
+            "job_error": job.error if job else None,
+            "return_code": job.return_code if job else None,
             "updated_at": datetime.now(timezone.utc),
         }
-
