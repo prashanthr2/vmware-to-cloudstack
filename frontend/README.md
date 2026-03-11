@@ -12,16 +12,13 @@ npm install
 npm run dev
 ```
 
-By default the UI targets `http://127.0.0.1:8000`.
+`VITE_API_BASE` is optional. If unset, the UI uses `http(s)://<current-host>:8000`.
 
-## Notes
+## Highlights
 
-- This setup is compatible with Node.js 16+.
-
-## Features
-
-- Create migration specs with strategy fields (`finalize_at`, delta intervals, shutdown mode)
-- Start migration right after spec generation
-- View running/recent jobs
-- Trigger finalize marker creation
-- View latest stdout/stderr logs per job
+- Auto-detect VM disks from vCenter when VM selection changes
+- Disk table with label, size, type, datastore, storage target, and disk offering
+- Validation: migration start disabled until all data disks have disk offerings
+- Environment manager (vCenter + CloudStack) with add/edit/delete persisted in local storage
+- Real-time migration dashboard with overall progress, per-disk progress, speed, and ETA
+- Finalize button + live log tailing

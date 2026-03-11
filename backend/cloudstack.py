@@ -95,6 +95,10 @@ class CloudStackClient:
         payload = self._call("listNetworks")
         return self._extract_list(payload, "listNetworks", "network")
 
+    def list_disk_offerings(self) -> list[dict]:
+        payload = self._call("listDiskOfferings")
+        return self._extract_list(payload, "listDiskOfferings", "diskoffering")
+
     def list_service_offerings(self) -> list[dict]:
         payload = self._call("listServiceOfferings")
         return self._extract_list(payload, "listServiceOfferings", "serviceoffering")

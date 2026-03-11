@@ -10,6 +10,8 @@ class VMwareDiskInfo(BaseModel):
     label: str
     size_gb: float
     datastore: Optional[str] = None
+    unit: Optional[int] = None
+    disk_type: Optional[str] = None
 
 
 class VMwareVMInfo(BaseModel):
@@ -65,11 +67,30 @@ class MigrationStartResponse(BaseModel):
     status: str
 
 
+class DiskProgressInfo(BaseModel):
+    unit: str
+    disk_name: str
+    disk_type: Optional[str] = None
+    datastore: Optional[str] = None
+    total_size: Optional[str] = None
+    copied_size: Optional[str] = None
+    remaining_size: Optional[str] = None
+    total_bytes: Optional[int] = None
+    copied_bytes: Optional[int] = None
+    remaining_bytes: Optional[int] = None
+    speed_mbps: Optional[float] = None
+    eta_seconds: Optional[int] = None
+    progress: Optional[float] = None
+
+
 class MigrationStatusResponse(BaseModel):
     vm_name: str
     stage: Optional[str] = None
     progress: Optional[Union[float, int]] = None
+    overall_progress: Optional[float] = None
+    transfer_speed_mbps: Optional[float] = None
     disks: dict[str, Any] = Field(default_factory=dict)
+    disk_progress: list[DiskProgressInfo] = Field(default_factory=list)
     job_id: Optional[str] = None
     job_status: Optional[str] = None
     job_error: Optional[str] = None

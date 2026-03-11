@@ -52,6 +52,7 @@ class MigrationManager:
         self._jobs: dict[str, MigrationJob] = {}
         self._futures: dict[str, Future] = {}
         self._jobs_by_vm: dict[str, list[str]] = {}
+        self._speed_samples: dict[str, tuple[float, int]] = {}
 
     @classmethod
     def from_sources(cls, config: Optional[dict] = None) -> "MigrationManager":
@@ -84,6 +85,24 @@ class MigrationManager:
     @staticmethod
     def _safe_vm_name(vm_name: str) -> str:
         return re.sub(r"[^A-Za-z0-9._-]", "_", vm_name)
+
+    @staticmethod
+    def _safe_int(value) -> int:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return 0
+
+    @staticmethod
+    def _format_bytes(num_bytes: int) -> str:
+        value = float(max(num_bytes, 0))
+        for unit in ["B", "KB", "MB", "GB", "TB"]:
+            if value < 1024.0 or unit == "TB":
+                if unit == "B":
+                    return f"{int(value)} {unit}"
+                return f"{value:.1f} {unit}"
+            value /= 1024.0
+        return f"{num_bytes} B"
 
     def _candidate_vm_dirs(self, vm_name: str) -> list[Path]:
         safe_name = self._safe_vm_name(vm_name)
@@ -131,7 +150,6 @@ class MigrationManager:
             if root_candidates:
                 return root_candidates[0]
 
-        # Backward compatibility for old global specs directory.
         safe_name = self._safe_vm_name(vm_name)
         if self.specs_dir.exists():
             legacy = sorted(self.specs_dir.glob(f"{safe_name}-*.yaml"), key=lambda p: p.stat().st_mtime, reverse=True)
@@ -231,6 +249,119 @@ class MigrationManager:
             if not ids:
                 return None
             return self._jobs[ids[-1]]
+
+    def _build_disk_progress(self, vm_name: str, state_data: dict) -> tuple[list[dict], int, int, Optional[float]]:
+        raw_disks = state_data.get("disks")
+        if not isinstance(raw_disks, dict):
+            return [], 0, 0, None
+
+        boot_unit = state_data.get("boot_unit")
+        boot_unit_str = str(boot_unit) if boot_unit is not None else None
+
+        now_ts = datetime.now(timezone.utc).timestamp()
+        disk_progress: list[dict] = []
+        total_bytes = 0
+        copied_bytes_total = 0
+        speed_values: list[float] = []
+
+        for unit, disk in raw_disks.items():
+            if not isinstance(disk, dict):
+                continue
+
+            unit_str = str(unit)
+            capacity = self._safe_int(disk.get("capacity"))
+            path = disk.get("path")
+
+            copied = 0
+            if isinstance(path, str) and path:
+                try:
+                    copied = os.path.getsize(path)
+                except OSError:
+                    copied = 0
+
+            if capacity > 0 and copied > capacity:
+                copied = capacity
+
+            remaining = max(capacity - copied, 0) if capacity > 0 else 0
+            progress = round((copied / capacity) * 100, 2) if capacity > 0 else None
+
+            sample_key = f"{vm_name}:{unit_str}"
+            speed_mbps = None
+            eta_seconds = None
+
+            previous = self._speed_samples.get(sample_key)
+            if previous and copied >= previous[1]:
+                delta_t = now_ts - previous[0]
+                if delta_t > 0:
+                    speed_bps = (copied - previous[1]) / delta_t
+                    if speed_bps > 0:
+                        speed_mbps = round(speed_bps / (1024 * 1024), 2)
+                        speed_values.append(speed_mbps)
+                        if remaining > 0:
+                            eta_seconds = int(remaining / speed_bps)
+
+            self._speed_samples[sample_key] = (now_ts, copied)
+
+            disk_type = disk.get("disk_type")
+            if not disk_type:
+                disk_type = "os" if boot_unit_str is not None and unit_str == boot_unit_str else "data"
+
+            disk_progress.append(
+                {
+                    "unit": unit_str,
+                    "disk_name": disk.get("label") or f"disk{unit_str}",
+                    "disk_type": disk_type,
+                    "datastore": disk.get("datastore"),
+                    "total_size": self._format_bytes(capacity) if capacity > 0 else None,
+                    "copied_size": self._format_bytes(copied),
+                    "remaining_size": self._format_bytes(remaining),
+                    "total_bytes": capacity if capacity > 0 else None,
+                    "copied_bytes": copied,
+                    "remaining_bytes": remaining,
+                    "speed_mbps": speed_mbps,
+                    "eta_seconds": eta_seconds,
+                    "progress": progress,
+                }
+            )
+
+            total_bytes += capacity
+            copied_bytes_total += copied
+
+        disk_progress.sort(key=lambda d: self._safe_int(d.get("unit")))
+        transfer_speed_mbps = round(sum(speed_values), 2) if speed_values else None
+
+        return disk_progress, total_bytes, copied_bytes_total, transfer_speed_mbps
+
+    def _build_status_payload(self, vm_name: str, state_data: dict, job: Optional[MigrationJob]) -> dict:
+        disk_progress, total_bytes, copied_bytes_total, transfer_speed_mbps = self._build_disk_progress(vm_name, state_data)
+
+        stage = state_data.get("stage")
+        state_progress = state_data.get("progress")
+
+        overall_progress = None
+        if isinstance(state_progress, (int, float)):
+            overall_progress = float(state_progress)
+        elif total_bytes > 0:
+            overall_progress = round((copied_bytes_total / total_bytes) * 100, 2)
+        elif stage == "done" or (job and job.status == "completed"):
+            overall_progress = 100.0
+
+        progress = state_progress if isinstance(state_progress, (int, float)) else overall_progress
+
+        return {
+            "vm_name": vm_name,
+            "stage": stage,
+            "progress": progress,
+            "overall_progress": overall_progress,
+            "transfer_speed_mbps": transfer_speed_mbps,
+            "disks": state_data.get("disks") or state_data.get("disk_status") or {},
+            "disk_progress": disk_progress,
+            "job_id": job.job_id if job else None,
+            "job_status": job.status if job else None,
+            "job_error": job.error if job else None,
+            "return_code": job.return_code if job else None,
+            "updated_at": datetime.now(timezone.utc),
+        }
 
     def generate_spec(self, request: MigrationSpecRequest, control_dir_name: Optional[str] = None) -> Path:
         dir_name = control_dir_name or self._safe_vm_name(request.vm_name)
@@ -341,17 +472,7 @@ class MigrationManager:
         if not state_data and job is None:
             return None
 
-        return {
-            "vm_name": vm_name,
-            "stage": state_data.get("stage"),
-            "progress": state_data.get("progress"),
-            "disks": state_data.get("disks") or state_data.get("disk_status") or {},
-            "job_id": job.job_id if job else None,
-            "job_status": job.status if job else None,
-            "job_error": job.error if job else None,
-            "return_code": job.return_code if job else None,
-            "updated_at": datetime.now(timezone.utc),
-        }
+        return self._build_status_payload(vm_name, state_data, job)
 
     def list_jobs(self, vm_name: Optional[str] = None, limit: int = 100) -> list[dict]:
         with self._lock:
@@ -365,6 +486,7 @@ class MigrationManager:
         result = []
         for job in jobs[:limit]:
             state_data = self._load_state(job.vm_name)
+            progress_payload = self._build_status_payload(job.vm_name, state_data, job)
             result.append(
                 {
                     "job_id": job.job_id,
@@ -375,8 +497,8 @@ class MigrationManager:
                     "finished_at": job.finished_at,
                     "return_code": job.return_code,
                     "error": job.error,
-                    "stage": state_data.get("stage"),
-                    "progress": state_data.get("progress"),
+                    "stage": progress_payload.get("stage"),
+                    "progress": progress_payload.get("overall_progress") or progress_payload.get("progress"),
                 }
             )
 

@@ -1,8 +1,36 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 
-const API_BASE = import.meta.env.VITE_API_BASE || `${window.location.protocol}//${window.location.hostname}:8000`;
+import DiskTable from "./components/DiskTable";
+import EnvironmentManager from "./components/EnvironmentManager";
+import MigrationProgress from "./components/MigrationProgress";
+import VMSelector from "./components/VMSelector";
 
-const emptyDisk = () => ({ unit: "1", storageid: "", diskofferingid: "" });
+const API_BASE = import.meta.env.VITE_API_BASE || `${window.location.protocol}//${window.location.hostname}:8000`;
+const ENV_STORAGE_KEY = "vm_migrator_environments_v1";
+
+const DEFAULT_ENV_STATE = {
+  selectedVcenterId: "",
+  selectedCloudstackId: "",
+  vcenters: [],
+  cloudstacks: [],
+};
+
+function optionLabel(item) {
+  return item.name || item.displaytext || item.id || "Unknown";
+}
+
+function uniqueByVm(jobs) {
+  const seen = new Set();
+  const result = [];
+  jobs.forEach((job) => {
+    if (seen.has(job.vm_name)) {
+      return;
+    }
+    seen.add(job.vm_name);
+    result.push(job.vm_name);
+  });
+  return result;
+}
 
 async function apiRequest(path, options = {}) {
   const response = await fetch(`${API_BASE}${path}`, {
@@ -14,25 +42,21 @@ async function apiRequest(path, options = {}) {
   });
 
   const text = await response.text();
-  const data = text ? JSON.parse(text) : null;
+  const payload = text ? JSON.parse(text) : null;
 
   if (!response.ok) {
-    const detail = data?.detail || response.statusText;
+    const detail = payload?.detail || response.statusText;
     throw new Error(typeof detail === "string" ? detail : JSON.stringify(detail));
   }
 
-  return data;
-}
-
-function resourceLabel(item) {
-  return item.name || item.displaytext || item.id || "Unknown";
+  return payload;
 }
 
 export default function App() {
   const [tab, setTab] = useState("new");
   const [busy, setBusy] = useState(false);
-  const [message, setMessage] = useState("");
-  const [error, setError] = useState("");
+  const [inventoryBusy, setInventoryBusy] = useState(false);
+  const [vmDisksLoading, setVmDisksLoading] = useState(false);
 
   const [vmwareVms, setVmwareVms] = useState([]);
   const [zones, setZones] = useState([]);
@@ -40,6 +64,9 @@ export default function App() {
   const [storagePools, setStoragePools] = useState([]);
   const [networks, setNetworks] = useState([]);
   const [serviceOfferings, setServiceOfferings] = useState([]);
+  const [diskOfferings, setDiskOfferings] = useState([]);
+
+  const [detectedDisks, setDetectedDisks] = useState([]);
 
   const [form, setForm] = useState({
     vm_name: "",
@@ -57,89 +84,267 @@ export default function App() {
       shutdown_mode: "",
       snapshot_quiesce: "",
     },
-    disks: [emptyDisk()],
   });
+
   const [lastSpecFile, setLastSpecFile] = useState("");
 
   const [jobs, setJobs] = useState([]);
+  const [statusByVm, setStatusByVm] = useState({});
+  const [selectedJob, setSelectedJob] = useState(null);
   const [logs, setLogs] = useState({ stdout: "", stderr: "", stdout_path: "", stderr_path: "", job_id: "" });
   const [logsBusy, setLogsBusy] = useState(false);
 
+  const [toasts, setToasts] = useState([]);
+
+  const [envState, setEnvState] = useState(() => {
+    try {
+      const raw = localStorage.getItem(ENV_STORAGE_KEY);
+      if (!raw) {
+        return DEFAULT_ENV_STATE;
+      }
+      const parsed = JSON.parse(raw);
+      return {
+        ...DEFAULT_ENV_STATE,
+        ...parsed,
+      };
+    } catch {
+      return DEFAULT_ENV_STATE;
+    }
+  });
+
+  useEffect(() => {
+    localStorage.setItem(ENV_STORAGE_KEY, JSON.stringify(envState));
+  }, [envState]);
+
+  const pushToast = useCallback((type, message) => {
+    const id = `${Date.now()}-${Math.floor(Math.random() * 10000)}`;
+    setToasts((prev) => [...prev, { id, type, message }]);
+    setTimeout(() => {
+      setToasts((prev) => prev.filter((toast) => toast.id !== id));
+    }, 4500);
+  }, []);
+
   const vmOptions = useMemo(
-    () => vmwareVms.map((vm) => ({ label: `${vm.name} (${vm.moref})`, value: vm.name, moref: vm.moref })),
+    () => vmwareVms.map((vm) => ({ name: vm.name, moref: vm.moref, disks: vm.disks || [] })),
     [vmwareVms]
   );
 
+  const validationByUnit = useMemo(() => {
+    const errors = {};
+    detectedDisks.forEach((disk) => {
+      if (!disk.storageid) {
+        errors[disk.unit] = "Storage target is required.";
+        return;
+      }
+
+      if (disk.diskType !== "os" && !disk.diskofferingid) {
+        errors[disk.unit] = "Disk offering is required for data disks.";
+      }
+    });
+    return errors;
+  }, [detectedDisks]);
+
+  const canStartMigration = useMemo(() => {
+    const hasRequiredCoreFields =
+      !!form.vm_name &&
+      !!form.vm_moref &&
+      !!form.zoneid &&
+      !!form.clusterid &&
+      !!form.networkid &&
+      !!form.serviceofferingid &&
+      !!form.boot_storageid;
+
+    return hasRequiredCoreFields && detectedDisks.length > 0 && Object.keys(validationByUnit).length === 0 && !busy;
+  }, [busy, detectedDisks, form, validationByUnit]);
+
+  const mapDetectedDisks = useCallback(
+    (vmDisks) => {
+      const previousByUnit = Object.fromEntries(detectedDisks.map((disk) => [disk.unit, disk]));
+
+      return vmDisks.map((disk, index) => {
+        const unit = disk.unit !== null && disk.unit !== undefined ? String(disk.unit) : String(index);
+        const existing = previousByUnit[unit];
+
+        return {
+          unit,
+          label: disk.label || `Disk ${index + 1}`,
+          sizeGb: disk.size_gb,
+          sizeText: disk.size_gb ? `${disk.size_gb} GB` : "-",
+          datastore: disk.datastore || "-",
+          diskType: disk.disk_type || (index === 0 ? "os" : "data"),
+          storageid: existing?.storageid || form.boot_storageid || "",
+          diskofferingid: existing?.diskofferingid || "",
+        };
+      });
+    },
+    [detectedDisks, form.boot_storageid]
+  );
+
   const loadInventory = useCallback(async () => {
+    setInventoryBusy(true);
     try {
-      setError("");
-      const [vmList, zoneList, clusterList, storageList, networkList, offeringList] = await Promise.all([
+      const [vms, zoneList, clusterList, storageList, networkList, serviceList, diskOfferingList] = await Promise.all([
         apiRequest("/vmware/vms"),
         apiRequest("/cloudstack/zones"),
         apiRequest("/cloudstack/clusters"),
         apiRequest("/cloudstack/storage"),
         apiRequest("/cloudstack/networks"),
         apiRequest("/cloudstack/serviceofferings"),
+        apiRequest("/cloudstack/diskofferings"),
       ]);
 
-      setVmwareVms(vmList);
+      setVmwareVms(vms);
       setZones(zoneList);
       setClusters(clusterList);
       setStoragePools(storageList);
       setNetworks(networkList);
-      setServiceOfferings(offeringList);
+      setServiceOfferings(serviceList);
+      setDiskOfferings(diskOfferingList);
 
       setForm((prev) => ({
         ...prev,
-        vm_name: prev.vm_name || vmList[0]?.name || "",
-        vm_moref: prev.vm_moref || vmList[0]?.moref || "",
+        vm_name: prev.vm_name || vms[0]?.name || "",
+        vm_moref: prev.vm_moref || vms[0]?.moref || "",
         zoneid: prev.zoneid || zoneList[0]?.id || "",
         clusterid: prev.clusterid || clusterList[0]?.id || "",
         networkid: prev.networkid || networkList[0]?.id || "",
-        serviceofferingid: prev.serviceofferingid || offeringList[0]?.id || "",
+        serviceofferingid: prev.serviceofferingid || serviceList[0]?.id || "",
         boot_storageid: prev.boot_storageid || storageList[0]?.id || "",
-        disks: prev.disks.map((disk) => ({
-          ...disk,
-          storageid: disk.storageid || storageList[0]?.id || "",
-        })),
       }));
-    } catch (loadErr) {
-      setError(loadErr.message);
+    } catch (err) {
+      pushToast("error", err.message || "Failed to load inventory.");
+    } finally {
+      setInventoryBusy(false);
     }
-  }, []);
+  }, [pushToast]);
+
+  const detectVmDisks = useCallback(
+    async (vmNameOverride = null) => {
+      const targetVmName = vmNameOverride || form.vm_name;
+      if (!targetVmName) {
+        return;
+      }
+
+      setVmDisksLoading(true);
+      try {
+        const vms = await apiRequest("/vmware/vms");
+        setVmwareVms(vms);
+
+        const selectedVm = vms.find((vm) => vm.name === targetVmName);
+        if (!selectedVm) {
+          setDetectedDisks([]);
+          pushToast("error", `VM ${targetVmName} not found in vCenter.`);
+          return;
+        }
+
+        setForm((prev) => ({
+          ...prev,
+          vm_moref: selectedVm.moref || prev.vm_moref || "",
+        }));
+
+        const mapped = mapDetectedDisks(selectedVm.disks || []);
+        setDetectedDisks(mapped);
+      } catch (err) {
+        pushToast("error", err.message || "Failed to detect VM disks.");
+      } finally {
+        setVmDisksLoading(false);
+      }
+    },
+    [form.vm_name, mapDetectedDisks, pushToast]
+  );
 
   const refreshJobs = useCallback(async () => {
     try {
       const list = await apiRequest("/migration/jobs?limit=200");
       setJobs(list);
-    } catch (jobsErr) {
-      setError(jobsErr.message);
+    } catch (err) {
+      pushToast("error", err.message || "Failed to load jobs.");
     }
-  }, []);
+  }, [pushToast]);
+
+  const pollStatuses = useCallback(async () => {
+    const vmNames = uniqueByVm(jobs);
+    if (!vmNames.length) {
+      return;
+    }
+
+    try {
+      const responses = await Promise.all(
+        vmNames.map(async (vmName) => {
+          try {
+            const status = await apiRequest(`/migration/status/${encodeURIComponent(vmName)}`);
+            return [vmName, status];
+          } catch {
+            return [vmName, null];
+          }
+        })
+      );
+
+      const updates = {};
+      responses.forEach(([vmName, payload]) => {
+        if (payload) {
+          updates[vmName] = payload;
+        }
+      });
+
+      if (Object.keys(updates).length) {
+        setStatusByVm((prev) => ({ ...prev, ...updates }));
+      }
+    } catch {
+      // keep silent to avoid noisy polling toasts
+    }
+  }, [jobs]);
+
+  const loadLogsForJob = useCallback(async (job) => {
+    if (!job) {
+      return;
+    }
+
+    setLogsBusy(true);
+    try {
+      const response = await apiRequest(
+        `/migration/logs/${encodeURIComponent(job.vm_name)}?job_id=${encodeURIComponent(job.job_id)}&lines=300`
+      );
+      setLogs(response);
+    } catch (err) {
+      pushToast("error", err.message || "Failed to load logs.");
+    } finally {
+      setLogsBusy(false);
+    }
+  }, [pushToast]);
 
   useEffect(() => {
     loadInventory();
-  }, [loadInventory]);
+    refreshJobs();
+  }, [loadInventory, refreshJobs]);
 
   useEffect(() => {
-    refreshJobs();
+    if (!form.vm_name) {
+      return;
+    }
+    detectVmDisks(form.vm_name);
+  }, [form.vm_name, detectVmDisks]);
+
+  useEffect(() => {
     const interval = setInterval(refreshJobs, 8000);
     return () => clearInterval(interval);
   }, [refreshJobs]);
 
   useEffect(() => {
-    const selected = vmwareVms.find((vm) => vm.name === form.vm_name);
-    if (!selected) {
+    pollStatuses();
+    const interval = setInterval(pollStatuses, 2000);
+    return () => clearInterval(interval);
+  }, [pollStatuses]);
+
+  useEffect(() => {
+    if (!selectedJob) {
       return;
     }
 
-    setForm((prev) => {
-      if (prev.vm_moref === selected.moref) {
-        return prev;
-      }
-      return { ...prev, vm_moref: selected.moref || "" };
-    });
-  }, [form.vm_name, vmwareVms]);
+    loadLogsForJob(selectedJob);
+    const interval = setInterval(() => loadLogsForJob(selectedJob), 2000);
+    return () => clearInterval(interval);
+  }, [selectedJob, loadLogsForJob]);
 
   const updateField = (field, value) => {
     setForm((prev) => ({ ...prev, [field]: value }));
@@ -155,39 +360,19 @@ export default function App() {
     }));
   };
 
-  const updateDisk = (index, key, value) => {
-    setForm((prev) => {
-      const next = [...prev.disks];
-      next[index] = { ...next[index], [key]: value };
-      return { ...prev, disks: next };
-    });
-  };
-
-  const addDisk = () => {
-    setForm((prev) => ({
-      ...prev,
-      disks: [...prev.disks, { ...emptyDisk(), unit: String(prev.disks.length + 1), storageid: prev.boot_storageid || "" }],
-    }));
-  };
-
-  const removeDisk = (index) => {
-    setForm((prev) => {
-      if (prev.disks.length <= 1) {
-        return prev;
-      }
-      const next = prev.disks.filter((_, i) => i !== index);
-      return { ...prev, disks: next };
-    });
+  const updateDisk = (unit, field, value) => {
+    setDetectedDisks((prev) => prev.map((disk) => (disk.unit === unit ? { ...disk, [field]: value } : disk)));
   };
 
   const buildSpecPayload = () => {
-    const diskMap = {};
-    form.disks.forEach((disk) => {
-      if (!disk.unit) {
+    const disks = {};
+    detectedDisks.forEach((disk) => {
+      const shouldInclude = disk.diskType !== "os" || !!disk.diskofferingid;
+      if (!shouldInclude) {
         return;
       }
-      diskMap[disk.unit] = {
-        storageid: disk.storageid,
+      disks[disk.unit] = {
+        storageid: disk.storageid || form.boot_storageid,
         diskofferingid: disk.diskofferingid,
       };
     });
@@ -214,22 +399,24 @@ export default function App() {
 
     return {
       vm_name: form.vm_name,
-      vm_moref: form.vm_moref || undefined,
+      vm_moref: form.vm_moref,
       zoneid: form.zoneid,
       clusterid: form.clusterid,
       networkid: form.networkid,
       serviceofferingid: form.serviceofferingid,
       boot_storageid: form.boot_storageid,
-      disks: diskMap,
+      disks,
       migration,
     };
   };
 
-  const createSpec = async (autoStart) => {
-    setBusy(true);
-    setMessage("");
-    setError("");
+  const createSpec = async (startAfter) => {
+    if (!canStartMigration) {
+      pushToast("error", "Please resolve validation errors before starting migration.");
+      return;
+    }
 
+    setBusy(true);
     try {
       const specResp = await apiRequest("/migration/spec", {
         method: "POST",
@@ -237,19 +424,20 @@ export default function App() {
       });
 
       setLastSpecFile(specResp.spec_file);
-      setMessage(`Spec generated at ${specResp.spec_file}`);
+      pushToast("success", `Spec generated: ${specResp.spec_file}`);
 
-      if (autoStart) {
+      if (startAfter) {
         const startResp = await apiRequest("/migration/start", {
           method: "POST",
           body: JSON.stringify({ vm_name: form.vm_name, spec_file: specResp.spec_file }),
         });
-        setMessage(`Migration started. Job ${startResp.job_id}`);
-        setTab("jobs");
-        await refreshJobs();
+
+        pushToast("success", `Migration started: ${startResp.job_id}`);
+        setTab("progress");
+        refreshJobs();
       }
-    } catch (submitErr) {
-      setError(submitErr.message);
+    } catch (err) {
+      pushToast("error", err.message || "Failed to generate/start migration.");
     } finally {
       setBusy(false);
     }
@@ -257,256 +445,227 @@ export default function App() {
 
   const finalizeVm = async (vmName) => {
     try {
-      setError("");
       const response = await apiRequest(`/migration/finalize/${encodeURIComponent(vmName)}`, { method: "POST" });
-      setMessage(`${response.message}: ${response.finalize_file}`);
-    } catch (finalizeErr) {
-      setError(finalizeErr.message);
+      pushToast("success", response.message);
+    } catch (err) {
+      pushToast("error", err.message || "Failed to finalize migration.");
     }
   };
 
-  const openLogs = async (job) => {
-    try {
-      setLogsBusy(true);
-      setError("");
-      const result = await apiRequest(
-        `/migration/logs/${encodeURIComponent(job.vm_name)}?job_id=${encodeURIComponent(job.job_id)}&lines=300`
-      );
-      setLogs(result);
-    } catch (logsErr) {
-      setError(logsErr.message);
-    } finally {
-      setLogsBusy(false);
-    }
-  };
+  const selectedVmStatus = selectedJob ? statusByVm[selectedJob.vm_name] : null;
 
   return (
     <div className="app-shell">
       <header className="topbar">
         <div>
           <h1>VMware to CloudStack Migrator</h1>
-          <p>Build specs, start migrations, track progress, and trigger finalize from one console.</p>
+          <p>Auto-detect VM disks, validate offerings, and monitor migration in real time.</p>
         </div>
         <div className="tab-buttons">
           <button className={tab === "new" ? "active" : ""} onClick={() => setTab("new")}>New Migration</button>
-          <button className={tab === "jobs" ? "active" : ""} onClick={() => setTab("jobs")}>Jobs & Logs</button>
+          <button className={tab === "progress" ? "active" : ""} onClick={() => setTab("progress")}>Progress</button>
         </div>
       </header>
 
-      {message ? <div className="notice success">{message}</div> : null}
-      {error ? <div className="notice error">{error}</div> : null}
+      <div className="toast-stack">
+        {toasts.map((toast) => (
+          <div key={toast.id} className={`toast ${toast.type}`}>
+            {toast.message}
+          </div>
+        ))}
+      </div>
 
       {tab === "new" ? (
-        <section className="panel">
-          <h2>Create Migration</h2>
-          <div className="form-grid">
-            <label>
-              Source VM
-              <select value={form.vm_name} onChange={(e) => updateField("vm_name", e.target.value)}>
-                {vmOptions.map((vm) => (
-                  <option key={`${vm.value}-${vm.moref}`} value={vm.value}>{vm.label}</option>
-                ))}
-              </select>
-            </label>
+        <>
+          <EnvironmentManager envState={envState} onChange={setEnvState} onToast={pushToast} />
 
-            <label>
-              VM MoRef
-              <input value={form.vm_moref} onChange={(e) => updateField("vm_moref", e.target.value)} placeholder="vm-123" />
-            </label>
+          <VMSelector
+            vmOptions={vmOptions}
+            vmName={form.vm_name}
+            vmMoref={form.vm_moref}
+            onVmChange={(value) => updateField("vm_name", value)}
+            onMorefChange={(value) => updateField("vm_moref", value)}
+            onDetectDisks={() => detectVmDisks(form.vm_name)}
+            loading={vmDisksLoading}
+          />
 
-            <label>
-              Zone
-              <select value={form.zoneid} onChange={(e) => updateField("zoneid", e.target.value)}>
-                {zones.map((item) => (
-                  <option key={item.id} value={item.id}>{resourceLabel(item)}</option>
-                ))}
-              </select>
-            </label>
-
-            <label>
-              Cluster
-              <select value={form.clusterid} onChange={(e) => updateField("clusterid", e.target.value)}>
-                {clusters.map((item) => (
-                  <option key={item.id} value={item.id}>{resourceLabel(item)}</option>
-                ))}
-              </select>
-            </label>
-
-            <label>
-              Network
-              <select value={form.networkid} onChange={(e) => updateField("networkid", e.target.value)}>
-                {networks.map((item) => (
-                  <option key={item.id} value={item.id}>{resourceLabel(item)}</option>
-                ))}
-              </select>
-            </label>
-
-            <label>
-              Service Offering
-              <select value={form.serviceofferingid} onChange={(e) => updateField("serviceofferingid", e.target.value)}>
-                {serviceOfferings.map((item) => (
-                  <option key={item.id} value={item.id}>{resourceLabel(item)}</option>
-                ))}
-              </select>
-            </label>
-
-            <label>
-              Boot Storage
-              <select value={form.boot_storageid} onChange={(e) => updateField("boot_storageid", e.target.value)}>
-                {storagePools.map((item) => (
-                  <option key={item.id} value={item.id}>{resourceLabel(item)}</option>
-                ))}
-              </select>
-            </label>
-
-            <label>
-              Delta Interval (sec)
-              <input
-                type="number"
-                min="1"
-                value={form.migration.delta_interval}
-                onChange={(e) => updateMigrationField("delta_interval", e.target.value)}
-              />
-            </label>
-
-            <label>
-              Finalize At (ISO)
-              <input
-                value={form.migration.finalize_at}
-                onChange={(e) => updateMigrationField("finalize_at", e.target.value)}
-                placeholder="2026-03-12T23:30:00+00:00"
-              />
-            </label>
-
-            <label>
-              Finalize Delta Interval
-              <input
-                type="number"
-                min="1"
-                value={form.migration.finalize_delta_interval}
-                onChange={(e) => updateMigrationField("finalize_delta_interval", e.target.value)}
-              />
-            </label>
-
-            <label>
-              Finalize Window
-              <input
-                type="number"
-                min="1"
-                value={form.migration.finalize_window}
-                onChange={(e) => updateMigrationField("finalize_window", e.target.value)}
-              />
-            </label>
-
-            <label>
-              Shutdown Mode
-              <input
-                value={form.migration.shutdown_mode}
-                onChange={(e) => updateMigrationField("shutdown_mode", e.target.value)}
-                placeholder="auto"
-              />
-            </label>
-
-            <label>
-              Snapshot Quiesce
-              <input
-                value={form.migration.snapshot_quiesce}
-                onChange={(e) => updateMigrationField("snapshot_quiesce", e.target.value)}
-                placeholder="auto"
-              />
-            </label>
-          </div>
-
-          <div className="subsection">
+          <section className="panel">
             <div className="subsection-title-row">
-              <h3>Data Disks</h3>
-              <button className="secondary" onClick={addDisk}>Add Disk</button>
+              <h2>Target and Strategy</h2>
+              <button className="secondary" onClick={loadInventory} disabled={inventoryBusy}>
+                {inventoryBusy ? "Loading..." : "Reload Inventory"}
+              </button>
             </div>
-            {form.disks.map((disk, index) => (
-              <div className="disk-row" key={`${disk.unit}-${index}`}>
-                <input value={disk.unit} onChange={(e) => updateDisk(index, "unit", e.target.value)} placeholder="Unit" />
-                <select value={disk.storageid} onChange={(e) => updateDisk(index, "storageid", e.target.value)}>
-                  {storagePools.map((item) => (
-                    <option key={item.id} value={item.id}>{resourceLabel(item)}</option>
+
+            <div className="form-grid">
+              <label>
+                Zone
+                <select value={form.zoneid} onChange={(e) => updateField("zoneid", e.target.value)}>
+                  <option value="">Select zone</option>
+                  {zones.map((item) => (
+                    <option key={item.id} value={item.id}>{optionLabel(item)}</option>
                   ))}
                 </select>
+              </label>
+
+              <label>
+                Cluster
+                <select value={form.clusterid} onChange={(e) => updateField("clusterid", e.target.value)}>
+                  <option value="">Select cluster</option>
+                  {clusters.map((item) => (
+                    <option key={item.id} value={item.id}>{optionLabel(item)}</option>
+                  ))}
+                </select>
+              </label>
+
+              <label>
+                Network
+                <select value={form.networkid} onChange={(e) => updateField("networkid", e.target.value)}>
+                  <option value="">Select network</option>
+                  {networks.map((item) => (
+                    <option key={item.id} value={item.id}>{optionLabel(item)}</option>
+                  ))}
+                </select>
+              </label>
+
+              <label>
+                Service Offering
+                <select value={form.serviceofferingid} onChange={(e) => updateField("serviceofferingid", e.target.value)}>
+                  <option value="">Select service offering</option>
+                  {serviceOfferings.map((item) => (
+                    <option key={item.id} value={item.id}>{optionLabel(item)}</option>
+                  ))}
+                </select>
+              </label>
+
+              <label>
+                Boot Storage
+                <select value={form.boot_storageid} onChange={(e) => updateField("boot_storageid", e.target.value)}>
+                  <option value="">Select boot storage</option>
+                  {storagePools.map((item) => (
+                    <option key={item.id} value={item.id}>{optionLabel(item)}</option>
+                  ))}
+                </select>
+              </label>
+
+              <label>
+                Delta Interval (sec)
                 <input
-                  value={disk.diskofferingid}
-                  onChange={(e) => updateDisk(index, "diskofferingid", e.target.value)}
-                  placeholder="Disk offering ID"
+                  type="number"
+                  min="1"
+                  value={form.migration.delta_interval}
+                  onChange={(e) => updateMigrationField("delta_interval", e.target.value)}
                 />
-                <button className="danger" onClick={() => removeDisk(index)}>Remove</button>
-              </div>
-            ))}
-          </div>
+              </label>
 
-          <div className="actions">
-            <button disabled={busy} onClick={() => createSpec(false)}>Generate Spec</button>
-            <button disabled={busy} onClick={() => createSpec(true)}>Generate & Start</button>
-            <button className="secondary" disabled={busy} onClick={loadInventory}>Reload Inventory</button>
-          </div>
+              <label>
+                Finalize At (ISO)
+                <input
+                  value={form.migration.finalize_at}
+                  onChange={(e) => updateMigrationField("finalize_at", e.target.value)}
+                  placeholder="2026-03-12T23:30:00+00:00"
+                />
+              </label>
 
-          {lastSpecFile ? <p className="hint">Latest spec: <code>{lastSpecFile}</code></p> : null}
-        </section>
+              <label>
+                Finalize Delta Interval
+                <input
+                  type="number"
+                  min="1"
+                  value={form.migration.finalize_delta_interval}
+                  onChange={(e) => updateMigrationField("finalize_delta_interval", e.target.value)}
+                />
+              </label>
+
+              <label>
+                Finalize Window
+                <input
+                  type="number"
+                  min="1"
+                  value={form.migration.finalize_window}
+                  onChange={(e) => updateMigrationField("finalize_window", e.target.value)}
+                />
+              </label>
+
+              <label>
+                Shutdown Mode
+                <input
+                  value={form.migration.shutdown_mode}
+                  onChange={(e) => updateMigrationField("shutdown_mode", e.target.value)}
+                  placeholder="auto"
+                />
+              </label>
+
+              <label>
+                Snapshot Quiesce
+                <input
+                  value={form.migration.snapshot_quiesce}
+                  onChange={(e) => updateMigrationField("snapshot_quiesce", e.target.value)}
+                  placeholder="auto"
+                />
+              </label>
+            </div>
+          </section>
+
+          <DiskTable
+            disks={detectedDisks}
+            storagePools={storagePools}
+            diskOfferings={diskOfferings}
+            onDiskChange={updateDisk}
+            validationByUnit={validationByUnit}
+            osDiskOfferingOptional
+          />
+
+          <section className="panel">
+            <div className="actions">
+              <button disabled={busy || !form.vm_name} onClick={() => createSpec(false)}>
+                Generate Spec
+              </button>
+              <button disabled={!canStartMigration} onClick={() => createSpec(true)}>
+                Start Migration
+              </button>
+            </div>
+            {Object.keys(validationByUnit).length > 0 ? (
+              <p className="field-error">Complete required disk offerings for all data disks before starting.</p>
+            ) : null}
+            {lastSpecFile ? <p className="hint">Last generated spec: <code>{lastSpecFile}</code></p> : null}
+          </section>
+        </>
       ) : (
-        <section className="panel">
-          <div className="subsection-title-row">
-            <h2>Running and Recent Jobs</h2>
-            <button className="secondary" onClick={refreshJobs}>Refresh</button>
-          </div>
-
-          <div className="table-wrap">
-            <table>
-              <thead>
-                <tr>
-                  <th>VM</th>
-                  <th>Job</th>
-                  <th>Status</th>
-                  <th>Stage</th>
-                  <th>Progress</th>
-                  <th>Started</th>
-                  <th>Actions</th>
-                </tr>
-              </thead>
-              <tbody>
-                {jobs.map((job) => (
-                  <tr key={job.job_id}>
-                    <td>{job.vm_name}</td>
-                    <td><code>{job.job_id.slice(0, 8)}</code></td>
-                    <td><span className={`pill ${job.status}`}>{job.status}</span></td>
-                    <td>{job.stage || "-"}</td>
-                    <td>{job.progress ?? "-"}</td>
-                    <td>{new Date(job.started_at).toLocaleString()}</td>
-                    <td className="row-actions">
-                      <button className="secondary" onClick={() => finalizeVm(job.vm_name)}>Finalize</button>
-                      <button className="secondary" onClick={() => openLogs(job)}>Logs</button>
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-
-          <div className="logs-pane">
-            <div className="subsection-title-row">
-              <h3>Logs</h3>
-              {logsBusy ? <span className="hint">Loading...</span> : null}
-            </div>
-            <p className="hint">
-              Job: <code>{logs.job_id || "n/a"}</code>
-            </p>
-            <div className="logs-grid">
-              <div>
-                <h4>STDOUT</h4>
-                <pre>{logs.stdout || "No stdout available."}</pre>
+        <MigrationProgress
+          jobs={jobs}
+          statusByVm={statusByVm}
+          selectedJobId={selectedJob?.job_id || ""}
+          onSelectJob={(job) => {
+            setSelectedJob(job);
+            loadLogsForJob(job);
+          }}
+          onFinalize={finalizeVm}
+          logsSection={
+            <div className="logs-pane">
+              <div className="subsection-title-row">
+                <h3>Logs</h3>
+                {logsBusy ? <span className="hint">Loading...</span> : null}
               </div>
-              <div>
-                <h4>STDERR</h4>
-                <pre>{logs.stderr || "No stderr available."}</pre>
+              {selectedJob ? (
+                <p className="hint">
+                  Job <code>{selectedJob.job_id}</code> | VM <strong>{selectedJob.vm_name}</strong>
+                </p>
+              ) : null}
+              <div className="logs-grid">
+                <div>
+                  <h4>STDOUT</h4>
+                  <pre>{logs.stdout || "No stdout logs available."}</pre>
+                </div>
+                <div>
+                  <h4>STDERR</h4>
+                  <pre>{logs.stderr || "No stderr logs available."}</pre>
+                </div>
               </div>
+              {selectedVmStatus?.job_error ? <p className="field-error">{selectedVmStatus.job_error}</p> : null}
             </div>
-          </div>
-        </section>
+          }
+        />
       )}
     </div>
   );

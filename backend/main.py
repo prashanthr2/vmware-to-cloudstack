@@ -134,6 +134,11 @@ def list_cloudstack_networks() -> list[dict[str, Any]]:
     return _cloudstack_call(cloudstack_client.list_networks)
 
 
+@app.get("/cloudstack/diskofferings")
+def list_cloudstack_disk_offerings() -> list[dict[str, Any]]:
+    return _cloudstack_call(cloudstack_client.list_disk_offerings)
+
+
 @app.get("/cloudstack/serviceofferings")
 def list_cloudstack_service_offerings() -> list[dict[str, Any]]:
     return _cloudstack_call(cloudstack_client.list_service_offerings)
@@ -225,3 +230,4 @@ def migration_logs(
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
+

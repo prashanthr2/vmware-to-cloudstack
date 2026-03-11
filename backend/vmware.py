@@ -91,6 +91,20 @@ class VMwareClient:
         finally:
             view.Destroy()
 
+    @staticmethod
+    def _detect_boot_disk_unit(vm) -> Optional[int]:
+        boot = getattr(vm.config, "bootOptions", None)
+        if boot and getattr(boot, "bootOrder", None):
+            for device in boot.bootOrder:
+                if isinstance(device, vim.vm.BootOptions.BootableDiskDevice):
+                    boot_key = device.deviceKey
+                    for dev in vm.config.hardware.device:
+                        if isinstance(dev, vim.vm.device.VirtualDisk) and dev.key == boot_key:
+                            return int(dev.unitNumber)
+
+        units = [int(dev.unitNumber) for dev in vm.config.hardware.device if isinstance(dev, vim.vm.device.VirtualDisk)]
+        return min(units) if units else None
+
     def list_vms(self) -> list[dict]:
         self._validate_config()
 
@@ -104,6 +118,8 @@ class VMwareClient:
                 if config is None:
                     continue
 
+                boot_unit = self._detect_boot_disk_unit(vm)
+
                 disks = []
                 for device in config.hardware.device:
                     if isinstance(device, vim.vm.device.VirtualDisk):
@@ -113,14 +129,20 @@ class VMwareClient:
                         if datastore is not None:
                             datastore_name = datastore.name
 
+                        unit = int(device.unitNumber) if device.unitNumber is not None else None
+                        disk_type = "os" if boot_unit is not None and unit == boot_unit else "data"
+
                         disks.append(
                             {
                                 "label": device.deviceInfo.label if device.deviceInfo else "Virtual Disk",
                                 "size_gb": round(device.capacityInKB / (1024 * 1024), 2),
                                 "datastore": datastore_name,
+                                "unit": unit,
+                                "disk_type": disk_type,
                             }
                         )
 
+                disks.sort(key=lambda d: d.get("unit") if d.get("unit") is not None else 10_000)
                 datastores = [ds.name for ds in getattr(vm, "datastore", []) if getattr(ds, "name", None)]
 
                 result.append(
