@@ -5,10 +5,11 @@ import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Optional
+from urllib.parse import urlparse
 
 import requests
 import yaml
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 
 from .cloudstack import CloudStackClient
@@ -26,7 +27,7 @@ from .models import (
 )
 from .vmware import VMwareClient
 
-app = FastAPI(title="VMware to CloudStack Migration Backend", version="1.3.0")
+app = FastAPI(title="VMware to CloudStack Migration Backend", version="1.4.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -56,14 +57,101 @@ def _safe_vm_name(vm_name: str) -> str:
     return re.sub(r"[^A-Za-z0-9._-]", "_", vm_name)
 
 
-def _resolve_vm_control_dir(payload: MigrationSpecRequest) -> str:
+def _parse_bool(raw: Optional[str], default: bool = False) -> bool:
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _parse_vcenter_host(raw: str) -> tuple[str, Optional[int]]:
+    value = raw.strip()
+    if not value:
+        return "", None
+
+    if "://" in value:
+        parsed = urlparse(value)
+        host = parsed.hostname or ""
+        return host, parsed.port
+
+    host = value.split("/")[0]
+    if host.count(":") == 1:
+        left, right = host.split(":", 1)
+        if right.isdigit():
+            return left, int(right)
+
+    return host, None
+
+
+def _vmware_client_for_request(request: Request) -> VMwareClient:
+    header_host = request.headers.get("x-vcenter-host")
+    if not header_host:
+        return vmware_client
+
+    host, parsed_port = _parse_vcenter_host(header_host)
+    username = request.headers.get("x-vcenter-user", "")
+    password = request.headers.get("x-vcenter-password", "")
+
+    if not host or not username or not password:
+        raise HTTPException(
+            status_code=400,
+            detail="Selected vCenter environment is missing host, username, or password.",
+        )
+
+    port_raw = request.headers.get("x-vcenter-port")
+    try:
+        port = int(port_raw) if port_raw else (parsed_port or 443)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Invalid x-vcenter-port header.") from exc
+
+    verify_ssl = _parse_bool(request.headers.get("x-vcenter-verify-ssl"), default=False)
+
+    return VMwareClient(
+        host=host,
+        username=username,
+        password=password,
+        port=port,
+        verify_ssl=verify_ssl,
+    )
+
+
+def _cloudstack_client_for_request(request: Request) -> CloudStackClient:
+    endpoint = request.headers.get("x-cloudstack-endpoint")
+    if not endpoint:
+        return cloudstack_client
+
+    api_key = request.headers.get("x-cloudstack-api-key", "")
+    secret_key = request.headers.get("x-cloudstack-secret-key", "")
+
+    if not api_key or not secret_key:
+        raise HTTPException(
+            status_code=400,
+            detail="Selected CloudStack environment is missing API key or secret key.",
+        )
+
+    timeout_raw = request.headers.get("x-cloudstack-timeout-seconds")
+    try:
+        timeout_seconds = int(timeout_raw) if timeout_raw else 30
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Invalid x-cloudstack-timeout-seconds header.") from exc
+
+    return CloudStackClient(
+        endpoint=endpoint,
+        api_key=api_key,
+        secret_key=secret_key,
+        timeout_seconds=timeout_seconds,
+    )
+
+
+def _resolve_vm_control_dir(payload: MigrationSpecRequest, request: Request) -> str:
     safe_name = _safe_vm_name(payload.vm_name)
 
     if payload.vm_moref:
         return f"{safe_name}_{payload.vm_moref}"
 
     try:
-        vm_list = vmware_client.list_vms()
+        vm_list = _vmware_client_for_request(request).list_vms()
+    except HTTPException:
+        raise
     except Exception as exc:
         raise HTTPException(
             status_code=400,
@@ -103,9 +191,11 @@ migration_manager = MigrationManager.from_sources(runtime_config)
 
 
 @app.get("/vmware/vms", response_model=list[VMwareVMInfo])
-def list_vmware_vms() -> list[dict[str, Any]]:
+def list_vmware_vms(request: Request) -> list[dict[str, Any]]:
     try:
-        return vmware_client.list_vms()
+        return _vmware_client_for_request(request).list_vms()
+    except HTTPException:
+        raise
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except RuntimeError as exc:
@@ -115,38 +205,40 @@ def list_vmware_vms() -> list[dict[str, Any]]:
 
 
 @app.get("/cloudstack/zones")
-def list_cloudstack_zones() -> list[dict[str, Any]]:
-    return _cloudstack_call(cloudstack_client.list_zones)
+def list_cloudstack_zones(request: Request) -> list[dict[str, Any]]:
+    return _cloudstack_call(_cloudstack_client_for_request(request).list_zones)
 
 
 @app.get("/cloudstack/clusters")
-def list_cloudstack_clusters() -> list[dict[str, Any]]:
-    return _cloudstack_call(cloudstack_client.list_clusters)
+def list_cloudstack_clusters(request: Request) -> list[dict[str, Any]]:
+    return _cloudstack_call(_cloudstack_client_for_request(request).list_clusters)
 
 
 @app.get("/cloudstack/storage")
-def list_cloudstack_storage() -> list[dict[str, Any]]:
-    return _cloudstack_call(cloudstack_client.list_storage)
+def list_cloudstack_storage(request: Request) -> list[dict[str, Any]]:
+    return _cloudstack_call(_cloudstack_client_for_request(request).list_storage)
 
 
 @app.get("/cloudstack/networks")
-def list_cloudstack_networks() -> list[dict[str, Any]]:
-    return _cloudstack_call(cloudstack_client.list_networks)
+def list_cloudstack_networks(request: Request) -> list[dict[str, Any]]:
+    return _cloudstack_call(_cloudstack_client_for_request(request).list_networks)
 
 
 @app.get("/cloudstack/diskofferings")
-def list_cloudstack_disk_offerings() -> list[dict[str, Any]]:
-    return _cloudstack_call(cloudstack_client.list_disk_offerings)
+def list_cloudstack_disk_offerings(request: Request) -> list[dict[str, Any]]:
+    return _cloudstack_call(_cloudstack_client_for_request(request).list_disk_offerings)
 
 
 @app.get("/cloudstack/serviceofferings")
-def list_cloudstack_service_offerings() -> list[dict[str, Any]]:
-    return _cloudstack_call(cloudstack_client.list_service_offerings)
+def list_cloudstack_service_offerings(request: Request) -> list[dict[str, Any]]:
+    return _cloudstack_call(_cloudstack_client_for_request(request).list_service_offerings)
 
 
 def _cloudstack_call(fn: Callable[[], list[dict[str, Any]]]) -> list[dict[str, Any]]:
     try:
         return fn()
+    except HTTPException:
+        raise
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except requests.RequestException as exc:
@@ -156,9 +248,9 @@ def _cloudstack_call(fn: Callable[[], list[dict[str, Any]]]) -> list[dict[str, A
 
 
 @app.post("/migration/spec", response_model=MigrationSpecResponse)
-def generate_migration_spec(payload: MigrationSpecRequest) -> MigrationSpecResponse:
+def generate_migration_spec(payload: MigrationSpecRequest, request: Request) -> MigrationSpecResponse:
     try:
-        control_dir_name = _resolve_vm_control_dir(payload)
+        control_dir_name = _resolve_vm_control_dir(payload, request)
         spec_file = migration_manager.generate_spec(payload, control_dir_name=control_dir_name)
         return MigrationSpecResponse(
             vm_name=payload.vm_name,
@@ -230,4 +322,3 @@ def migration_logs(
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
-

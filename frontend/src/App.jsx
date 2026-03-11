@@ -116,6 +116,37 @@ export default function App() {
     localStorage.setItem(ENV_STORAGE_KEY, JSON.stringify(envState));
   }, [envState]);
 
+  const selectedVcenter = useMemo(
+    () => envState.vcenters.find((item) => item.id === envState.selectedVcenterId) || null,
+    [envState.selectedVcenterId, envState.vcenters]
+  );
+  const selectedCloudstack = useMemo(
+    () => envState.cloudstacks.find((item) => item.id === envState.selectedCloudstackId) || null,
+    [envState.cloudstacks, envState.selectedCloudstackId]
+  );
+
+  const vmwareHeaders = useMemo(() => {
+    if (!selectedVcenter) {
+      return {};
+    }
+    return {
+      "x-vcenter-host": selectedVcenter.host || "",
+      "x-vcenter-user": selectedVcenter.username || "",
+      "x-vcenter-password": selectedVcenter.password || "",
+    };
+  }, [selectedVcenter]);
+
+  const cloudstackHeaders = useMemo(() => {
+    if (!selectedCloudstack) {
+      return {};
+    }
+    return {
+      "x-cloudstack-endpoint": selectedCloudstack.apiUrl || "",
+      "x-cloudstack-api-key": selectedCloudstack.apiKey || "",
+      "x-cloudstack-secret-key": selectedCloudstack.secretKey || "",
+    };
+  }, [selectedCloudstack]);
+
   const pushToast = useCallback((type, message) => {
     const id = `${Date.now()}-${Math.floor(Math.random() * 10000)}`;
     setToasts((prev) => [...prev, { id, type, message }]);
@@ -180,17 +211,40 @@ export default function App() {
     [detectedDisks, form.boot_storageid]
   );
 
+  const pickValidOrFirst = useCallback((currentId, items) => {
+    if (!items.length) {
+      return "";
+    }
+    return items.some((item) => item.id === currentId) ? currentId : items[0].id;
+  }, []);
+
+  const mapInventoryDisks = useCallback((vmDisks, bootStorageId) => {
+    return vmDisks.map((disk, index) => {
+      const unit = disk.unit !== null && disk.unit !== undefined ? String(disk.unit) : String(index);
+      return {
+        unit,
+        label: disk.label || `Disk ${index + 1}`,
+        sizeGb: disk.size_gb,
+        sizeText: disk.size_gb ? `${disk.size_gb} GB` : "-",
+        datastore: disk.datastore || "-",
+        diskType: disk.disk_type || (index === 0 ? "os" : "data"),
+        storageid: bootStorageId || "",
+        diskofferingid: "",
+      };
+    });
+  }, []);
+
   const loadInventory = useCallback(async () => {
     setInventoryBusy(true);
     try {
       const [vms, zoneList, clusterList, storageList, networkList, serviceList, diskOfferingList] = await Promise.all([
-        apiRequest("/vmware/vms"),
-        apiRequest("/cloudstack/zones"),
-        apiRequest("/cloudstack/clusters"),
-        apiRequest("/cloudstack/storage"),
-        apiRequest("/cloudstack/networks"),
-        apiRequest("/cloudstack/serviceofferings"),
-        apiRequest("/cloudstack/diskofferings"),
+        apiRequest("/vmware/vms", { headers: vmwareHeaders }),
+        apiRequest("/cloudstack/zones", { headers: cloudstackHeaders }),
+        apiRequest("/cloudstack/clusters", { headers: cloudstackHeaders }),
+        apiRequest("/cloudstack/storage", { headers: cloudstackHeaders }),
+        apiRequest("/cloudstack/networks", { headers: cloudstackHeaders }),
+        apiRequest("/cloudstack/serviceofferings", { headers: cloudstackHeaders }),
+        apiRequest("/cloudstack/diskofferings", { headers: cloudstackHeaders }),
       ]);
 
       setVmwareVms(vms);
@@ -201,22 +255,30 @@ export default function App() {
       setServiceOfferings(serviceList);
       setDiskOfferings(diskOfferingList);
 
-      setForm((prev) => ({
-        ...prev,
-        vm_name: prev.vm_name || vms[0]?.name || "",
-        vm_moref: prev.vm_moref || vms[0]?.moref || "",
-        zoneid: prev.zoneid || zoneList[0]?.id || "",
-        clusterid: prev.clusterid || clusterList[0]?.id || "",
-        networkid: prev.networkid || networkList[0]?.id || "",
-        serviceofferingid: prev.serviceofferingid || serviceList[0]?.id || "",
-        boot_storageid: prev.boot_storageid || storageList[0]?.id || "",
-      }));
+      setForm((prev) => {
+        const nextVmName = vms.some((vm) => vm.name === prev.vm_name) ? prev.vm_name : vms[0]?.name || "";
+        const vmForSelection = vms.find((vm) => vm.name === nextVmName);
+        const nextBootStorage = pickValidOrFirst(prev.boot_storageid, storageList);
+
+        setDetectedDisks(vmForSelection ? mapInventoryDisks(vmForSelection.disks || [], nextBootStorage) : []);
+
+        return {
+          ...prev,
+          vm_name: nextVmName,
+          vm_moref: vmForSelection?.moref || "",
+          zoneid: pickValidOrFirst(prev.zoneid, zoneList),
+          clusterid: pickValidOrFirst(prev.clusterid, clusterList),
+          networkid: pickValidOrFirst(prev.networkid, networkList),
+          serviceofferingid: pickValidOrFirst(prev.serviceofferingid, serviceList),
+          boot_storageid: nextBootStorage,
+        };
+      });
     } catch (err) {
       pushToast("error", err.message || "Failed to load inventory.");
     } finally {
       setInventoryBusy(false);
     }
-  }, [pushToast]);
+  }, [cloudstackHeaders, mapInventoryDisks, pickValidOrFirst, pushToast, vmwareHeaders]);
 
   const detectVmDisks = useCallback(
     async (vmNameOverride = null) => {
@@ -227,7 +289,7 @@ export default function App() {
 
       setVmDisksLoading(true);
       try {
-        const vms = await apiRequest("/vmware/vms");
+        const vms = await apiRequest("/vmware/vms", { headers: vmwareHeaders });
         setVmwareVms(vms);
 
         const selectedVm = vms.find((vm) => vm.name === targetVmName);
@@ -250,7 +312,7 @@ export default function App() {
         setVmDisksLoading(false);
       }
     },
-    [form.vm_name, mapDetectedDisks, pushToast]
+    [form.vm_name, mapDetectedDisks, pushToast, vmwareHeaders]
   );
 
   const refreshJobs = useCallback(async () => {
@@ -420,6 +482,7 @@ export default function App() {
     try {
       const specResp = await apiRequest("/migration/spec", {
         method: "POST",
+        headers: vmwareHeaders,
         body: JSON.stringify(buildSpecPayload()),
       });
 
