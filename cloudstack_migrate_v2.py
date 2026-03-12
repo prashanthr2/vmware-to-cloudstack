@@ -1,4 +1,4 @@
-﻿# V2 engine scaffold: safe place for base_copy/delta redesign.
+# V2 engine scaffold: safe place for base_copy/delta redesign.
 # This file starts as a copy of cloudstack_migrate.py and can diverge independently.
 
 import os
@@ -447,11 +447,44 @@ class Migrator:
         return disk_cfg["storageid"]
 
 
-    def run_qemu_convert(self, cmd, raw_file, disk_size, disk_unit):
+    def precreate_qcow2(self, path, size_bytes):
+        size_bytes = int(size_bytes)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+
+        if os.path.exists(path):
+            os.remove(path)
+
+        cmd = [
+            "qemu-img",
+            "create",
+            "-f", "qcow2",
+            "-o", "preallocation=falloc",
+            path,
+            str(size_bytes),
+        ]
+
+        log(f"[disk] precreate qcow2: {' '.join(cmd)}")
+        subprocess.run(cmd, check=True)
+
+    def run_v2v_base(self, source_nbd_uri, target_qcow2_path, disk_size, disk_unit):
         import pty
 
-        start = time.time()
+        output_dir = os.path.dirname(target_qcow2_path)
+        output_name = os.path.splitext(os.path.basename(target_qcow2_path))[0]
 
+        cmd = [
+            "virt-v2v",
+            "-i", "disk",
+            source_nbd_uri,
+            "-o", "local",
+            "-os", output_dir,
+            "-of", "qcow2",
+            "-on", output_name,
+        ]
+
+        log(f"[disk{disk_unit}] starting virt-v2v base: {' '.join(cmd)}")
+
+        start = time.time()
         master, slave = pty.openpty()
         flags = fcntl.fcntl(master, fcntl.F_GETFL)
         fcntl.fcntl(master, fcntl.F_SETFL, flags | os.O_NONBLOCK)
@@ -464,122 +497,59 @@ class Migrator:
         )
         os.close(slave)
 
-        qemu_pct = 0.0
+        v2v_pct = 0.0
 
         while proc.poll() is None:
             ready, _, _ = select.select([master], [], [], 1.0)
-
             if ready:
                 try:
                     data = os.read(master, 4096).decode(errors="ignore")
-                    for part in data.split("\r"):
-                        if "(" in part and "/100%" in part:
+                    for part in data.replace("\n", "\r").split("\r"):
+                        if "(" in part and "/100" in part:
                             try:
-                                qemu_pct = float(part.split("(")[1].split("/")[0])
+                                pct_raw = part.split("(")[1].split("/")[0].strip()
+                                v2v_pct = float(pct_raw)
                             except (IndexError, ValueError):
                                 pass
                 except OSError:
                     pass
 
-            if os.path.exists(raw_file):
-                st = os.stat(raw_file)
-                written = st.st_blocks * 512
-                alloc_pct = min((written / disk_size) * 100, 100) if disk_size else 0
-                effective_pct = max(alloc_pct, qemu_pct)
+            elapsed = max(time.time() - start, 1e-6)
+            written_bytes = int((v2v_pct / 100.0) * disk_size) if disk_size else 0
+            speed = written_bytes / elapsed / (1024**2)
+            eta_seconds = None
+            if speed > 0 and disk_size:
+                remaining = max(disk_size - written_bytes, 0)
+                eta_seconds = int(remaining / (speed * 1024 * 1024))
 
-                elapsed = time.time() - start
-                speed = written / elapsed / (1024**2) if elapsed > 0 else 0
+            with self.state_lock:
+                disk_state = self.state["disks"].setdefault(str(disk_unit), {})
+                disk_state["qemu_progress"] = v2v_pct
+                disk_state["progress"] = v2v_pct
+                disk_state["bytes_written"] = written_bytes
+                disk_state["copied_bytes"] = written_bytes
+                disk_state["speed_mb"] = round(speed, 2)
+                disk_state["speed_mbps"] = round(speed, 2)
+                disk_state["transfer_speed_mbps"] = round(speed, 2)
+                if eta_seconds is not None:
+                    disk_state["eta_seconds"] = eta_seconds
 
-                dynamic_estimated_used = None
-                if qemu_pct > 0:
-                    ratio = max(min(qemu_pct, 100.0), 0.01) / 100.0
-                    dynamic_estimated_used = int(written / ratio)
-                    if disk_size:
-                        dynamic_estimated_used = min(max(dynamic_estimated_used, written), disk_size)
-                    elif dynamic_estimated_used < written:
-                        dynamic_estimated_used = written
+                self.state["transfer_speed_mbps"] = round(speed, 2)
+                self.state["stage"] = MigrationStage.BASE_COPY
+                self._recalculate_overall_progress_locked()
 
-                with self.state_lock:
-                    disk_state = self.state["disks"].setdefault(str(disk_unit), {})
-                    disk_state["qemu_progress"] = qemu_pct
-                    disk_state["progress"] = effective_pct
-                    disk_state["bytes_written"] = written
-                    disk_state["copied_bytes"] = min(written, disk_size) if disk_size else written
-
-                    locked_estimate = bool(disk_state.get("used_estimate_locked"))
-                    if not locked_estimate and dynamic_estimated_used is not None:
-                        previous_est = self._to_int(disk_state.get("estimated_used_bytes"))
-                        if previous_est > 0:
-                            diff_ratio = abs(dynamic_estimated_used - previous_est) / float(max(previous_est, 1))
-                            stable_count = self._to_int(disk_state.get("used_estimate_stable_count"))
-                            stable_count = stable_count + 1 if diff_ratio <= 0.02 else 0
-                            smoothed = int((previous_est * 3 + dynamic_estimated_used) / 4)
-                            new_estimate = max(smoothed, written)
-                        else:
-                            stable_count = 0
-                            new_estimate = max(dynamic_estimated_used, written)
-
-                        if disk_size:
-                            new_estimate = min(new_estimate, disk_size)
-
-                        disk_state["estimated_used_bytes"] = new_estimate
-                        disk_state["read_total_bytes"] = new_estimate
-                        disk_state["used_estimate_stable_count"] = stable_count
-                        disk_state["used_size_source"] = "estimated_qemu"
-
-                        if stable_count >= 5 and qemu_pct >= 20:
-                            disk_state["used_estimate_locked"] = True
-                            disk_state["used_size_source"] = "estimated_stable"
-                            log(f"[disk{disk_unit}] locked used-size estimate at {format_bytes(new_estimate)}")
-
-                    eta_total = self._to_int(disk_state.get("read_total_bytes")) or self._to_int(
-                        disk_state.get("estimated_used_bytes")
-                    )
-                    if eta_total <= 0 and disk_size:
-                        eta_total = disk_size
-
-                    if eta_total > 0 and eta_total < written:
-                        eta_total = written
-                        disk_state["estimated_used_bytes"] = eta_total
-                        disk_state["read_total_bytes"] = eta_total
-
-                    disk_state["speed_mb"] = round(speed, 2)
-                    disk_state["speed_mbps"] = round(speed, 2)
-                    disk_state["transfer_speed_mbps"] = round(speed, 2)
-
-                    if speed > 0 and eta_total > 0:
-                        remaining = max(eta_total - written, 0)
-                        disk_state["eta_seconds"] = int(remaining / (speed * 1024 * 1024))
-
-                    self.state["transfer_speed_mbps"] = round(speed, 2)
-                    self.state["stage"] = MigrationStage.BASE_COPY
-                    self._recalculate_overall_progress_locked()
-
-                log(f"[disk{disk_unit}] copy {alloc_pct:.2f}% scan {qemu_pct:.2f}% {speed:.1f} MB/s")
-                self.save_state()
+            self.save_state()
 
         os.close(master)
         if proc.returncode != 0:
-            raise Exception(f"qemu-img convert failed with code {proc.returncode}")
-
-        final_written = disk_size
-        if os.path.exists(raw_file):
-            try:
-                final_written = os.stat(raw_file).st_blocks * 512
-            except OSError:
-                final_written = disk_size
+            raise Exception(f"virt-v2v base failed with code {proc.returncode}")
 
         with self.state_lock:
             disk_state = self.state["disks"].setdefault(str(disk_unit), {})
             disk_state["qemu_progress"] = 100.0
             disk_state["progress"] = 100.0
-            disk_state["bytes_written"] = final_written
-            disk_state["copied_bytes"] = final_written
-            disk_state["estimated_used_bytes"] = final_written
-            disk_state["read_total_bytes"] = final_written
-            disk_state["used_estimate_stable_count"] = 999
-            disk_state["used_estimate_locked"] = True
-            disk_state["used_size_source"] = "final_sparse_written"
+            disk_state["bytes_written"] = disk_size
+            disk_state["copied_bytes"] = disk_size
             disk_state["speed_mb"] = 0
             disk_state["speed_mbps"] = 0
             disk_state["transfer_speed_mbps"] = 0
@@ -588,7 +558,6 @@ class Migrator:
             self._recalculate_overall_progress_locked()
 
         self.save_state()
-
     def _recalculate_overall_progress_locked(self):
         progress_values = [
             d.get("progress")
@@ -1052,56 +1021,27 @@ class Migrator:
         storageid = self.get_disk_storage(u_str)
         storage_path = ensure_storage_mounted(storageid)
 
-        raw_file = f"{storage_path}/{self.migration_id}_disk{u_str}.raw"
+        target_qcow2 = f"{storage_path}/{self.migration_id}_disk{u_str}.qcow2"
 
         log(f"Disk {u_str}: staging on storage {storageid}")
-        log(f"Disk {u_str}: Starting Base copy")
+        log(f"Disk {u_str}: Starting direct-to-qcow2 base copy")
 
-        uri = f"nbd+unix:///?socket={sock}"
+        source_uri = f"nbd+unix:///?socket={sock}"
 
         try:
-            self.run_qemu_convert(
-                [
-                    "stdbuf", "-e0",
-                    "qemu-img", "convert", "-p",
-                    "-m", "16",
-                    "-t", "none",
-                    "-T", "none",
-                    "-O", "raw",
-                    uri,
-                    raw_file
-                ],
-                raw_file,
-                disk["capacity"],
-                u_str
-            )
+            self.precreate_qcow2(target_qcow2, disk["capacity"])
+            self.run_v2v_base(source_uri, target_qcow2, disk["capacity"], u_str)
 
             disk_obj = next(d for d in res_snap.config.hardware.device if d.key == disk['key'])
 
             with self.state_lock:
                 disk_state = self.state["disks"].setdefault(u_str, {})
-                disk_state["path"] = raw_file
+                disk_state["path"] = target_qcow2
+                disk_state["format"] = "qcow2"
                 disk_state["changeId"] = disk_obj.backing.changeId
                 disk_state["capacity"] = disk["capacity"]
                 disk_state["key"] = disk["key"]
-
-                final_written = self._to_int(disk_state.get("bytes_written")) or self._to_int(disk_state.get("copied_bytes"))
-                if final_written <= 0 and os.path.exists(raw_file):
-                    try:
-                        final_written = os.stat(raw_file).st_blocks * 512
-                    except OSError:
-                        final_written = 0
-
-                if final_written > 0:
-                    disk_state["copied_bytes"] = final_written
-                    disk_state["estimated_used_bytes"] = max(
-                        self._to_int(disk_state.get("estimated_used_bytes")),
-                        final_written,
-                    )
-                    disk_state["read_total_bytes"] = disk_state["estimated_used_bytes"]
-
-                disk_state["used_estimate_locked"] = True
-                disk_state.setdefault("used_size_source", "base_copy_completed")
+                disk_state["copied_bytes"] = disk["capacity"]
                 disk_state["progress"] = 100.0
                 self._recalculate_overall_progress_locked()
             self.save_state()
@@ -1111,7 +1051,6 @@ class Migrator:
                 proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 proc.kill()
-
     def base_copy(self):
         try:
             self._seed_guest_used_estimates()
@@ -1142,141 +1081,174 @@ class Migrator:
 
         for disk in self.disks():
             u_str = str(disk['unit'])
-            proc, sock_path = self.start_nbd(disk, new_snap)
-            h = nbd.NBD()
+            src_proc, src_sock_path = self.start_nbd(disk, new_snap)
+            target_proc = None
+            src_h = nbd.NBD()
+            dst_h = nbd.NBD()
+
+            target_sock = f"/tmp/target_{self.migration_id}_{u_str}.sock"
+            if os.path.exists(target_sock):
+                os.remove(target_sock)
 
             try:
-                h.connect_unix(sock_path)
-
                 with self.state_lock:
                     disk_state = self.state["disks"].get(u_str, {})
                     old_change_id = disk_state.get("changeId")
-                    raw_path = disk_state.get("path")
+                    target_qcow2 = disk_state.get("path")
 
                 if not old_change_id:
                     raise Exception(f"Missing previous changeId for disk unit {u_str}")
-                if not raw_path:
-                    raise Exception(f"Missing raw path in state for disk unit {u_str}")
+                if not target_qcow2:
+                    raise Exception(f"Missing target path in state for disk unit {u_str}")
+                if not os.path.exists(target_qcow2):
+                    raise Exception(f"Target qcow2 does not exist for disk unit {u_str}: {target_qcow2}")
 
-                delta_written = 0
+                target_proc = subprocess.Popen([
+                    "qemu-nbd",
+                    "--socket", target_sock,
+                    "--format", "qcow2",
+                    target_qcow2,
+                ])
+
+                src_h.connect_unix(src_sock_path)
+
+                connected_dst = False
+                for _ in range(60):
+                    if os.path.exists(target_sock):
+                        try:
+                            dst_h.connect_unix(target_sock)
+                            connected_dst = True
+                            break
+                        except Exception:
+                            pass
+                    time.sleep(1)
+
+                if not connected_dst:
+                    raise Exception(f"qemu-nbd target socket not ready for disk unit {u_str}")
+
+                written_bytes = 0
                 delta_total = 0
-                delta_start = time.time()
+                start_time = time.time()
                 last_state_flush = 0.0
 
-                with open(raw_path, "r+b") as f:
-                    start_offset = 0
-                    while start_offset < disk["capacity"]:
-                        spec = self.vm.QueryChangedDiskAreas(
-                            snapshot=new_snap,
-                            deviceKey=disk["key"],
-                            startOffset=start_offset,
-                            changeId=old_change_id
-                        )
+                start_offset = 0
+                while start_offset < disk["capacity"]:
+                    spec = self.vm.QueryChangedDiskAreas(
+                        snapshot=new_snap,
+                        deviceKey=disk["key"],
+                        startOffset=start_offset,
+                        changeId=old_change_id,
+                    )
 
-                        changed_areas = list(spec.changedArea or [])
-                        if not changed_areas:
-                            start_offset = spec.startOffset + spec.length
-                            if start_offset >= disk["capacity"]:
-                                break
-                            continue
-
-                        for area in changed_areas:
-                            delta_total += area.length
-                            offset = area.start
-                            end = area.start + area.length
-
-                            while offset < end:
-                                chunk_size = min(64 * 1024 * 1024, end - offset)
-                                t0 = time.time()
-
-                                buf = h.pread(chunk_size, offset)
-
-                                f.seek(offset)
-                                f.write(buf)
-
-                                elapsed = max(time.time() - t0, 1e-6)
-                                chunk_mb = len(buf) / (1024 * 1024)
-                                chunk_speed = chunk_mb / elapsed
-                                delta_written += len(buf)
-
-                                elapsed_total = max(time.time() - delta_start, 1e-6)
-                                speed_mbps = delta_written / elapsed_total / (1024 * 1024)
-
-                                eta_seconds = None
-                                if speed_mbps > 0:
-                                    remaining = max(delta_total - delta_written, 0)
-                                    eta_seconds = int(remaining / (speed_mbps * 1024 * 1024))
-
-                                log(f"[delta] disk {u_str} offset={offset} size={chunk_mb:.1f}MB speed={chunk_speed:.1f}MB/s")
-
-                                now_ts = time.time()
-                                if now_ts - last_state_flush >= 1.0:
-                                    delta_progress = 0.0
-                                    if delta_total > 0:
-                                        delta_progress = round(min((delta_written / delta_total) * 100, 100), 2)
-
-                                    with self.state_lock:
-                                        disk_state = self.state["disks"].setdefault(u_str, {})
-                                        disk_state["delta_total_bytes"] = delta_total
-                                        disk_state["delta_bytes_written"] = delta_written
-                                        disk_state["delta_progress"] = delta_progress
-                                        disk_state["speed_mb"] = round(speed_mbps, 2)
-                                        disk_state["speed_mbps"] = round(speed_mbps, 2)
-                                        disk_state["transfer_speed_mbps"] = round(speed_mbps, 2)
-                                        disk_state.setdefault("capacity", disk["capacity"])
-                                        disk_state.setdefault("copied_bytes", disk["capacity"])
-                                        if eta_seconds is not None:
-                                            disk_state["eta_seconds"] = eta_seconds
-
-                                        self.state["transfer_speed_mbps"] = round(speed_mbps, 2)
-                                        self.state["stage"] = MigrationStage.DELTA
-                                        self._recalculate_overall_progress_locked()
-
-                                    self.save_state()
-                                    last_state_flush = now_ts
-
-                                offset += chunk_size
-
+                    changed_areas = list(spec.changedArea or [])
+                    if not changed_areas:
                         start_offset = spec.startOffset + spec.length
                         if start_offset >= disk["capacity"]:
                             break
+                        continue
 
-                total_time = max(time.time() - delta_start, 1e-6)
-                total_mb = delta_written / (1024 * 1024)
+                    for area in changed_areas:
+                        delta_total += area.length
+                        offset = area.start
+                        end = area.start + area.length
+
+                        while offset < end:
+                            chunk_size = min(64 * 1024 * 1024, end - offset)
+                            buf = src_h.pread(chunk_size, offset)
+                            dst_h.pwrite(buf, offset)
+
+                            written_bytes += len(buf)
+
+                            elapsed_total = max(time.time() - start_time, 1e-6)
+                            speed_mbps = written_bytes / elapsed_total / (1024 * 1024)
+
+                            delta_progress = 0.0
+                            if delta_total > 0:
+                                delta_progress = round(min((written_bytes / delta_total) * 100, 100), 2)
+
+                            eta_seconds = None
+                            if speed_mbps > 0 and delta_total > 0:
+                                remaining = max(delta_total - written_bytes, 0)
+                                eta_seconds = int(remaining / (speed_mbps * 1024 * 1024))
+
+                            now_ts = time.time()
+                            if now_ts - last_state_flush >= 1.0:
+                                with self.state_lock:
+                                    dstate = self.state["disks"].setdefault(u_str, {})
+                                    dstate["delta_total_bytes"] = delta_total
+                                    dstate["delta_bytes_written"] = written_bytes
+                                    dstate["delta_progress"] = delta_progress
+                                    dstate["speed_mb"] = round(speed_mbps, 2)
+                                    dstate["speed_mbps"] = round(speed_mbps, 2)
+                                    dstate["transfer_speed_mbps"] = round(speed_mbps, 2)
+                                    dstate.setdefault("capacity", disk["capacity"])
+                                    dstate.setdefault("copied_bytes", disk["capacity"])
+                                    if eta_seconds is not None:
+                                        dstate["eta_seconds"] = eta_seconds
+
+                                    self.state["transfer_speed_mbps"] = round(speed_mbps, 2)
+                                    self.state["stage"] = MigrationStage.DELTA
+                                    self._recalculate_overall_progress_locked()
+
+                                self.save_state()
+                                last_state_flush = now_ts
+
+                            offset += chunk_size
+
+                    start_offset = spec.startOffset + spec.length
+                    if start_offset >= disk["capacity"]:
+                        break
+
+                total_time = max(time.time() - start_time, 1e-6)
+                total_mb = written_bytes / (1024 * 1024)
                 avg_speed = total_mb / total_time
-                if delta_written:
+                if written_bytes:
                     log(f"[delta] disk {u_str} total {total_mb:.1f}MB in {total_time:.1f}s ({avg_speed:.1f}MB/s)")
                 else:
                     log(f"[delta] disk {u_str} no changed blocks")
 
                 disk_obj = next(d for d in new_snap.config.hardware.device if d.key == disk['key'])
                 with self.state_lock:
-                    disk_state = self.state["disks"].setdefault(u_str, {})
-                    disk_state["changeId"] = disk_obj.backing.changeId
-                    disk_state["delta_total_bytes"] = delta_total
-                    disk_state["delta_bytes_written"] = delta_written
-                    disk_state["delta_progress"] = 100.0 if delta_total > 0 else 0.0
-                    disk_state["speed_mb"] = 0
-                    disk_state["speed_mbps"] = 0
-                    disk_state["transfer_speed_mbps"] = 0
-                    disk_state["eta_seconds"] = 0
-                    disk_state.setdefault("capacity", disk["capacity"])
-                    disk_state.setdefault("copied_bytes", disk["capacity"])
+                    dstate = self.state["disks"].setdefault(u_str, {})
+                    dstate["changeId"] = disk_obj.backing.changeId
+                    dstate["delta_total_bytes"] = delta_total
+                    dstate["delta_bytes_written"] = written_bytes
+                    dstate["delta_progress"] = 100.0 if delta_total > 0 else 0.0
+                    dstate["speed_mb"] = 0
+                    dstate["speed_mbps"] = 0
+                    dstate["transfer_speed_mbps"] = 0
+                    dstate["eta_seconds"] = 0
+                    dstate.setdefault("capacity", disk["capacity"])
+                    dstate.setdefault("copied_bytes", disk["capacity"])
                     self.state["transfer_speed_mbps"] = 0
                     self.state["stage"] = MigrationStage.DELTA
                     self._recalculate_overall_progress_locked()
                 self.save_state()
             finally:
                 try:
-                    h.close()
+                    src_h.close()
+                except Exception:
+                    pass
+                try:
+                    dst_h.close()
                 except Exception:
                     pass
 
-                proc.terminate()
+                if target_proc is not None:
+                    target_proc.terminate()
+                    try:
+                        target_proc.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        target_proc.kill()
+
+                src_proc.terminate()
                 try:
-                    proc.wait(timeout=5)
+                    src_proc.wait(timeout=5)
                 except subprocess.TimeoutExpired:
-                    proc.kill()
+                    src_proc.kill()
+
+                if os.path.exists(target_sock):
+                    os.remove(target_sock)
 
         with self.state_lock:
             self.state["active_snapshot"] = new_snap._moId
@@ -1292,7 +1264,6 @@ class Migrator:
 
             if task.info.state == vim.TaskInfo.State.error:
                 raise task.info.error
-
     def finalize(self):
         self.ensure_vcenter_session()
 
