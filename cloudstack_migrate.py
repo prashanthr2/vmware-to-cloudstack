@@ -487,23 +487,14 @@ class Migrator:
                 elapsed = time.time() - start
                 speed = written / elapsed / (1024**2) if elapsed > 0 else 0
 
-                estimated_used = None
+                dynamic_estimated_used = None
                 if qemu_pct > 0:
                     ratio = max(min(qemu_pct, 100.0), 0.01) / 100.0
-                    estimated_used = int(written / ratio)
+                    dynamic_estimated_used = int(written / ratio)
                     if disk_size:
-                        estimated_used = min(max(estimated_used, written), disk_size)
-                    elif estimated_used < written:
-                        estimated_used = written
-
-                eta_seconds = None
-                if speed > 0:
-                    eta_total = estimated_used if estimated_used is not None else disk_size
-                    if eta_total is not None:
-                        remaining = max(eta_total - written, 0)
-                        eta_seconds = int(remaining / (speed * 1024 * 1024))
-
-                log(f"[disk{disk_unit}] copy {alloc_pct:.2f}% scan {qemu_pct:.2f}% {speed:.1f} MB/s")
+                        dynamic_estimated_used = min(max(dynamic_estimated_used, written), disk_size)
+                    elif dynamic_estimated_used < written:
+                        dynamic_estimated_used = written
 
                 with self.state_lock:
                     disk_state = self.state["disks"].setdefault(str(disk_unit), {})
@@ -511,18 +502,57 @@ class Migrator:
                     disk_state["progress"] = effective_pct
                     disk_state["bytes_written"] = written
                     disk_state["copied_bytes"] = min(written, disk_size) if disk_size else written
-                    if estimated_used is not None:
-                        disk_state["estimated_used_bytes"] = estimated_used
-                        disk_state["read_total_bytes"] = estimated_used
+
+                    locked_estimate = bool(disk_state.get("used_estimate_locked"))
+                    if not locked_estimate and dynamic_estimated_used is not None:
+                        previous_est = self._to_int(disk_state.get("estimated_used_bytes"))
+                        if previous_est > 0:
+                            diff_ratio = abs(dynamic_estimated_used - previous_est) / float(max(previous_est, 1))
+                            stable_count = self._to_int(disk_state.get("used_estimate_stable_count"))
+                            stable_count = stable_count + 1 if diff_ratio <= 0.02 else 0
+                            smoothed = int((previous_est * 3 + dynamic_estimated_used) / 4)
+                            new_estimate = max(smoothed, written)
+                        else:
+                            stable_count = 0
+                            new_estimate = max(dynamic_estimated_used, written)
+
+                        if disk_size:
+                            new_estimate = min(new_estimate, disk_size)
+
+                        disk_state["estimated_used_bytes"] = new_estimate
+                        disk_state["read_total_bytes"] = new_estimate
+                        disk_state["used_estimate_stable_count"] = stable_count
+                        disk_state["used_size_source"] = "estimated_qemu"
+
+                        if stable_count >= 5 and qemu_pct >= 20:
+                            disk_state["used_estimate_locked"] = True
+                            disk_state["used_size_source"] = "estimated_stable"
+                            log(f"[disk{disk_unit}] locked used-size estimate at {format_bytes(new_estimate)}")
+
+                    eta_total = self._to_int(disk_state.get("read_total_bytes")) or self._to_int(
+                        disk_state.get("estimated_used_bytes")
+                    )
+                    if eta_total <= 0 and disk_size:
+                        eta_total = disk_size
+
+                    if eta_total > 0 and eta_total < written:
+                        eta_total = written
+                        disk_state["estimated_used_bytes"] = eta_total
+                        disk_state["read_total_bytes"] = eta_total
+
                     disk_state["speed_mb"] = round(speed, 2)
                     disk_state["speed_mbps"] = round(speed, 2)
                     disk_state["transfer_speed_mbps"] = round(speed, 2)
-                    if eta_seconds is not None:
-                        disk_state["eta_seconds"] = eta_seconds
+
+                    if speed > 0 and eta_total > 0:
+                        remaining = max(eta_total - written, 0)
+                        disk_state["eta_seconds"] = int(remaining / (speed * 1024 * 1024))
+
                     self.state["transfer_speed_mbps"] = round(speed, 2)
                     self.state["stage"] = MigrationStage.BASE_COPY
                     self._recalculate_overall_progress_locked()
 
+                log(f"[disk{disk_unit}] copy {alloc_pct:.2f}% scan {qemu_pct:.2f}% {speed:.1f} MB/s")
                 self.save_state()
 
         os.close(master)
@@ -544,6 +574,9 @@ class Migrator:
             disk_state["copied_bytes"] = final_written
             disk_state["estimated_used_bytes"] = final_written
             disk_state["read_total_bytes"] = final_written
+            disk_state["used_estimate_stable_count"] = 999
+            disk_state["used_estimate_locked"] = True
+            disk_state["used_size_source"] = "final_sparse_written"
             disk_state["speed_mb"] = 0
             disk_state["speed_mbps"] = 0
             disk_state["transfer_speed_mbps"] = 0
@@ -618,6 +651,87 @@ class Migrator:
                 f.flush()
                 os.fsync(f.fileno())
             os.replace(tmp_file, self.state_file)
+
+    @staticmethod
+    def _to_int(value, default=0):
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
+
+    def _vm_guest_used_total_bytes(self):
+        self.ensure_vcenter_session()
+        guest = getattr(self.vm, "guest", None)
+        if guest is None:
+            return None
+
+        tools_status = getattr(guest, "toolsStatus", None)
+        if tools_status not in ["toolsOk", "toolsOld"]:
+            return None
+
+        guest_disks = getattr(guest, "disk", None)
+        if not guest_disks:
+            return None
+
+        total_used = 0
+        for d in guest_disks:
+            capacity = getattr(d, "capacity", None)
+            free_space = getattr(d, "freeSpace", None)
+            if capacity is None or free_space is None:
+                continue
+            used = max(self._to_int(capacity) - self._to_int(free_space), 0)
+            total_used += used
+
+        if total_used <= 0:
+            return None
+
+        return total_used
+
+    def _seed_guest_used_estimates(self):
+        total_used = self._vm_guest_used_total_bytes()
+        if not total_used:
+            return
+
+        vm_disks = self.disks()
+        if not vm_disks:
+            return
+
+        total_capacity = sum(max(self._to_int(d.get("capacity")), 0) for d in vm_disks)
+        if total_capacity <= 0:
+            return
+
+        ordered_disks = sorted(vm_disks, key=lambda d: self._to_int(d.get("unit"), 10_000))
+        remaining = total_used
+
+        with self.state_lock:
+            self.state["guest_used_total_bytes"] = total_used
+            for idx, disk in enumerate(ordered_disks):
+                unit = str(disk["unit"])
+                capacity = max(self._to_int(disk.get("capacity")), 0)
+                disk_state = self.state["disks"].setdefault(unit, {})
+
+                if idx == len(ordered_disks) - 1:
+                    allocated_used = max(remaining, 0)
+                else:
+                    allocated_used = int((total_used * capacity) / total_capacity)
+                    remaining -= allocated_used
+
+                if capacity > 0:
+                    allocated_used = min(allocated_used, capacity)
+
+                copied = self._to_int(disk_state.get("copied_bytes"))
+                allocated_used = max(allocated_used, copied)
+                if capacity > 0:
+                    allocated_used = min(allocated_used, capacity)
+
+                disk_state["estimated_used_bytes"] = allocated_used
+                disk_state["read_total_bytes"] = allocated_used
+                disk_state["used_estimate_stable_count"] = 999
+                disk_state["used_estimate_locked"] = True
+                disk_state["used_size_source"] = "vmware_tools_guest_disk"
+
+        log(f"[+] Seeded used-size from VMware Tools guest disks: {format_bytes(total_used)} total")
+        self.save_state()
 
     def get_boot_disk_unit(self):
         self.ensure_vcenter_session()
@@ -967,7 +1081,24 @@ class Migrator:
                 disk_state["changeId"] = disk_obj.backing.changeId
                 disk_state["capacity"] = disk["capacity"]
                 disk_state["key"] = disk["key"]
-                disk_state["copied_bytes"] = disk["capacity"]
+
+                final_written = self._to_int(disk_state.get("bytes_written")) or self._to_int(disk_state.get("copied_bytes"))
+                if final_written <= 0 and os.path.exists(raw_file):
+                    try:
+                        final_written = os.stat(raw_file).st_blocks * 512
+                    except OSError:
+                        final_written = 0
+
+                if final_written > 0:
+                    disk_state["copied_bytes"] = final_written
+                    disk_state["estimated_used_bytes"] = max(
+                        self._to_int(disk_state.get("estimated_used_bytes")),
+                        final_written,
+                    )
+                    disk_state["read_total_bytes"] = disk_state["estimated_used_bytes"]
+
+                disk_state["used_estimate_locked"] = True
+                disk_state.setdefault("used_size_source", "base_copy_completed")
                 disk_state["progress"] = 100.0
                 self._recalculate_overall_progress_locked()
             self.save_state()
@@ -979,6 +1110,11 @@ class Migrator:
                 proc.kill()
 
     def base_copy(self):
+        try:
+            self._seed_guest_used_estimates()
+        except Exception as e:
+            log(f"[!] Could not seed used-size from VMware Tools: {e}")
+
         self.check_snapshot_limit()
         res_snap = self.create_snapshot(f"Migrate_Base_{self.vm.name}")
         with ThreadPoolExecutor(max_workers=4) as exe:
