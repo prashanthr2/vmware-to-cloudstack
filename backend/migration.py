@@ -250,7 +250,9 @@ class MigrationManager:
                 return None
             return self._jobs[ids[-1]]
 
-    def _build_disk_progress(self, vm_name: str, state_data: dict) -> tuple[list[dict], int, int, Optional[float]]:
+    def _build_disk_progress(
+        self, vm_name: str, state_data: dict, stage: Optional[str] = None
+    ) -> tuple[list[dict], int, int, Optional[float]]:
         raw_disks = state_data.get("disks")
         if not isinstance(raw_disks, dict):
             return [], 0, 0, None
@@ -276,6 +278,8 @@ class MigrationManager:
         boot_unit_str = str(boot_unit) if boot_unit is not None else None
 
         now_ts = datetime.now(timezone.utc).timestamp()
+        stage_norm = (stage or "").lower()
+        use_delta_metrics = stage_norm in {"delta", "final_sync", "waiting_finalize"}
         disk_progress: list[dict] = []
         total_bytes = 0
         copied_bytes_total = 0
@@ -313,11 +317,35 @@ class MigrationManager:
             if capacity > 0 and copied > capacity:
                 copied = capacity
 
+            delta_total = first_int([
+                disk.get("delta_total_bytes"),
+                disk.get("delta_total"),
+                disk.get("changed_bytes_total"),
+            ])
+            delta_copied = first_int([
+                disk.get("delta_bytes_written"),
+                disk.get("delta_copied_bytes"),
+                disk.get("changed_bytes_copied"),
+            ])
+            if delta_total > 0 and delta_copied > delta_total:
+                delta_copied = delta_total
+
+            display_total = capacity
+            display_copied = copied
             remaining = max(capacity - copied, 0) if capacity > 0 else 0
+            if use_delta_metrics and delta_total > 0:
+                display_total = delta_total
+                display_copied = delta_copied
+                remaining = max(delta_total - delta_copied, 0)
 
             progress = None
+            delta_progress_raw = disk.get("delta_progress")
             progress_raw = disk.get("progress")
-            if isinstance(progress_raw, (int, float)):
+            if use_delta_metrics and isinstance(delta_progress_raw, (int, float)):
+                progress = float(delta_progress_raw)
+            elif use_delta_metrics and display_total > 0:
+                progress = round((display_copied / display_total) * 100, 2)
+            elif isinstance(progress_raw, (int, float)):
                 progress = float(progress_raw)
             elif capacity > 0:
                 progress = round((copied / capacity) * 100, 2)
@@ -330,12 +358,13 @@ class MigrationManager:
             ])
             eta_seconds = first_int([disk.get("eta_seconds"), disk.get("eta")]) or None
 
+            sample_copied = display_copied if use_delta_metrics and display_total > 0 else copied
             if speed_mbps is None:
                 previous = self._speed_samples.get(sample_key)
-                if previous and copied >= previous[1]:
+                if previous and sample_copied >= previous[1]:
                     delta_t = now_ts - previous[0]
                     if delta_t > 0:
-                        speed_bps = (copied - previous[1]) / delta_t
+                        speed_bps = (sample_copied - previous[1]) / delta_t
                         if speed_bps > 0:
                             speed_mbps = round(speed_bps / (1024 * 1024), 2)
                             if remaining > 0 and eta_seconds is None:
@@ -344,7 +373,7 @@ class MigrationManager:
             if speed_mbps is not None and speed_mbps > 0:
                 speed_values.append(speed_mbps)
 
-            self._speed_samples[sample_key] = (now_ts, copied)
+            self._speed_samples[sample_key] = (now_ts, sample_copied)
 
             disk_type = disk.get("disk_type")
             if not disk_type:
@@ -356,11 +385,11 @@ class MigrationManager:
                     "disk_name": disk.get("label") or f"disk{unit_str}",
                     "disk_type": disk_type,
                     "datastore": disk.get("datastore"),
-                    "total_size": self._format_bytes(capacity) if capacity > 0 else None,
-                    "copied_size": self._format_bytes(copied),
+                    "total_size": self._format_bytes(display_total) if display_total > 0 else None,
+                    "copied_size": self._format_bytes(display_copied),
                     "remaining_size": self._format_bytes(remaining),
-                    "total_bytes": capacity if capacity > 0 else None,
-                    "copied_bytes": copied,
+                    "total_bytes": display_total if display_total > 0 else None,
+                    "copied_bytes": display_copied,
                     "remaining_bytes": remaining,
                     "speed_mbps": speed_mbps,
                     "eta_seconds": eta_seconds,
@@ -368,8 +397,8 @@ class MigrationManager:
                 }
             )
 
-            total_bytes += capacity
-            copied_bytes_total += copied
+            total_bytes += display_total
+            copied_bytes_total += display_copied
 
         disk_progress.sort(key=lambda d: self._safe_int(d.get("unit")))
 
@@ -384,20 +413,30 @@ class MigrationManager:
         return disk_progress, total_bytes, copied_bytes_total, transfer_speed_mbps
 
     def _build_status_payload(self, vm_name: str, state_data: dict, job: Optional[MigrationJob]) -> dict:
-        disk_progress, total_bytes, copied_bytes_total, transfer_speed_mbps = self._build_disk_progress(vm_name, state_data)
-
         stage = state_data.get("stage")
+        stage_norm = (stage or "").lower()
+        use_delta_metrics = stage_norm in {"delta", "final_sync", "waiting_finalize"}
+
+        disk_progress, total_bytes, copied_bytes_total, transfer_speed_mbps = self._build_disk_progress(
+            vm_name, state_data, stage=stage
+        )
+
         state_progress = state_data.get("progress")
 
         overall_progress = None
-        if isinstance(state_progress, (int, float)):
+        if use_delta_metrics and total_bytes > 0:
+            overall_progress = round((copied_bytes_total / total_bytes) * 100, 2)
+        elif isinstance(state_progress, (int, float)):
             overall_progress = float(state_progress)
         elif total_bytes > 0:
             overall_progress = round((copied_bytes_total / total_bytes) * 100, 2)
         elif stage == "done" or (job and job.status == "completed"):
             overall_progress = 100.0
 
-        progress = state_progress if isinstance(state_progress, (int, float)) else overall_progress
+        if use_delta_metrics:
+            progress = overall_progress
+        else:
+            progress = state_progress if isinstance(state_progress, (int, float)) else overall_progress
 
         return {
             "vm_name": vm_name,
