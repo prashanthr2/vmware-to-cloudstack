@@ -486,10 +486,22 @@ class Migrator:
 
                 elapsed = time.time() - start
                 speed = written / elapsed / (1024**2) if elapsed > 0 else 0
+
+                estimated_used = None
+                if qemu_pct > 0:
+                    ratio = max(min(qemu_pct, 100.0), 0.01) / 100.0
+                    estimated_used = int(written / ratio)
+                    if disk_size:
+                        estimated_used = min(max(estimated_used, written), disk_size)
+                    elif estimated_used < written:
+                        estimated_used = written
+
                 eta_seconds = None
-                if disk_size and speed > 0:
-                    remaining = max(disk_size - written, 0)
-                    eta_seconds = int(remaining / (speed * 1024 * 1024))
+                if speed > 0:
+                    eta_total = estimated_used if estimated_used is not None else disk_size
+                    if eta_total is not None:
+                        remaining = max(eta_total - written, 0)
+                        eta_seconds = int(remaining / (speed * 1024 * 1024))
 
                 log(f"[disk{disk_unit}] copy {alloc_pct:.2f}% scan {qemu_pct:.2f}% {speed:.1f} MB/s")
 
@@ -499,6 +511,9 @@ class Migrator:
                     disk_state["progress"] = effective_pct
                     disk_state["bytes_written"] = written
                     disk_state["copied_bytes"] = min(written, disk_size) if disk_size else written
+                    if estimated_used is not None:
+                        disk_state["estimated_used_bytes"] = estimated_used
+                        disk_state["read_total_bytes"] = estimated_used
                     disk_state["speed_mb"] = round(speed, 2)
                     disk_state["speed_mbps"] = round(speed, 2)
                     disk_state["transfer_speed_mbps"] = round(speed, 2)
@@ -514,12 +529,21 @@ class Migrator:
         if proc.returncode != 0:
             raise Exception(f"qemu-img convert failed with code {proc.returncode}")
 
+        final_written = disk_size
+        if os.path.exists(raw_file):
+            try:
+                final_written = os.stat(raw_file).st_blocks * 512
+            except OSError:
+                final_written = disk_size
+
         with self.state_lock:
             disk_state = self.state["disks"].setdefault(str(disk_unit), {})
             disk_state["qemu_progress"] = 100.0
             disk_state["progress"] = 100.0
-            disk_state["bytes_written"] = disk_size
-            disk_state["copied_bytes"] = disk_size
+            disk_state["bytes_written"] = final_written
+            disk_state["copied_bytes"] = final_written
+            disk_state["estimated_used_bytes"] = final_written
+            disk_state["read_total_bytes"] = final_written
             disk_state["speed_mb"] = 0
             disk_state["speed_mbps"] = 0
             disk_state["transfer_speed_mbps"] = 0

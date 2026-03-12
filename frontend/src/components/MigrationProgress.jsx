@@ -1,4 +1,4 @@
-import DiskProgress from "./DiskProgress";
+﻿import DiskProgress from "./DiskProgress";
 
 function normalizeProgress(value) {
   if (value === null || value === undefined || Number.isNaN(Number(value))) {
@@ -36,18 +36,19 @@ export default function MigrationProgress({
             <tr>
               <th>VM</th>
               <th>Job</th>
-              <th>Status</th>
+              <th>Job Status</th>
               <th>Stage</th>
               <th>Overall Progress</th>
               <th>Speed</th>
               <th>Started</th>
+              <th>Ended</th>
               <th>Actions</th>
             </tr>
           </thead>
           <tbody>
             {jobs.length === 0 ? (
               <tr>
-                <td colSpan={8}>No jobs yet.</td>
+                <td colSpan={9}>No jobs yet.</td>
               </tr>
             ) : (
               jobs.map((job) => {
@@ -57,12 +58,17 @@ export default function MigrationProgress({
                     ? status.overall_progress
                     : job.progress
                 );
+                const jobStatus = status.job_status || job.status || "-";
+                const statusClass = typeof jobStatus === "string" ? jobStatus.toLowerCase() : "";
+                const endedAt =
+                  job.finished_at ||
+                  ((jobStatus === "completed" || jobStatus === "failed") ? status.updated_at : null);
 
                 return (
                   <tr key={job.job_id} className={selectedJobId === job.job_id ? "selected-row" : ""}>
                     <td>{job.vm_name}</td>
                     <td><code>{job.job_id.slice(0, 8)}</code></td>
-                    <td><span className={`pill ${job.status}`}>{job.status}</span></td>
+                    <td><span className={`pill ${statusClass}`}>{jobStatus}</span></td>
                     <td>{status.stage || job.stage || "-"}</td>
                     <td>
                       <div className="progress-cell">
@@ -74,6 +80,7 @@ export default function MigrationProgress({
                     </td>
                     <td>{status.transfer_speed_mbps ? `${status.transfer_speed_mbps} MB/s` : "-"}</td>
                     <td>{formatDate(job.started_at)}</td>
+                    <td>{formatDate(endedAt)}</td>
                     <td className="row-actions">
                       <button className="secondary" onClick={() => onSelectJob(job)}>
                         Details

@@ -72,6 +72,10 @@ class DiskProgressInfo(BaseModel):
     disk_name: str
     disk_type: Optional[str] = None
     datastore: Optional[str] = None
+    provisioned_size: Optional[str] = None
+    provisioned_bytes: Optional[int] = None
+    used_size: Optional[str] = None
+    used_bytes: Optional[int] = None
     total_size: Optional[str] = None
     copied_size: Optional[str] = None
     remaining_size: Optional[str] = None

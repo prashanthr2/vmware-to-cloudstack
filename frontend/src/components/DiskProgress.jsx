@@ -1,4 +1,4 @@
-function formatEta(seconds) {
+﻿function formatEta(seconds) {
   if (!seconds || seconds <= 0) {
     return "-";
   }
@@ -25,10 +25,13 @@ export default function DiskProgress({ status }) {
         <div className="copying-banner">
           <strong>Copying {activeDisk.disk_name}</strong>
           <span>
-            Transferred: {activeDisk.copied_size || "-"} / {activeDisk.total_size || "-"}
+            Transferred: {activeDisk.copied_size || "-"} / {activeDisk.used_size || "-"}
           </span>
           <span>
             Speed: {activeDisk.speed_mbps ? `${activeDisk.speed_mbps} MB/s` : "-"} | ETA: {formatEta(activeDisk.eta_seconds)}
+          </span>
+          <span>
+            Provisioned: {activeDisk.provisioned_size || activeDisk.total_size || "-"}
           </span>
         </div>
       ) : null}
@@ -38,12 +41,13 @@ export default function DiskProgress({ status }) {
           <thead>
             <tr>
               <th>Disk</th>
-              <th>Total Size</th>
+              <th>Provisioned Size</th>
+              <th>Used Size (Estimated)</th>
               <th>Copied</th>
               <th>Remaining</th>
               <th>Speed</th>
               <th>ETA</th>
-              <th>Progress</th>
+              <th>Disk Read Progress</th>
             </tr>
           </thead>
           <tbody>
@@ -53,7 +57,8 @@ export default function DiskProgress({ status }) {
                   {item.disk_name}
                   <div className="hint small">{item.disk_type === "os" ? "OS" : "Data"}</div>
                 </td>
-                <td>{item.total_size || "-"}</td>
+                <td>{item.provisioned_size || item.total_size || "-"}</td>
+                <td>{item.used_size || "-"}</td>
                 <td>{item.copied_size || "-"}</td>
                 <td>{item.remaining_size || "-"}</td>
                 <td>{item.speed_mbps ? `${item.speed_mbps} MB/s` : "-"}</td>

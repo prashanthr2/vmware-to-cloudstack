@@ -280,6 +280,7 @@ class MigrationManager:
         now_ts = datetime.now(timezone.utc).timestamp()
         stage_norm = (stage or "").lower()
         use_delta_metrics = stage_norm in {"delta", "final_sync", "waiting_finalize"}
+
         disk_progress: list[dict] = []
         total_bytes = 0
         copied_bytes_total = 0
@@ -306,6 +307,7 @@ class MigrationManager:
                 disk.get("written_bytes"),
                 disk.get("bytes_done"),
                 disk.get("copied_size"),
+                disk.get("bytes_written"),
             ])
 
             if copied <= 0 and isinstance(path, str) and path:
@@ -316,6 +318,13 @@ class MigrationManager:
 
             if capacity > 0 and copied > capacity:
                 copied = capacity
+
+            qemu_progress = first_float([
+                disk.get("qemu_progress"),
+                disk.get("read_progress"),
+                disk.get("scan_progress"),
+            ])
+            progress_raw = disk.get("progress")
 
             delta_total = first_int([
                 disk.get("delta_total_bytes"),
@@ -330,25 +339,51 @@ class MigrationManager:
             if delta_total > 0 and delta_copied > delta_total:
                 delta_copied = delta_total
 
-            display_total = capacity
-            display_copied = copied
-            remaining = max(capacity - copied, 0) if capacity > 0 else 0
-            if use_delta_metrics and delta_total > 0:
-                display_total = delta_total
-                display_copied = delta_copied
-                remaining = max(delta_total - delta_copied, 0)
+            used_total = first_int([
+                disk.get("estimated_used_bytes"),
+                disk.get("read_total_bytes"),
+                disk.get("used_bytes"),
+            ])
 
-            progress = None
-            delta_progress_raw = disk.get("delta_progress")
-            progress_raw = disk.get("progress")
-            if use_delta_metrics and isinstance(delta_progress_raw, (int, float)):
-                progress = float(delta_progress_raw)
-            elif use_delta_metrics and display_total > 0:
-                progress = round((display_copied / display_total) * 100, 2)
-            elif isinstance(progress_raw, (int, float)):
-                progress = float(progress_raw)
-            elif capacity > 0:
-                progress = round((copied / capacity) * 100, 2)
+            read_total = 0
+            read_copied = 0
+            read_remaining = 0
+            read_progress = None
+
+            if use_delta_metrics and delta_total > 0:
+                read_total = delta_total
+                read_copied = delta_copied
+                read_remaining = max(read_total - read_copied, 0)
+
+                delta_progress_raw = disk.get("delta_progress")
+                if isinstance(delta_progress_raw, (int, float)):
+                    read_progress = float(delta_progress_raw)
+                elif read_total > 0:
+                    read_progress = round((read_copied / read_total) * 100, 2)
+            else:
+                if used_total <= 0 and copied > 0 and qemu_progress is not None and qemu_progress > 0:
+                    ratio = max(min(qemu_progress, 100.0), 0.01) / 100.0
+                    used_total = int(copied / ratio)
+
+                if used_total <= 0 and copied > 0 and qemu_progress is not None and qemu_progress >= 99.9:
+                    used_total = copied
+
+                if capacity > 0 and used_total > capacity:
+                    used_total = capacity
+
+                if used_total > 0:
+                    used_total = max(used_total, copied)
+
+                read_total = used_total
+                read_copied = copied
+                read_remaining = max(read_total - read_copied, 0) if read_total > 0 else 0
+
+                if qemu_progress is not None:
+                    read_progress = float(qemu_progress)
+                elif isinstance(progress_raw, (int, float)):
+                    read_progress = float(progress_raw)
+                elif read_total > 0:
+                    read_progress = round((read_copied / read_total) * 100, 2)
 
             sample_key = f"{vm_name}:{unit_str}"
             speed_mbps = first_float([
@@ -358,7 +393,7 @@ class MigrationManager:
             ])
             eta_seconds = first_int([disk.get("eta_seconds"), disk.get("eta")]) or None
 
-            sample_copied = display_copied if use_delta_metrics and display_total > 0 else copied
+            sample_copied = read_copied if read_total > 0 else copied
             if speed_mbps is None:
                 previous = self._speed_samples.get(sample_key)
                 if previous and sample_copied >= previous[1]:
@@ -367,8 +402,8 @@ class MigrationManager:
                         speed_bps = (sample_copied - previous[1]) / delta_t
                         if speed_bps > 0:
                             speed_mbps = round(speed_bps / (1024 * 1024), 2)
-                            if remaining > 0 and eta_seconds is None:
-                                eta_seconds = int(remaining / speed_bps)
+                            if read_remaining > 0 and eta_seconds is None:
+                                eta_seconds = int(read_remaining / speed_bps)
 
             if speed_mbps is not None and speed_mbps > 0:
                 speed_values.append(speed_mbps)
@@ -385,20 +420,27 @@ class MigrationManager:
                     "disk_name": disk.get("label") or f"disk{unit_str}",
                     "disk_type": disk_type,
                     "datastore": disk.get("datastore"),
-                    "total_size": self._format_bytes(display_total) if display_total > 0 else None,
-                    "copied_size": self._format_bytes(display_copied),
-                    "remaining_size": self._format_bytes(remaining),
-                    "total_bytes": display_total if display_total > 0 else None,
-                    "copied_bytes": display_copied,
-                    "remaining_bytes": remaining,
+                    "provisioned_size": self._format_bytes(capacity) if capacity > 0 else None,
+                    "provisioned_bytes": capacity if capacity > 0 else None,
+                    "used_size": self._format_bytes(read_total) if read_total > 0 else None,
+                    "used_bytes": read_total if read_total > 0 else None,
+                    "total_size": self._format_bytes(capacity) if capacity > 0 else None,
+                    "copied_size": self._format_bytes(read_copied),
+                    "remaining_size": self._format_bytes(read_remaining) if read_total > 0 else None,
+                    "total_bytes": capacity if capacity > 0 else None,
+                    "copied_bytes": read_copied,
+                    "remaining_bytes": read_remaining if read_total > 0 else None,
                     "speed_mbps": speed_mbps,
                     "eta_seconds": eta_seconds,
-                    "progress": progress,
+                    "progress": read_progress,
                 }
             )
 
-            total_bytes += display_total
-            copied_bytes_total += display_copied
+            summary_total = read_total if read_total > 0 else capacity
+            summary_copied = read_copied if read_total > 0 else copied
+            if summary_total > 0:
+                total_bytes += summary_total
+                copied_bytes_total += min(summary_copied, summary_total)
 
         disk_progress.sort(key=lambda d: self._safe_int(d.get("unit")))
 
