@@ -21,7 +21,6 @@ import string
 import threading
 import select
 import fcntl
-import pyvddk
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pyVim.connect import SmartConnect, Disconnect
@@ -50,6 +49,9 @@ VCPASS = config["vcenter"]["password"]
 
 #DATA = config["migration"]["data_dir"]
 VDDK = config["migration"]["vddk_path"]
+
+sys.path.insert(0, os.path.join(VDDK, 'lib', 'python'))
+import pyvddk
 
 
 def migrate_vm(vmname):
