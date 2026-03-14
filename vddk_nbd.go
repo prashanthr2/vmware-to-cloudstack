@@ -5,6 +5,7 @@ import (
     "flag"
     "log"
     "net"
+    "net/url"
     "os"
     "sync"
     "time"
@@ -62,7 +63,7 @@ func main() {
     // Open VDDK handles
     var handles []*vddk.Handle
     for i := 0; i < *numHandles; i++ {
-        config := &vddk.Config{
+        config := vddk.Config{
             Libdir:     "/opt/vmware-vddk/vmware-vix-disklib-distrib/",
             Server:     *vcenter,
             User:       *user,
