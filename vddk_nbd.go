@@ -14,7 +14,7 @@ import (
     "github.com/vmware/govmomi/vim25/types"
     "github.com/vmware/govmomi/object"
     "github.com/vmware/govmomi/vddk"
-    "github.com/Cloud-Foundations/go-nbd/server"
+    "github.com/digitalocean/go-nbd/server"
 )
 
 type VDDKReader struct {

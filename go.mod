@@ -3,6 +3,6 @@ module vddk_nbd
 go 1.21
 
 require (
-	github.com/Cloud-Foundations/go-nbd v0.0.0-20231215185923-1b8b8b1b1b1b
+	github.com/digitalocean/go-nbd v0.0.0-20230614223553-6e4a71e63d02
 	github.com/vmware/govmomi v0.33.1
 )
