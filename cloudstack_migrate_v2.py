@@ -50,9 +50,6 @@ VCPASS = config["vcenter"]["password"]
 #DATA = config["migration"]["data_dir"]
 VDDK = config["migration"]["vddk_path"]
 
-sys.path.insert(0, os.path.join(VDDK, 'lib', 'python'))
-import pyvddk
-
 
 def migrate_vm(vmname):
 
@@ -470,7 +467,7 @@ class Migrator:
         log(f"[disk] precreate qcow2: {' '.join(cmd)}")
         subprocess.run(cmd, check=True)
 
-    def run_v2v_base(self, source_path, target_qcow2_path, disk_size, disk_unit):
+    def run_v2v_base(self, source_nbd_uri, target_qcow2_path, disk_size, disk_unit):
         import pty
 
         output_dir = os.path.dirname(target_qcow2_path)
@@ -479,7 +476,7 @@ class Migrator:
         cmd = [
             "virt-v2v",
             "-i", "disk",
-            source_path,
+            source_nbd_uri,
             "-o", "local",
             "-os", output_dir,
             "-of", "qcow2",
@@ -608,9 +605,6 @@ class Migrator:
         self.thumb = get_thumbprint(VCENTER)
         self.nbd_procs = []
         view.Destroy()
-
-    def is_all_zero(self, data):
-        return all(b == 0 for b in data)
 
     def load_state(self):
         if os.path.exists(self.state_file):
@@ -1006,22 +1000,6 @@ class Migrator:
             time.sleep(1)
         raise Exception("nbdkit failed to start")
 
-    def open_vddk_disk(self, disk, snapshot):
-        self.ensure_vcenter_session()
-        snapshot_disk_path = self.get_snapshot_disk_path(snapshot, disk['key'])
-        connection = pyvddk.connect(
-            server=VCENTER,
-            user=VCUSER,
-            password=VCPASS,
-            thumbprint=self.thumb,
-            libdir=VDDK
-        )
-        disk_handle = connection.open_disk(
-            path=snapshot_disk_path,
-            flags=pyvddk.VIXDISKLIB_FLAG_OPEN_READ_ONLY
-        )
-        return disk_handle, connection
-
     def copy_disk_base(self, disk, res_snap):
 
         u_str = str(disk["unit"])
@@ -1039,6 +1017,8 @@ class Migrator:
             self._recalculate_overall_progress_locked()
         self.save_state()
 
+        proc, sock = self.start_nbd(disk, res_snap, export_name="extents:all")
+
         storageid = self.get_disk_storage(u_str)
         storage_path = ensure_storage_mounted(storageid)
 
@@ -1047,110 +1027,31 @@ class Migrator:
         log(f"Disk {u_str}: staging on storage {storageid}")
         log(f"Disk {u_str}: Starting direct-to-qcow2 base copy")
 
-        self.precreate_qcow2(target_qcow2, disk["capacity"])
+        source_uri = f"nbd+unix:///?socket={sock}"
 
-        target_sock = f"/tmp/target_{self.migration_id}_{u_str}.sock"
-        if os.path.exists(target_sock):
-            os.remove(target_sock)
-
-        target_proc = subprocess.Popen([
-            "qemu-nbd",
-            "--socket", target_sock,
-            "--format", "qcow2",
-            target_qcow2,
-        ])
-
-        # Wait for qemu-nbd to be ready
-        for _ in range(60):
-            if os.path.exists(target_sock):
-                try:
-                    h = nbd.NBD()
-                    h.connect_unix(target_sock)
-                    h.close()
-                    break
-                except Exception:
-                    pass
-            time.sleep(1)
-        else:
-            raise Exception(f"qemu-nbd target socket not ready for disk unit {u_str}")
-
-        # Open VDDK connection
-        connection = pyvddk.connect(
-            server=VCENTER,
-            user=VCUSER,
-            password=VCPASS,
-            thumbprint=self.thumb,
-            libdir=VDDK
-        )
-
-        snapshot_disk_path = self.get_snapshot_disk_path(res_snap, disk['key'])
-
-        # Block queue
-        block_queue = Queue()
-
-        # Workers
-        def worker():
-            disk_h = connection.open_disk(snapshot_disk_path, pyvddk.VIXDISKLIB_FLAG_OPEN_READ_ONLY)
-            h = nbd.NBD()
-            h.connect_unix(target_sock)
-            while True:
-                item = block_queue.get()
-                if item is None:
-                    break
-                offset, length = item
-                data = disk_h.read(offset, length)
-                if not self.is_all_zero(data):
-                    h.pwrite(data, offset)
-                block_queue.task_done()
-            h.close()
-            disk_h.close()
-
-        num_workers = 4
-        threads = []
-        for _ in range(num_workers):
-            t = threading.Thread(target=worker)
-            t.start()
-            threads.append(t)
-
-        # Scheduler
-        chunk_size = 1024 * 1024  # 1MB
-        total_size = disk["capacity"]
-        for offset in range(0, total_size, chunk_size):
-            length = min(chunk_size, total_size - offset)
-            block_queue.put((offset, length))
-
-        # Wait
-        block_queue.join()
-        for _ in range(num_workers):
-            block_queue.put(None)
-        for t in threads:
-            t.join()
-
-        # Close target
-        target_proc.terminate()
         try:
-            target_proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            target_proc.kill()
+            self.precreate_qcow2(target_qcow2, disk["capacity"])
+            self.run_v2v_base(source_uri, target_qcow2, disk["capacity"], u_str)
 
-        connection.close()
+            disk_obj = next(d for d in res_snap.config.hardware.device if d.key == disk['key'])
 
-        # Now run virt-v2v to inject drivers
-        self.run_v2v_base(target_qcow2, target_qcow2, disk["capacity"], u_str)
-
-        disk_obj = next(d for d in res_snap.config.hardware.device if d.key == disk['key'])
-
-        with self.state_lock:
-            disk_state = self.state["disks"].setdefault(u_str, {})
-            disk_state["path"] = target_qcow2
-            disk_state["format"] = "qcow2"
-            disk_state["changeId"] = disk_obj.backing.changeId
-            disk_state["capacity"] = disk["capacity"]
-            disk_state["key"] = disk["key"]
-            disk_state["copied_bytes"] = disk["capacity"]
-            disk_state["progress"] = 100.0
-            self._recalculate_overall_progress_locked()
-        self.save_state()
+            with self.state_lock:
+                disk_state = self.state["disks"].setdefault(u_str, {})
+                disk_state["path"] = target_qcow2
+                disk_state["format"] = "qcow2"
+                disk_state["changeId"] = disk_obj.backing.changeId
+                disk_state["capacity"] = disk["capacity"]
+                disk_state["key"] = disk["key"]
+                disk_state["copied_bytes"] = disk["capacity"]
+                disk_state["progress"] = 100.0
+                self._recalculate_overall_progress_locked()
+            self.save_state()
+        finally:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
     def base_copy(self):
         try:
             self._seed_guest_used_estimates()
@@ -1181,8 +1082,9 @@ class Migrator:
 
         for disk in self.disks():
             u_str = str(disk['unit'])
-            src_disk_handle, src_connection = self.open_vddk_disk(disk, new_snap)
+            src_proc, src_sock_path = self.start_nbd(disk, new_snap)
             target_proc = None
+            src_h = nbd.NBD()
             dst_h = nbd.NBD()
 
             target_sock = f"/tmp/target_{self.migration_id}_{u_str}.sock"
@@ -1208,6 +1110,8 @@ class Migrator:
                     "--format", "qcow2",
                     target_qcow2,
                 ])
+
+                src_h.connect_unix(src_sock_path)
 
                 connected_dst = False
                 for _ in range(60):
@@ -1251,7 +1155,7 @@ class Migrator:
 
                         while offset < end:
                             chunk_size = min(64 * 1024 * 1024, end - offset)
-                            buf = src_disk_handle.read(offset, chunk_size)
+                            buf = src_h.pread(chunk_size, offset)
                             dst_h.pwrite(buf, offset)
 
                             written_bytes += len(buf)
@@ -1323,11 +1227,7 @@ class Migrator:
                 self.save_state()
             finally:
                 try:
-                    src_disk_handle.close()
-                except Exception:
-                    pass
-                try:
-                    src_connection.close()
+                    src_h.close()
                 except Exception:
                     pass
                 try:
@@ -1341,6 +1241,12 @@ class Migrator:
                         target_proc.wait(timeout=5)
                     except subprocess.TimeoutExpired:
                         target_proc.kill()
+
+                src_proc.terminate()
+                try:
+                    src_proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    src_proc.kill()
 
                 if os.path.exists(target_sock):
                     os.remove(target_sock)
