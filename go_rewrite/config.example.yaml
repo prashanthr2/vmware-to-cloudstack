@@ -1,0 +1,23 @@
+vddk:
+  libdir: /opt/vmware-vddk/vmware-vix-disklib-distrib
+  server: 10.0.35.3
+  user: administrator@vsphere.local
+  # Prefer passing password as env var VC_PASSWORD at runtime.
+  password: ""
+  thumbprint: "AA:BB:CC:DD:EE:FF:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE"
+
+engine:
+  readers: 4
+  queue_depth: 64
+  min_chunk_mb: 1
+  max_chunk_mb: 4
+  fast_latency_ms: 40
+  slow_latency_ms: 250
+  fast_mbps: 180
+  slow_mbps: 40
+  chunk_mb_delta: 4
+
+virt:
+  run_virt_v2v: true
+  virtio_iso: /usr/share/virtio-win/virtio-win.iso
+
