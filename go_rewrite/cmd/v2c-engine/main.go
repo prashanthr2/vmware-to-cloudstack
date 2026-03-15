@@ -76,6 +76,8 @@ import (
 	"sync/atomic"
 	"time"
 	"unsafe"
+
+	"gopkg.in/yaml.v3"
 )
 
 const (
@@ -542,6 +544,42 @@ type copyStats struct {
 	Mode             string `json:"mode"`
 }
 
+type engineSpec struct {
+	VDDK struct {
+		LibDir     string `yaml:"libdir"`
+		Server     string `yaml:"server"`
+		User       string `yaml:"user"`
+		Password   string `yaml:"password"`
+		Thumbprint string `yaml:"thumbprint"`
+		VMMoref    string `yaml:"vm_moref"`
+	} `yaml:"vddk"`
+	BaseCopy struct {
+		SnapshotMoref string  `yaml:"snapshot_moref"`
+		DiskPath      string  `yaml:"disk_path"`
+		TargetQCOW2   string  `yaml:"target_qcow2"`
+		DiskSizeBytes int64   `yaml:"disk_size_bytes"`
+		Readers       int     `yaml:"readers"`
+		QueueDepth    int     `yaml:"queue_depth"`
+		MinChunkMB    int     `yaml:"min_chunk_mb"`
+		MaxChunkMB    int     `yaml:"max_chunk_mb"`
+		FastLatencyMS int     `yaml:"fast_latency_ms"`
+		SlowLatencyMS int     `yaml:"slow_latency_ms"`
+		FastMBps      float64 `yaml:"fast_mbps"`
+		SlowMBps      float64 `yaml:"slow_mbps"`
+		RunVirtV2V    *bool   `yaml:"run_virt_v2v"`
+		VirtioISO     string  `yaml:"virtio_iso"`
+	} `yaml:"base_copy"`
+	DeltaSync struct {
+		SnapshotMoref string `yaml:"snapshot_moref"`
+		DiskPath      string `yaml:"disk_path"`
+		TargetQCOW2   string `yaml:"target_qcow2"`
+		RangesFile    string `yaml:"ranges_file"`
+		Readers       int    `yaml:"readers"`
+		QueueDepth    int    `yaml:"queue_depth"`
+		ChunkMB       int    `yaml:"chunk_mb"`
+	} `yaml:"delta_sync"`
+}
+
 type baseCopyOptions struct {
 	VDDK             vddkConnCfg
 	DiskPath         string
@@ -557,6 +595,64 @@ type baseCopyOptions struct {
 	SlowMBps         float64
 	RunVirtV2V       bool
 	VirtioISO        string
+}
+
+func extractSpecPath(args []string) string {
+	for i, a := range args {
+		if a == "--spec" || a == "-spec" {
+			if i+1 < len(args) {
+				return args[i+1]
+			}
+		}
+		if strings.HasPrefix(a, "--spec=") {
+			return strings.TrimSpace(strings.TrimPrefix(a, "--spec="))
+		}
+		if strings.HasPrefix(a, "-spec=") {
+			return strings.TrimSpace(strings.TrimPrefix(a, "-spec="))
+		}
+	}
+	return ""
+}
+
+func loadEngineSpec(path string) (*engineSpec, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var spec engineSpec
+	if err := yaml.Unmarshal(raw, &spec); err != nil {
+		return nil, fmt.Errorf("parse spec yaml: %w", err)
+	}
+	return &spec, nil
+}
+
+func specToBaseCopyOptions(spec *engineSpec) baseCopyOptions {
+	o := baseCopyOptions{}
+	o.VDDK.LibDir = spec.VDDK.LibDir
+	o.VDDK.Server = spec.VDDK.Server
+	o.VDDK.User = spec.VDDK.User
+	o.VDDK.Password = spec.VDDK.Password
+	o.VDDK.Thumbprint = spec.VDDK.Thumbprint
+	o.VDDK.VMMoref = spec.VDDK.VMMoref
+	o.VDDK.SnapshotMoref = spec.BaseCopy.SnapshotMoref
+	o.DiskPath = spec.BaseCopy.DiskPath
+	o.TargetQCOW2 = spec.BaseCopy.TargetQCOW2
+	o.DiskSizeBytes = spec.BaseCopy.DiskSizeBytes
+	o.Readers = spec.BaseCopy.Readers
+	o.QueueDepth = spec.BaseCopy.QueueDepth
+	o.MinChunkMB = spec.BaseCopy.MinChunkMB
+	o.MaxChunkMB = spec.BaseCopy.MaxChunkMB
+	o.FastLatencyMS = spec.BaseCopy.FastLatencyMS
+	o.SlowLatencyMS = spec.BaseCopy.SlowLatencyMS
+	o.FastMBps = spec.BaseCopy.FastMBps
+	o.SlowMBps = spec.BaseCopy.SlowMBps
+	if spec.BaseCopy.RunVirtV2V == nil {
+		o.RunVirtV2V = true
+	} else {
+		o.RunVirtV2V = *spec.BaseCopy.RunVirtV2V
+	}
+	o.VirtioISO = spec.BaseCopy.VirtioISO
+	return o
 }
 
 func detectSourceDiskSizeBytes(cfg vddkConnCfg, diskPath string) (int64, error) {
@@ -796,6 +892,24 @@ type deltaSyncOptions struct {
 	ChunkMB          int
 }
 
+func specToDeltaSyncOptions(spec *engineSpec) deltaSyncOptions {
+	o := deltaSyncOptions{}
+	o.VDDK.LibDir = spec.VDDK.LibDir
+	o.VDDK.Server = spec.VDDK.Server
+	o.VDDK.User = spec.VDDK.User
+	o.VDDK.Password = spec.VDDK.Password
+	o.VDDK.Thumbprint = spec.VDDK.Thumbprint
+	o.VDDK.VMMoref = spec.VDDK.VMMoref
+	o.VDDK.SnapshotMoref = spec.DeltaSync.SnapshotMoref
+	o.DiskPath = spec.DeltaSync.DiskPath
+	o.TargetQCOW2 = spec.DeltaSync.TargetQCOW2
+	o.RangesFile = spec.DeltaSync.RangesFile
+	o.Readers = spec.DeltaSync.Readers
+	o.QueueDepth = spec.DeltaSync.QueueDepth
+	o.ChunkMB = spec.DeltaSync.ChunkMB
+	return o
+}
+
 func (o *deltaSyncOptions) normalize() {
 	if o.Readers <= 0 {
 		o.Readers = 4
@@ -1011,33 +1125,54 @@ func usage() {
 	fmt.Fprintf(os.Stderr, "Usage:\n")
 	fmt.Fprintf(os.Stderr, "  v2c-engine base-copy  [flags]\n")
 	fmt.Fprintf(os.Stderr, "  v2c-engine delta-sync [flags]\n")
+	fmt.Fprintf(os.Stderr, "  v2c-engine base-copy --spec /path/spec.yaml\n")
+	fmt.Fprintf(os.Stderr, "  v2c-engine delta-sync --spec /path/spec.yaml\n")
 }
 
 func cmdBaseCopy(args []string) error {
+	specPath := extractSpecPath(args)
 	var o baseCopyOptions
+	o.RunVirtV2V = true
+	o.VirtioISO = "/usr/share/virtio-win/virtio-win.iso"
+	if specPath != "" {
+		spec, err := loadEngineSpec(specPath)
+		if err != nil {
+			return err
+		}
+		o = specToBaseCopyOptions(spec)
+		if o.VirtioISO == "" {
+			o.VirtioISO = "/usr/share/virtio-win/virtio-win.iso"
+		}
+	}
+
 	fs := flag.NewFlagSet("base-copy", flag.ContinueOnError)
-	fs.StringVar(&o.VDDK.LibDir, "vddk-libdir", "", "VDDK install root")
-	fs.StringVar(&o.VDDK.Server, "server", "", "vCenter/ESXi hostname")
-	fs.StringVar(&o.VDDK.User, "user", "", "vCenter username")
-	fs.StringVar(&o.VDDK.Password, "password", "", "vCenter password")
-	fs.StringVar(&o.VDDK.Thumbprint, "thumbprint", "", "SSL thumbprint")
-	fs.StringVar(&o.VDDK.VMMoref, "vm-moref", "", "VM MoRef (vm-XXX)")
-	fs.StringVar(&o.VDDK.SnapshotMoref, "snapshot-moref", "", "Snapshot MoRef")
-	fs.StringVar(&o.DiskPath, "disk-path", "", "Snapshot disk backing path")
-	fs.StringVar(&o.TargetQCOW2, "target-qcow2", "", "Destination QCOW2 path")
-	fs.Int64Var(&o.DiskSizeBytes, "disk-size-bytes", 0, "Disk capacity in bytes (optional, auto-detected when 0)")
-	fs.IntVar(&o.Readers, "readers", 4, "Number of parallel VDDK readers")
-	fs.IntVar(&o.QueueDepth, "queue-depth", 64, "Queue depth for read/write channels")
-	fs.IntVar(&o.MinChunkMB, "min-chunk-mb", 1, "Adaptive minimum read chunk size in MB")
-	fs.IntVar(&o.MaxChunkMB, "max-chunk-mb", 4, "Adaptive maximum read chunk size in MB")
-	fs.IntVar(&o.FastLatencyMS, "fast-latency-ms", 40, "Fast latency threshold in ms")
-	fs.IntVar(&o.SlowLatencyMS, "slow-latency-ms", 250, "Slow latency threshold in ms")
-	fs.Float64Var(&o.FastMBps, "fast-mbps", 180, "Throughput considered fast")
-	fs.Float64Var(&o.SlowMBps, "slow-mbps", 40, "Throughput considered slow")
-	fs.BoolVar(&o.RunVirtV2V, "run-virt-v2v", true, "Run virt-v2v-in-place after base copy")
-	fs.StringVar(&o.VirtioISO, "virtio-iso", "/usr/share/virtio-win/virtio-win.iso", "VirtIO ISO path for Windows injection")
+	fs.StringVar(&specPath, "spec", specPath, "YAML spec file path")
+	fs.StringVar(&o.VDDK.LibDir, "vddk-libdir", o.VDDK.LibDir, "VDDK install root")
+	fs.StringVar(&o.VDDK.Server, "server", o.VDDK.Server, "vCenter/ESXi hostname")
+	fs.StringVar(&o.VDDK.User, "user", o.VDDK.User, "vCenter username")
+	fs.StringVar(&o.VDDK.Password, "password", o.VDDK.Password, "vCenter password")
+	fs.StringVar(&o.VDDK.Thumbprint, "thumbprint", o.VDDK.Thumbprint, "SSL thumbprint")
+	fs.StringVar(&o.VDDK.VMMoref, "vm-moref", o.VDDK.VMMoref, "VM MoRef (vm-XXX)")
+	fs.StringVar(&o.VDDK.SnapshotMoref, "snapshot-moref", o.VDDK.SnapshotMoref, "Snapshot MoRef")
+	fs.StringVar(&o.DiskPath, "disk-path", o.DiskPath, "Snapshot disk backing path")
+	fs.StringVar(&o.TargetQCOW2, "target-qcow2", o.TargetQCOW2, "Destination QCOW2 path")
+	fs.Int64Var(&o.DiskSizeBytes, "disk-size-bytes", o.DiskSizeBytes, "Disk capacity in bytes (optional, auto-detected when 0)")
+	fs.IntVar(&o.Readers, "readers", o.Readers, "Number of parallel VDDK readers")
+	fs.IntVar(&o.QueueDepth, "queue-depth", o.QueueDepth, "Queue depth for read/write channels")
+	fs.IntVar(&o.MinChunkMB, "min-chunk-mb", o.MinChunkMB, "Adaptive minimum read chunk size in MB")
+	fs.IntVar(&o.MaxChunkMB, "max-chunk-mb", o.MaxChunkMB, "Adaptive maximum read chunk size in MB")
+	fs.IntVar(&o.FastLatencyMS, "fast-latency-ms", o.FastLatencyMS, "Fast latency threshold in ms")
+	fs.IntVar(&o.SlowLatencyMS, "slow-latency-ms", o.SlowLatencyMS, "Slow latency threshold in ms")
+	fs.Float64Var(&o.FastMBps, "fast-mbps", o.FastMBps, "Throughput considered fast")
+	fs.Float64Var(&o.SlowMBps, "slow-mbps", o.SlowMBps, "Throughput considered slow")
+	fs.BoolVar(&o.RunVirtV2V, "run-virt-v2v", o.RunVirtV2V, "Run virt-v2v-in-place after base copy")
+	fs.StringVar(&o.VirtioISO, "virtio-iso", o.VirtioISO, "VirtIO ISO path for Windows injection")
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+
+	if o.VirtioISO == "" {
+		o.VirtioISO = "/usr/share/virtio-win/virtio-win.iso"
 	}
 
 	if o.VDDK.Password == "" {
@@ -1055,21 +1190,31 @@ func cmdBaseCopy(args []string) error {
 }
 
 func cmdDeltaSync(args []string) error {
+	specPath := extractSpecPath(args)
 	var o deltaSyncOptions
+	if specPath != "" {
+		spec, err := loadEngineSpec(specPath)
+		if err != nil {
+			return err
+		}
+		o = specToDeltaSyncOptions(spec)
+	}
+
 	fs := flag.NewFlagSet("delta-sync", flag.ContinueOnError)
-	fs.StringVar(&o.VDDK.LibDir, "vddk-libdir", "", "VDDK install root")
-	fs.StringVar(&o.VDDK.Server, "server", "", "vCenter/ESXi hostname")
-	fs.StringVar(&o.VDDK.User, "user", "", "vCenter username")
-	fs.StringVar(&o.VDDK.Password, "password", "", "vCenter password")
-	fs.StringVar(&o.VDDK.Thumbprint, "thumbprint", "", "SSL thumbprint")
-	fs.StringVar(&o.VDDK.VMMoref, "vm-moref", "", "VM MoRef (vm-XXX)")
-	fs.StringVar(&o.VDDK.SnapshotMoref, "snapshot-moref", "", "Snapshot MoRef")
-	fs.StringVar(&o.DiskPath, "disk-path", "", "Snapshot disk backing path")
-	fs.StringVar(&o.TargetQCOW2, "target-qcow2", "", "Destination QCOW2 path")
-	fs.StringVar(&o.RangesFile, "ranges-file", "", "JSON file with CBT ranges")
-	fs.IntVar(&o.Readers, "readers", 4, "Number of parallel VDDK readers")
-	fs.IntVar(&o.QueueDepth, "queue-depth", 64, "Queue depth for read/write channels")
-	fs.IntVar(&o.ChunkMB, "chunk-mb", 4, "Chunk size per delta read in MB")
+	fs.StringVar(&specPath, "spec", specPath, "YAML spec file path")
+	fs.StringVar(&o.VDDK.LibDir, "vddk-libdir", o.VDDK.LibDir, "VDDK install root")
+	fs.StringVar(&o.VDDK.Server, "server", o.VDDK.Server, "vCenter/ESXi hostname")
+	fs.StringVar(&o.VDDK.User, "user", o.VDDK.User, "vCenter username")
+	fs.StringVar(&o.VDDK.Password, "password", o.VDDK.Password, "vCenter password")
+	fs.StringVar(&o.VDDK.Thumbprint, "thumbprint", o.VDDK.Thumbprint, "SSL thumbprint")
+	fs.StringVar(&o.VDDK.VMMoref, "vm-moref", o.VDDK.VMMoref, "VM MoRef (vm-XXX)")
+	fs.StringVar(&o.VDDK.SnapshotMoref, "snapshot-moref", o.VDDK.SnapshotMoref, "Snapshot MoRef")
+	fs.StringVar(&o.DiskPath, "disk-path", o.DiskPath, "Snapshot disk backing path")
+	fs.StringVar(&o.TargetQCOW2, "target-qcow2", o.TargetQCOW2, "Destination QCOW2 path")
+	fs.StringVar(&o.RangesFile, "ranges-file", o.RangesFile, "JSON file with CBT ranges")
+	fs.IntVar(&o.Readers, "readers", o.Readers, "Number of parallel VDDK readers")
+	fs.IntVar(&o.QueueDepth, "queue-depth", o.QueueDepth, "Queue depth for read/write channels")
+	fs.IntVar(&o.ChunkMB, "chunk-mb", o.ChunkMB, "Chunk size per delta read in MB")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}

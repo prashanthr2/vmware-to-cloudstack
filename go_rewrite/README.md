@@ -90,6 +90,23 @@ export CGO_LDFLAGS="-L/opt/vmware-vddk/lib64 -lvixDiskLib -ldl -lpthread"
   -chunk-mb 4
 ```
 
+## Spec-file mode (UI-friendly)
+
+`v2c-engine` can read a YAML spec directly:
+
+```bash
+./v2c-engine base-copy --spec ./spec.engine.example.yaml
+./v2c-engine delta-sync --spec ./spec.engine.example.yaml
+```
+
+You can still override any value from spec with CLI flags:
+
+```bash
+./v2c-engine base-copy --spec ./spec.engine.example.yaml -readers 8
+```
+
+Use [spec.engine.example.yaml](./spec.engine.example.yaml) as the template for UI-generated specs.
+
 ## Mapping from current Python flow
 
 - Replace Python `copy_disk_base(...)` with `v2c-engine base-copy`.
