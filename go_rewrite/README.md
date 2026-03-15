@@ -9,6 +9,7 @@ This folder contains a Go rewrite of the migration copy/sync engine with direct 
   - Uses a shared dynamic work queue.
   - Starts with 1 MB reads, adaptively increases up to 4 MB, and shrinks on high latency.
   - Detects all-zero blocks and skips writes (sparse QCOW2 preserved).
+  - Auto-detects source disk capacity from VDDK (ignores mismatched `-disk-size-bytes`).
   - Writes non-zero blocks directly into QCOW2 through `qemu-nbd`.
   - Runs `virt-v2v-in-place` immediately after base copy (optional flag).
 
@@ -94,4 +95,3 @@ export CGO_LDFLAGS="-L/opt/vmware-vddk/lib64 -lvixDiskLib -ldl -lpthread"
 - Replace Python `copy_disk_base(...)` with `v2c-engine base-copy`.
 - Replace Python `delta(...)` write loop with `v2c-engine delta-sync`.
 - Keep existing snapshot creation/CBT range discovery/state/import phases unchanged, but execute them from Go orchestration if you are fully migrating runtime to Go.
-

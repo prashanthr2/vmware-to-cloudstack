@@ -12,12 +12,12 @@ static VixError v2c_vddk_init(const char *libdir) {
 }
 
 static VixError v2c_vddk_connect(
-    const char *server,
-    const char *user,
-    const char *pass,
-    const char *thumb,
-    const char *vmxSpec,
-    const char *snapshotRef,
+    char *server,
+    char *user,
+    char *pass,
+    char *thumb,
+    char *vmxSpec,
+    char *snapshotRef,
     VixDiskLibConnection *conn
 ) {
     VixDiskLibConnectParams params;
@@ -43,6 +43,17 @@ static VixError v2c_vddk_read(VixDiskLibHandle handle, uint64_t startSector, uin
         (VixDiskLibSectorType)numSectors,
         buf
     );
+}
+
+static VixError v2c_vddk_get_capacity(VixDiskLibHandle handle, uint64_t *capacitySectors) {
+    VixDiskLibInfo *info = NULL;
+    VixError err = VixDiskLib_GetInfo(handle, &info);
+    if (err != VIX_OK || info == NULL) {
+        return err;
+    }
+    *capacitySectors = (uint64_t)info->capacity;
+    VixDiskLib_FreeInfo(info);
+    return VIX_OK;
 }
 */
 import "C"
@@ -199,6 +210,19 @@ func (h *vddkHandle) readAt(offset int64, length int) ([]byte, error) {
 		return nil, fmt.Errorf("VixDiskLib_Read failed at offset=%d length=%d: %s", offset, length, vixErrorText(err))
 	}
 	return buf, nil
+}
+
+func (h *vddkHandle) capacityBytes() (int64, error) {
+	var sectors C.uint64_t
+	err := C.v2c_vddk_get_capacity(h.ptr, &sectors)
+	if err != 0 {
+		return 0, fmt.Errorf("VixDiskLib_GetInfo failed: %s", vixErrorText(err))
+	}
+	capBytes := int64(sectors) * sectorSize
+	if capBytes <= 0 {
+		return 0, errors.New("invalid source disk capacity from VDDK")
+	}
+	return capBytes, nil
 }
 
 func vixErrorText(vixErr C.VixError) string {
@@ -535,6 +559,20 @@ type baseCopyOptions struct {
 	VirtioISO        string
 }
 
+func detectSourceDiskSizeBytes(cfg vddkConnCfg, diskPath string) (int64, error) {
+	conn, err := connectVDDK(cfg)
+	if err != nil {
+		return 0, err
+	}
+	defer conn.close()
+	handle, err := conn.open(diskPath)
+	if err != nil {
+		return 0, err
+	}
+	defer handle.close()
+	return handle.capacityBytes()
+}
+
 func (o *baseCopyOptions) normalize() {
 	if o.Readers <= 0 {
 		o.Readers = 4
@@ -568,6 +606,23 @@ func (o *baseCopyOptions) normalize() {
 func runBaseCopy(ctx context.Context, opts baseCopyOptions) (copyStats, error) {
 	opts.normalize()
 	start := time.Now()
+
+	sourceDiskBytes, err := detectSourceDiskSizeBytes(opts.VDDK, opts.DiskPath)
+	if err != nil {
+		return copyStats{}, fmt.Errorf("failed to detect source disk size: %w", err)
+	}
+	if opts.DiskSizeBytes <= 0 {
+		opts.DiskSizeBytes = sourceDiskBytes
+		fmt.Fprintf(os.Stderr, "[base-copy] auto-detected source disk size=%d bytes\n", opts.DiskSizeBytes)
+	} else if opts.DiskSizeBytes != sourceDiskBytes {
+		fmt.Fprintf(
+			os.Stderr,
+			"[base-copy] disk-size-bytes mismatch requested=%d detected=%d, using detected size\n",
+			opts.DiskSizeBytes,
+			sourceDiskBytes,
+		)
+		opts.DiskSizeBytes = sourceDiskBytes
+	}
 
 	if err := createSparseQCOW2(opts.TargetQCOW2, opts.DiskSizeBytes); err != nil {
 		return copyStats{}, err
@@ -970,7 +1025,7 @@ func cmdBaseCopy(args []string) error {
 	fs.StringVar(&o.VDDK.SnapshotMoref, "snapshot-moref", "", "Snapshot MoRef")
 	fs.StringVar(&o.DiskPath, "disk-path", "", "Snapshot disk backing path")
 	fs.StringVar(&o.TargetQCOW2, "target-qcow2", "", "Destination QCOW2 path")
-	fs.Int64Var(&o.DiskSizeBytes, "disk-size-bytes", 0, "Disk capacity in bytes")
+	fs.Int64Var(&o.DiskSizeBytes, "disk-size-bytes", 0, "Disk capacity in bytes (optional, auto-detected when 0)")
 	fs.IntVar(&o.Readers, "readers", 4, "Number of parallel VDDK readers")
 	fs.IntVar(&o.QueueDepth, "queue-depth", 64, "Queue depth for read/write channels")
 	fs.IntVar(&o.MinChunkMB, "min-chunk-mb", 1, "Adaptive minimum read chunk size in MB")
@@ -1036,8 +1091,8 @@ func validateBaseCopy(o baseCopyOptions) error {
 		o.VDDK.VMMoref == "" || o.VDDK.SnapshotMoref == "" || o.DiskPath == "" || o.TargetQCOW2 == "" {
 		return errors.New("missing required base-copy flags")
 	}
-	if o.DiskSizeBytes <= 0 {
-		return errors.New("disk-size-bytes must be > 0")
+	if o.DiskSizeBytes < 0 {
+		return errors.New("disk-size-bytes must be >= 0")
 	}
 	if o.VDDK.Password == "" {
 		return errors.New("password is required (flag or VC_PASSWORD env)")
