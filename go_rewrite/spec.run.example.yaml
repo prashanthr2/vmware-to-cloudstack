@@ -1,0 +1,26 @@
+vm:
+  name: Centos7
+
+migration:
+  # Delta loop interval in seconds.
+  delta_interval: 300
+  # Optional, used when finalize_at is near.
+  finalize_delta_interval: 30
+  finalize_window: 600
+  # Optional, RFC3339 or "YYYY-MM-DDTHH:MM:SS"
+  # finalize_at: "2026-03-16T00:30:00"
+
+  # Engine options
+  readers: 4
+  run_virt_v2v: false
+  # Optional override for snapshot mode: true|false|auto
+  snapshot_quiesce: auto
+
+target:
+  cloudstack:
+    storageid: 68f38850-a051-3ff1-9865-6a24a2ba2864
+
+disks:
+  "1":
+    storageid: 68f38850-a051-3ff1-9865-6a24a2ba2864
+

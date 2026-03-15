@@ -59,8 +59,11 @@ static VixError v2c_vddk_get_capacity(VixDiskLibHandle handle, uint64_t *capacit
 import "C"
 
 import (
+	"crypto/sha1"
+	"crypto/tls"
 	"context"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -68,15 +71,26 @@ import (
 	"io"
 	"math"
 	"net"
+	neturl "net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 	"unsafe"
 
+	"github.com/vmware/govmomi"
+	"github.com/vmware/govmomi/find"
+	"github.com/vmware/govmomi/object"
+	"github.com/vmware/govmomi/property"
+	"github.com/vmware/govmomi/vim25/methods"
+	"github.com/vmware/govmomi/vim25/mo"
+	"github.com/vmware/govmomi/vim25/types"
 	"gopkg.in/yaml.v3"
 )
 
@@ -578,6 +592,71 @@ type engineSpec struct {
 		QueueDepth    int    `yaml:"queue_depth"`
 		ChunkMB       int    `yaml:"chunk_mb"`
 	} `yaml:"delta_sync"`
+}
+
+type appConfig struct {
+	VCenter struct {
+		Host     string `yaml:"host"`
+		User     string `yaml:"user"`
+		Password string `yaml:"password"`
+	} `yaml:"vcenter"`
+	Migration struct {
+		VDDKPath        string `yaml:"vddk_path"`
+		SnapshotQuiesce string `yaml:"snapshot_quiesce"`
+	} `yaml:"migration"`
+}
+
+type runSpec struct {
+	VM struct {
+		Name string `yaml:"name"`
+	} `yaml:"vm"`
+	Migration struct {
+		DeltaInterval       int    `yaml:"delta_interval"`
+		FinalizeDeltaInterval int  `yaml:"finalize_delta_interval"`
+		FinalizeWindow      int    `yaml:"finalize_window"`
+		FinalizeAt          string `yaml:"finalize_at"`
+		Readers             int    `yaml:"readers"`
+		RunVirtV2V          *bool  `yaml:"run_virt_v2v"`
+		SnapshotQuiesce     string `yaml:"snapshot_quiesce"`
+	} `yaml:"migration"`
+	Target struct {
+		CloudStack struct {
+			StorageID string `yaml:"storageid"`
+		} `yaml:"cloudstack"`
+	} `yaml:"target"`
+	Disks map[string]struct {
+		StorageID string `yaml:"storageid"`
+	} `yaml:"disks"`
+}
+
+type vmDisk struct {
+	Key      int32
+	Unit     int
+	Capacity int64
+}
+
+type snapshotDiskMeta struct {
+	Path     string
+	ChangeID string
+}
+
+type runDiskState struct {
+	Key          int32  `json:"key"`
+	Unit         int    `json:"unit"`
+	Capacity     int64  `json:"capacity"`
+	TargetQCOW2  string `json:"target_qcow2"`
+	SourceDiskPath string `json:"source_disk_path"`
+	ChangeID     string `json:"change_id"`
+}
+
+type runState struct {
+	VMName        string                  `json:"vm_name"`
+	VMMoref       string                  `json:"vm_moref"`
+	MigrationID   string                  `json:"migration_id"`
+	Stage         string                  `json:"stage"`
+	ActiveSnapshot string                 `json:"active_snapshot"`
+	Disks         map[string]*runDiskState `json:"disks"`
+	UpdatedAt     string                  `json:"updated_at"`
 }
 
 type baseCopyOptions struct {
@@ -1099,12 +1178,586 @@ func alignDown(v, align int) int {
 	return v - (v % align)
 }
 
+func loadAppConfig(path string) (*appConfig, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var cfg appConfig
+	if err := yaml.Unmarshal(raw, &cfg); err != nil {
+		return nil, fmt.Errorf("parse config yaml: %w", err)
+	}
+	return &cfg, nil
+}
+
+func loadRunSpec(path string) (*runSpec, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var spec runSpec
+	if err := yaml.Unmarshal(raw, &spec); err != nil {
+		return nil, fmt.Errorf("parse run spec yaml: %w", err)
+	}
+	return &spec, nil
+}
+
+func defaultConfigPath() string {
+	if _, err := os.Stat("config.yaml"); err == nil {
+		return "config.yaml"
+	}
+	if _, err := os.Stat("../config.yaml"); err == nil {
+		return "../config.yaml"
+	}
+	return "config.yaml"
+}
+
+func getServerThumbprint(host string) (string, error) {
+	conn, err := tls.Dial("tcp", net.JoinHostPort(host, "443"), &tls.Config{InsecureSkipVerify: true})
+	if err != nil {
+		return "", err
+	}
+	defer conn.Close()
+	state := conn.ConnectionState()
+	if len(state.PeerCertificates) == 0 {
+		return "", errors.New("no peer certificates received")
+	}
+	sum := sha1.Sum(state.PeerCertificates[0].Raw)
+	hexVal := strings.ToUpper(hex.EncodeToString(sum[:]))
+	parts := make([]string, 0, len(hexVal)/2)
+	for i := 0; i < len(hexVal); i += 2 {
+		parts = append(parts, hexVal[i:i+2])
+	}
+	return strings.Join(parts, ":"), nil
+}
+
+func connectVCenter(ctx context.Context, cfg *appConfig) (*govmomi.Client, error) {
+	u, err := neturl.Parse("https://" + cfg.VCenter.Host + "/sdk")
+	if err != nil {
+		return nil, err
+	}
+	u.User = neturl.UserPassword(cfg.VCenter.User, cfg.VCenter.Password)
+	return govmomi.NewClient(ctx, u, true)
+}
+
+func findVM(ctx context.Context, client *govmomi.Client, vmName string) (*object.VirtualMachine, error) {
+	finder := find.NewFinder(client.Client, true)
+	dc, err := finder.DefaultDatacenter(ctx)
+	if err != nil {
+		return nil, err
+	}
+	finder.SetDatacenter(dc)
+	return finder.VirtualMachine(ctx, vmName)
+}
+
+func listVMDisksAndBootUnit(ctx context.Context, client *govmomi.Client, vm *object.VirtualMachine) ([]vmDisk, int, error) {
+	pc := property.DefaultCollector(client.Client)
+	var vmMo mo.VirtualMachine
+	if err := pc.RetrieveOne(ctx, vm.Reference(), []string{"config.hardware.device", "config.bootOptions"}, &vmMo); err != nil {
+		return nil, 0, err
+	}
+	disks := make([]vmDisk, 0)
+	keyToUnit := map[int32]int{}
+	for _, dev := range vmMo.Config.Hardware.Device {
+		vd, ok := dev.(*types.VirtualDisk)
+		if !ok {
+			continue
+		}
+		unit := 0
+		if vd.UnitNumber != nil {
+			unit = int(*vd.UnitNumber)
+		}
+		capacity := int64(vd.CapacityInBytes)
+		if capacity <= 0 && vd.CapacityInKB > 0 {
+			capacity = int64(vd.CapacityInKB) * 1024
+		}
+		disks = append(disks, vmDisk{
+			Key:      vd.Key,
+			Unit:     unit,
+			Capacity: capacity,
+		})
+		keyToUnit[vd.Key] = unit
+	}
+	if len(disks) == 0 {
+		return nil, 0, errors.New("no virtual disks found on VM")
+	}
+	sort.Slice(disks, func(i, j int) bool { return disks[i].Unit < disks[j].Unit })
+
+	bootUnit := disks[0].Unit
+	if vmMo.Config.BootOptions != nil {
+		for _, b := range vmMo.Config.BootOptions.BootOrder {
+			bootDisk, ok := b.(*types.VirtualMachineBootOptionsBootableDiskDevice)
+			if !ok {
+				continue
+			}
+			if u, ok := keyToUnit[bootDisk.DeviceKey]; ok {
+				bootUnit = u
+				break
+			}
+		}
+	}
+	return disks, bootUnit, nil
+}
+
+func createSnapshot(ctx context.Context, vm *object.VirtualMachine, name string, quiesce bool) (types.ManagedObjectReference, error) {
+	task, err := vm.CreateSnapshot(ctx, name, "", false, quiesce)
+	if err != nil {
+		return types.ManagedObjectReference{}, err
+	}
+	result, err := task.WaitForResult(ctx, nil)
+	if err != nil {
+		return types.ManagedObjectReference{}, err
+	}
+	switch v := result.Result.(type) {
+	case types.ManagedObjectReference:
+		return v, nil
+	case *types.ManagedObjectReference:
+		return *v, nil
+	default:
+		return types.ManagedObjectReference{}, fmt.Errorf("unexpected snapshot result type %T", result.Result)
+	}
+}
+
+func removeSnapshot(ctx context.Context, client *govmomi.Client, snapshotRef types.ManagedObjectReference) error {
+	req := types.RemoveSnapshot_Task{
+		This:           snapshotRef,
+		RemoveChildren: false,
+	}
+	resp, err := methods.RemoveSnapshot_Task(ctx, client.Client, &req)
+	if err != nil {
+		return err
+	}
+	task := object.NewTask(client.Client, resp.Returnval)
+	_, err = task.WaitForResult(ctx, nil)
+	return err
+}
+
+func snapshotDiskMetadata(ctx context.Context, client *govmomi.Client, snapshotRef types.ManagedObjectReference) (map[int32]snapshotDiskMeta, error) {
+	pc := property.DefaultCollector(client.Client)
+	var snap mo.VirtualMachineSnapshot
+	if err := pc.RetrieveOne(ctx, snapshotRef, []string{"config.hardware.device"}, &snap); err != nil {
+		return nil, err
+	}
+	out := map[int32]snapshotDiskMeta{}
+	for _, dev := range snap.Config.Hardware.Device {
+		vd, ok := dev.(*types.VirtualDisk)
+		if !ok {
+			continue
+		}
+		fileName := getBackingString(vd.Backing, "FileName")
+		changeID := getBackingString(vd.Backing, "ChangeId")
+		out[vd.Key] = snapshotDiskMeta{
+			Path:     fileName,
+			ChangeID: changeID,
+		}
+	}
+	return out, nil
+}
+
+func getBackingString(backing types.BaseVirtualDeviceBackingInfo, field string) string {
+	if backing == nil {
+		return ""
+	}
+	v := reflect.ValueOf(backing)
+	if v.Kind() == reflect.Ptr {
+		if v.IsNil() {
+			return ""
+		}
+		v = v.Elem()
+	}
+	f := v.FieldByName(field)
+	if !f.IsValid() || f.Kind() != reflect.String {
+		return ""
+	}
+	return f.String()
+}
+
+func resolveStorageID(spec *runSpec, unit int, bootUnit int) (string, error) {
+	if unit == bootUnit {
+		if spec.Target.CloudStack.StorageID == "" {
+			return "", errors.New("target.cloudstack.storageid is required for boot disk")
+		}
+		return spec.Target.CloudStack.StorageID, nil
+	}
+	cfg, ok := spec.Disks[strconv.Itoa(unit)]
+	if !ok || cfg.StorageID == "" {
+		return "", fmt.Errorf("disks.%d.storageid is required for data disk", unit)
+	}
+	return cfg.StorageID, nil
+}
+
+func ensureStorageMounted(storageID string) (string, error) {
+	mountPath := filepath.Join("/mnt", storageID)
+	if st, err := os.Stat(mountPath); err != nil || !st.IsDir() {
+		return "", fmt.Errorf("storage mount path not present: %s", mountPath)
+	}
+	data, err := os.ReadFile("/proc/mounts")
+	if err != nil {
+		return "", err
+	}
+	if !strings.Contains(string(data), mountPath) {
+		return "", fmt.Errorf("%s exists but is not mounted", mountPath)
+	}
+	return mountPath, nil
+}
+
+func parseFinalizeAt(s string) (time.Time, error) {
+	if strings.TrimSpace(s) == "" {
+		return time.Time{}, nil
+	}
+	layouts := []string{
+		time.RFC3339,
+		"2006-01-02T15:04:05",
+		"2006-01-02T15:04",
+	}
+	var parseErr error
+	for _, layout := range layouts {
+		t, err := time.Parse(layout, s)
+		if err == nil {
+			return t, nil
+		}
+		parseErr = err
+	}
+	return time.Time{}, parseErr
+}
+
+func queryChangedRanges(
+	ctx context.Context,
+	client *govmomi.Client,
+	vmRef types.ManagedObjectReference,
+	snapshotRef types.ManagedObjectReference,
+	deviceKey int32,
+	changeID string,
+	capacity int64,
+) ([]changedRange, error) {
+	ranges := make([]changedRange, 0)
+	var startOffset int64
+	for startOffset < capacity {
+		req := types.QueryChangedDiskAreas{
+			This:        vmRef,
+			Snapshot:    &snapshotRef,
+			DeviceKey:   deviceKey,
+			StartOffset: startOffset,
+			ChangeId:    changeID,
+		}
+		resp, err := methods.QueryChangedDiskAreas(ctx, client.Client, &req)
+		if err != nil {
+			return nil, err
+		}
+		if resp.Returnval == nil {
+			break
+		}
+		for _, area := range resp.Returnval.ChangedArea {
+			ranges = append(ranges, changedRange{Start: area.Start, Length: area.Length})
+		}
+		next := resp.Returnval.StartOffset + resp.Returnval.Length
+		if next <= startOffset {
+			break
+		}
+		startOffset = next
+	}
+	return ranges, nil
+}
+
+func writeRangesTempFile(ranges []changedRange, unit int) (string, error) {
+	name := filepath.Join(os.TempDir(), fmt.Sprintf("v2c_ranges_u%d_%d.json", unit, time.Now().UnixNano()))
+	data, err := json.Marshal(ranges)
+	if err != nil {
+		return "", err
+	}
+	if err := os.WriteFile(name, data, 0o600); err != nil {
+		return "", err
+	}
+	return name, nil
+}
+
+func saveRunState(path string, st *runState) error {
+	st.UpdatedAt = time.Now().Format(time.RFC3339)
+	raw, err := json.MarshalIndent(st, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, raw, 0o644)
+}
+
+type runOptions struct {
+	SpecPath      string
+	ConfigPath    string
+	Readers       int
+	RunVirtV2V    bool
+	OverrideV2V   bool
+}
+
+func runWorkflow(ctx context.Context, opts runOptions) error {
+	spec, err := loadRunSpec(opts.SpecPath)
+	if err != nil {
+		return err
+	}
+	if opts.ConfigPath == "" {
+		opts.ConfigPath = defaultConfigPath()
+	}
+	cfg, err := loadAppConfig(opts.ConfigPath)
+	if err != nil {
+		return err
+	}
+	if cfg.VCenter.Password == "" {
+		cfg.VCenter.Password = os.Getenv("VC_PASSWORD")
+	}
+	if cfg.VCenter.Password == "" {
+		return errors.New("missing vcenter password in config and VC_PASSWORD env")
+	}
+	if strings.TrimSpace(cfg.Migration.VDDKPath) == "" {
+		return errors.New("config migration.vddk_path is required")
+	}
+	if spec.VM.Name == "" {
+		return errors.New("spec.vm.name is required")
+	}
+
+	client, err := connectVCenter(ctx, cfg)
+	if err != nil {
+		return err
+	}
+	vmObj, err := findVM(ctx, client, spec.VM.Name)
+	if err != nil {
+		return err
+	}
+	vmMoref := vmObj.Reference().Value
+	migrationID := fmt.Sprintf("%s_%s", spec.VM.Name, vmMoref)
+	controlDir := filepath.Join("/var/lib/vm-migrator", migrationID)
+	if err := os.MkdirAll(controlDir, 0o755); err != nil {
+		return err
+	}
+	statePath := filepath.Join(controlDir, "state.engine.json")
+	finalizeFile := filepath.Join(controlDir, "FINALIZE")
+
+	thumb, err := getServerThumbprint(cfg.VCenter.Host)
+	if err != nil {
+		return err
+	}
+
+	disks, bootUnit, err := listVMDisksAndBootUnit(ctx, client, vmObj)
+	if err != nil {
+		return err
+	}
+
+	quiesceMode := strings.ToLower(strings.TrimSpace(cfg.Migration.SnapshotQuiesce))
+	if strings.TrimSpace(spec.Migration.SnapshotQuiesce) != "" {
+		quiesceMode = strings.ToLower(strings.TrimSpace(spec.Migration.SnapshotQuiesce))
+	}
+	quiesce := quiesceMode == "true"
+
+	baseSnap, err := createSnapshot(ctx, vmObj, "Migrate_Base_"+spec.VM.Name, quiesce)
+	if err != nil {
+		return err
+	}
+	baseMeta, err := snapshotDiskMetadata(ctx, client, baseSnap)
+	if err != nil {
+		return err
+	}
+
+	readers := spec.Migration.Readers
+	if readers <= 0 {
+		readers = 4
+	}
+	if opts.Readers > 0 {
+		readers = opts.Readers
+	}
+	runVirtV2V := false
+	if spec.Migration.RunVirtV2V != nil {
+		runVirtV2V = *spec.Migration.RunVirtV2V
+	}
+	if opts.OverrideV2V {
+		runVirtV2V = opts.RunVirtV2V
+	}
+
+	st := &runState{
+		VMName:         spec.VM.Name,
+		VMMoref:        vmMoref,
+		MigrationID:    migrationID,
+		Stage:          "base_copy",
+		ActiveSnapshot: baseSnap.Value,
+		Disks:          map[string]*runDiskState{},
+	}
+
+	for _, d := range disks {
+		meta, ok := baseMeta[d.Key]
+		if !ok || meta.Path == "" {
+			return fmt.Errorf("snapshot backing path not found for disk key=%d", d.Key)
+		}
+		storageID, err := resolveStorageID(spec, d.Unit, bootUnit)
+		if err != nil {
+			return err
+		}
+		mountPath, err := ensureStorageMounted(storageID)
+		if err != nil {
+			return err
+		}
+		targetQCOW2 := filepath.Join(mountPath, fmt.Sprintf("%s_disk%d.qcow2", migrationID, d.Unit))
+		baseOpts := baseCopyOptions{
+			VDDK: vddkConnCfg{
+				LibDir:        cfg.Migration.VDDKPath,
+				Server:        cfg.VCenter.Host,
+				User:          cfg.VCenter.User,
+				Password:      cfg.VCenter.Password,
+				Thumbprint:    thumb,
+				VMMoref:       vmMoref,
+				SnapshotMoref: baseSnap.Value,
+			},
+			DiskPath:      meta.Path,
+			TargetQCOW2:   targetQCOW2,
+			DiskSizeBytes: d.Capacity,
+			Readers:       readers,
+			RunVirtV2V:    runVirtV2V && d.Unit == bootUnit,
+		}
+		if _, err := runBaseCopy(ctx, baseOpts); err != nil {
+			return fmt.Errorf("base copy failed for unit=%d: %w", d.Unit, err)
+		}
+		st.Disks[strconv.Itoa(d.Unit)] = &runDiskState{
+			Key:            d.Key,
+			Unit:           d.Unit,
+			Capacity:       d.Capacity,
+			TargetQCOW2:    targetQCOW2,
+			SourceDiskPath: meta.Path,
+			ChangeID:       meta.ChangeID,
+		}
+		if err := saveRunState(statePath, st); err != nil {
+			return err
+		}
+	}
+
+	deltaInterval := spec.Migration.DeltaInterval
+	if deltaInterval <= 0 {
+		deltaInterval = 300
+	}
+	finalizeDeltaInterval := spec.Migration.FinalizeDeltaInterval
+	if finalizeDeltaInterval <= 0 {
+		finalizeDeltaInterval = 30
+	}
+	finalizeWindow := spec.Migration.FinalizeWindow
+	if finalizeWindow <= 0 {
+		finalizeWindow = 600
+	}
+	finalizeAt, err := parseFinalizeAt(spec.Migration.FinalizeAt)
+	if err != nil {
+		return fmt.Errorf("invalid finalize_at: %w", err)
+	}
+
+	runDeltaOnce := func() error {
+		st.Stage = "delta"
+		newSnap, err := createSnapshot(ctx, vmObj, fmt.Sprintf("Migrate_Delta_%s_%d", spec.VM.Name, time.Now().Unix()), quiesce)
+		if err != nil {
+			return err
+		}
+		newMeta, err := snapshotDiskMetadata(ctx, client, newSnap)
+		if err != nil {
+			return err
+		}
+		for _, d := range disks {
+			unitKey := strconv.Itoa(d.Unit)
+			ds := st.Disks[unitKey]
+			if ds == nil {
+				return fmt.Errorf("missing disk state for unit=%d", d.Unit)
+			}
+			meta, ok := newMeta[d.Key]
+			if !ok || meta.Path == "" {
+				return fmt.Errorf("missing delta snapshot metadata for key=%d", d.Key)
+			}
+			if strings.TrimSpace(ds.ChangeID) == "" {
+				ds.ChangeID = meta.ChangeID
+				ds.SourceDiskPath = meta.Path
+				continue
+			}
+			ranges, err := queryChangedRanges(ctx, client, vmObj.Reference(), newSnap, d.Key, ds.ChangeID, d.Capacity)
+			if err != nil {
+				return err
+			}
+			if len(ranges) > 0 {
+				rangesPath, err := writeRangesTempFile(ranges, d.Unit)
+				if err != nil {
+					return err
+				}
+				deltaOpts := deltaSyncOptions{
+					VDDK: vddkConnCfg{
+						LibDir:        cfg.Migration.VDDKPath,
+						Server:        cfg.VCenter.Host,
+						User:          cfg.VCenter.User,
+						Password:      cfg.VCenter.Password,
+						Thumbprint:    thumb,
+						VMMoref:       vmMoref,
+						SnapshotMoref: newSnap.Value,
+					},
+					DiskPath:    meta.Path,
+					TargetQCOW2: ds.TargetQCOW2,
+					RangesFile:  rangesPath,
+					Readers:     readers,
+				}
+				if _, err := runDeltaSync(ctx, deltaOpts); err != nil {
+					_ = os.Remove(rangesPath)
+					return fmt.Errorf("delta sync failed for unit=%d: %w", d.Unit, err)
+				}
+				_ = os.Remove(rangesPath)
+			}
+			ds.ChangeID = meta.ChangeID
+			ds.SourceDiskPath = meta.Path
+		}
+		prev := st.ActiveSnapshot
+		st.ActiveSnapshot = newSnap.Value
+		if err := saveRunState(statePath, st); err != nil {
+			return err
+		}
+		if prev != "" && prev != newSnap.Value {
+			if err := removeSnapshot(ctx, client, types.ManagedObjectReference{Type: "VirtualMachineSnapshot", Value: prev}); err != nil {
+				fmt.Fprintf(os.Stderr, "[run] warning: failed to remove snapshot %s: %v\n", prev, err)
+			}
+		}
+		return nil
+	}
+
+	for {
+		if !finalizeAt.IsZero() && time.Now().After(finalizeAt) {
+			st.Stage = "final_sync"
+			_ = saveRunState(statePath, st)
+			return runDeltaOnce()
+		}
+		if _, err := os.Stat(finalizeFile); err == nil {
+			st.Stage = "final_sync"
+			_ = saveRunState(statePath, st)
+			return runDeltaOnce()
+		}
+		if err := runDeltaOnce(); err != nil {
+			return err
+		}
+		sleepSec := deltaInterval
+		if !finalizeAt.IsZero() {
+			remaining := int(time.Until(finalizeAt).Seconds())
+			if remaining <= 0 {
+				continue
+			}
+			if remaining <= finalizeWindow {
+				sleepSec = finalizeDeltaInterval
+			}
+			if remaining < sleepSec {
+				sleepSec = remaining
+			}
+		}
+		if sleepSec <= 0 {
+			continue
+		}
+		time.Sleep(time.Duration(sleepSec) * time.Second)
+	}
+}
+
 func main() {
 	if len(os.Args) < 2 {
 		usage()
 		os.Exit(2)
 	}
 	switch os.Args[1] {
+	case "run":
+		if err := cmdRun(os.Args[2:]); err != nil {
+			fmt.Fprintf(os.Stderr, "run failed: %v\n", err)
+			os.Exit(1)
+		}
 	case "base-copy":
 		if err := cmdBaseCopy(os.Args[2:]); err != nil {
 			fmt.Fprintf(os.Stderr, "base-copy failed: %v\n", err)
@@ -1123,10 +1776,28 @@ func main() {
 
 func usage() {
 	fmt.Fprintf(os.Stderr, "Usage:\n")
+	fmt.Fprintf(os.Stderr, "  v2c-engine run        --spec /path/spec.yaml [--config /path/config.yaml]\n")
 	fmt.Fprintf(os.Stderr, "  v2c-engine base-copy  [flags]\n")
 	fmt.Fprintf(os.Stderr, "  v2c-engine delta-sync [flags]\n")
 	fmt.Fprintf(os.Stderr, "  v2c-engine base-copy --spec /path/spec.yaml\n")
 	fmt.Fprintf(os.Stderr, "  v2c-engine delta-sync --spec /path/spec.yaml\n")
+}
+
+func cmdRun(args []string) error {
+	var opts runOptions
+	fs := flag.NewFlagSet("run", flag.ContinueOnError)
+	fs.StringVar(&opts.SpecPath, "spec", "", "Python-style VM migration spec YAML")
+	fs.StringVar(&opts.ConfigPath, "config", defaultConfigPath(), "Global config.yaml path")
+	fs.IntVar(&opts.Readers, "readers", 0, "Override readers from spec migration.readers")
+	fs.BoolVar(&opts.RunVirtV2V, "run-virt-v2v", false, "Override spec migration.run_virt_v2v")
+	fs.BoolVar(&opts.OverrideV2V, "override-run-virt-v2v", false, "If true, force use of --run-virt-v2v")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if strings.TrimSpace(opts.SpecPath) == "" {
+		return errors.New("run requires --spec <file>")
+	}
+	return runWorkflow(context.Background(), opts)
 }
 
 func cmdBaseCopy(args []string) error {

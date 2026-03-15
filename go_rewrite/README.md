@@ -95,17 +95,28 @@ export CGO_LDFLAGS="-L/opt/vmware-vddk/lib64 -lvixDiskLib -ldl -lpthread"
 `v2c-engine` can read a YAML spec directly:
 
 ```bash
+./v2c-engine run --spec ./spec.run.example.yaml --config ../config.yaml
 ./v2c-engine base-copy --spec ./spec.engine.example.yaml
 ./v2c-engine delta-sync --spec ./spec.engine.example.yaml
 ```
+
+`run` mode follows the Python-style workflow for base copy and delta loop scheduling:
+- Reads VM and migration strategy from spec (`delta_interval`, `finalize_at`, etc.).
+- Resolves destination disk path from CloudStack storage selection:
+  - boot disk -> `target.cloudstack.storageid`
+  - data disk -> `disks.<unit>.storageid`
+  - output path format -> `/mnt/<storageid>/<vm>_<vmMoref>_disk<unit>.qcow2`
+- Uses `migration.readers` and `migration.run_virt_v2v` from spec.
 
 You can still override any value from spec with CLI flags:
 
 ```bash
 ./v2c-engine base-copy --spec ./spec.engine.example.yaml -readers 8
+./v2c-engine run --spec ./spec.run.example.yaml --readers 8 --override-run-virt-v2v --run-virt-v2v=true
 ```
 
 Use [spec.engine.example.yaml](./spec.engine.example.yaml) as the template for UI-generated specs.
+Use [spec.run.example.yaml](./spec.run.example.yaml) as the template for full run-mode specs.
 
 ## Mapping from current Python flow
 
