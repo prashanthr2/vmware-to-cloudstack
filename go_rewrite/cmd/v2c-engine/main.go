@@ -2375,10 +2375,8 @@ func runVMWorkflow(ctx context.Context, cfg *appConfig, spec *runSpec, opts runO
 				return fmt.Errorf("snapshot backing path not found for disk key=%d", d.Key)
 			}
 
-			d := d
-			meta := meta
 			wg.Add(1)
-			go func() {
+			go func(d vmDisk, meta snapshotDiskMeta) {
 				defer wg.Done()
 				select {
 				case sem <- struct{}{}:
@@ -2432,7 +2430,7 @@ func runVMWorkflow(ctx context.Context, cfg *appConfig, spec *runSpec, opts runO
 				_ = saveRunState(statePath, st)
 				stateMu.Unlock()
 				log.Printf("[disk%d] base copy completed read=%d written=%d zero_skipped=%d", d.Unit, stats.BytesRead, stats.BytesWritten, stats.BytesZeroSkipped)
-			}()
+			}(d, meta)
 		}
 		wg.Wait()
 		if firstErr != nil {
@@ -2486,13 +2484,12 @@ func runVMWorkflow(ctx context.Context, cfg *appConfig, spec *runSpec, opts runO
 		var errMu sync.Mutex
 
 		for _, d := range disks {
-			d := d
 			meta, ok := newMeta[d.Key]
 			if !ok || meta.Path == "" {
 				return fmt.Errorf("missing delta snapshot metadata for key=%d", d.Key)
 			}
 			wg.Add(1)
-			go func() {
+			go func(d vmDisk, meta snapshotDiskMeta) {
 				defer wg.Done()
 				select {
 				case sem <- struct{}{}:
@@ -2588,7 +2585,7 @@ func runVMWorkflow(ctx context.Context, cfg *appConfig, spec *runSpec, opts runO
 				recomputeStateProgress(st)
 				_ = saveRunState(statePath, st)
 				stateMu.Unlock()
-			}()
+			}(d, meta)
 		}
 
 		wg.Wait()
