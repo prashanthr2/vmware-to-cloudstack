@@ -2839,9 +2839,27 @@ func runVMWorkflow(ctx context.Context, cfg *appConfig, spec *runSpec, opts runO
 					errMu.Unlock()
 					return
 				}
-
-				if strings.TrimSpace(prevChangeID) != "" {
-					ranges, err := queryChangedRanges(ctx, client, vmObj.Reference(), newSnap, d.Key, prevChangeID, d.Capacity)
+				if strings.TrimSpace(prevChangeID) == "" {
+					errMu.Lock()
+					if firstErr == nil {
+						firstErr = fmt.Errorf("missing previous changeID for unit=%d", d.Unit)
+						deltaCancel()
+					}
+					errMu.Unlock()
+					return
+				}
+				ranges, err := queryChangedRanges(ctx, client, vmObj.Reference(), newSnap, d.Key, prevChangeID, d.Capacity)
+				if err != nil {
+					errMu.Lock()
+					if firstErr == nil {
+						firstErr = err
+						deltaCancel()
+					}
+					errMu.Unlock()
+					return
+				}
+				if len(ranges) > 0 {
+					rangesPath, err := writeRangesTempFile(ranges, d.Unit)
 					if err != nil {
 						errMu.Lock()
 						if firstErr == nil {
@@ -2851,48 +2869,36 @@ func runVMWorkflow(ctx context.Context, cfg *appConfig, spec *runSpec, opts runO
 						errMu.Unlock()
 						return
 					}
-					if len(ranges) > 0 {
-						rangesPath, err := writeRangesTempFile(ranges, d.Unit)
-						if err != nil {
-							errMu.Lock()
-							if firstErr == nil {
-								firstErr = err
-								deltaCancel()
-							}
-							errMu.Unlock()
-							return
+					totalChanged := changedBytes(ranges)
+					if totalChanged <= 0 {
+						totalChanged = d.Capacity
+					}
+					progress := makeProgressUpdater(stateMu, statePath, st, log, d.Unit, totalChanged, stageName)
+					_, err = runDeltaSync(deltaCtx, deltaSyncOptions{
+						VDDK: vddkConnCfg{
+							LibDir:        cfg.Migration.VDDKPath,
+							Server:        cfg.VCenter.Host,
+							User:          cfg.VCenter.User,
+							Password:      cfg.VCenter.Password,
+							Thumbprint:    thumb,
+							VMMoref:       vmMoref,
+							SnapshotMoref: newSnap.Value,
+						},
+						DiskPath:    meta.Path,
+						TargetQCOW2: targetQCOW2,
+						RangesFile:  rangesPath,
+						Readers:     readers,
+						OnProgress:  progress,
+					})
+					_ = os.Remove(rangesPath)
+					if err != nil {
+						errMu.Lock()
+						if firstErr == nil {
+							firstErr = fmt.Errorf("delta sync failed for unit=%d: %w", d.Unit, err)
+							deltaCancel()
 						}
-						totalChanged := changedBytes(ranges)
-						if totalChanged <= 0 {
-							totalChanged = d.Capacity
-						}
-						progress := makeProgressUpdater(stateMu, statePath, st, log, d.Unit, totalChanged, stageName)
-						_, err = runDeltaSync(deltaCtx, deltaSyncOptions{
-							VDDK: vddkConnCfg{
-								LibDir:        cfg.Migration.VDDKPath,
-								Server:        cfg.VCenter.Host,
-								User:          cfg.VCenter.User,
-								Password:      cfg.VCenter.Password,
-								Thumbprint:    thumb,
-								VMMoref:       vmMoref,
-								SnapshotMoref: newSnap.Value,
-							},
-							DiskPath:    meta.Path,
-							TargetQCOW2: targetQCOW2,
-							RangesFile:  rangesPath,
-							Readers:     readers,
-							OnProgress:  progress,
-						})
-						_ = os.Remove(rangesPath)
-						if err != nil {
-							errMu.Lock()
-							if firstErr == nil {
-								firstErr = fmt.Errorf("delta sync failed for unit=%d: %w", d.Unit, err)
-								deltaCancel()
-							}
-							errMu.Unlock()
-							return
-						}
+						errMu.Unlock()
+						return
 					}
 				}
 
