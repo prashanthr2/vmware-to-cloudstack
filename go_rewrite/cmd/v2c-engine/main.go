@@ -580,8 +580,21 @@ func verifyImageBeforeV2V(path string) error {
 		return nil
 	}
 
+	// Prefer explicit no-repair check when supported, but older qemu-img
+	// releases do not accept "-r none".
 	if err := run("qemu-img", "check", "-r", "none", path); err != nil {
-		return err
+		msg := strings.ToLower(err.Error())
+		unsupportedNoRepair :=
+			strings.Contains(msg, "unknown option value for -r") ||
+				strings.Contains(msg, "invalid option") ||
+				strings.Contains(msg, "unrecognized option")
+		if unsupportedNoRepair {
+			if err2 := run("qemu-img", "check", path); err2 != nil {
+				return err2
+			}
+		} else {
+			return err
+		}
 	}
 	if err := run("virt-inspector", "-a", path); err != nil {
 		return err
