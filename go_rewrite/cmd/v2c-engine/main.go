@@ -55,6 +55,60 @@ static VixError v2c_vddk_get_capacity(VixDiskLibHandle handle, uint64_t *capacit
     VixDiskLib_FreeInfo(info);
     return VIX_OK;
 }
+
+static VixError v2c_vddk_query_allocated_blocks(
+    VixDiskLibHandle handle,
+    uint64_t startSector,
+    uint64_t numSectors,
+    uint64_t chunkSize,
+    uint64_t **offsets,
+    uint64_t **lengths,
+    uint32_t *count
+) {
+    VixDiskLibBlockList *blockList = NULL;
+    VixError err = VixDiskLib_QueryAllocatedBlocks(
+        handle,
+        (VixDiskLibSectorType)startSector,
+        (VixDiskLibSectorType)numSectors,
+        (VixDiskLibSectorType)chunkSize,
+        &blockList
+    );
+    if (err != VIX_OK) {
+        return err;
+    }
+
+    *offsets = NULL;
+    *lengths = NULL;
+    *count = 0;
+
+    if (blockList == NULL || blockList->numBlocks == 0) {
+        if (blockList != NULL) {
+            VixDiskLib_FreeBlockList(blockList);
+        }
+        return VIX_OK;
+    }
+
+    uint32_t n = blockList->numBlocks;
+    uint64_t *offs = (uint64_t *)malloc(sizeof(uint64_t) * n);
+    uint64_t *lens = (uint64_t *)malloc(sizeof(uint64_t) * n);
+    if (offs == NULL || lens == NULL) {
+        if (offs != NULL) free(offs);
+        if (lens != NULL) free(lens);
+        VixDiskLib_FreeBlockList(blockList);
+        return (VixError)1;
+    }
+
+    for (uint32_t i = 0; i < n; ++i) {
+        offs[i] = (uint64_t)blockList->blocks[i].offset;
+        lens[i] = (uint64_t)blockList->blocks[i].length;
+    }
+
+    VixDiskLib_FreeBlockList(blockList);
+    *offsets = offs;
+    *lengths = lens;
+    *count = n;
+    return VIX_OK;
+}
 */
 import "C"
 
@@ -135,6 +189,11 @@ type vddkConnection struct {
 
 type vddkHandle struct {
 	ptr C.VixDiskLibHandle
+}
+
+type allocatedExtent struct {
+	Offset int64
+	Length int64
 }
 
 var (
@@ -248,6 +307,66 @@ func (h *vddkHandle) capacityBytes() (int64, error) {
 		return 0, errors.New("invalid source disk capacity from VDDK")
 	}
 	return capBytes, nil
+}
+
+func (h *vddkHandle) queryAllocatedBlocks(startSector, numSectors, chunkSectors uint64) ([]allocatedExtent, error) {
+	if numSectors == 0 {
+		return nil, nil
+	}
+	if chunkSectors == 0 {
+		chunkSectors = 1
+	}
+
+	var cOffsets *C.uint64_t
+	var cLengths *C.uint64_t
+	var cCount C.uint32_t
+	err := C.v2c_vddk_query_allocated_blocks(
+		h.ptr,
+		C.uint64_t(startSector),
+		C.uint64_t(numSectors),
+		C.uint64_t(chunkSectors),
+		&cOffsets,
+		&cLengths,
+		&cCount,
+	)
+	if err != 0 {
+		return nil, fmt.Errorf(
+			"VixDiskLib_QueryAllocatedBlocks failed start=%d sectors=%d chunk=%d: %s",
+			startSector,
+			numSectors,
+			chunkSectors,
+			vixErrorText(err),
+		)
+	}
+	defer func() {
+		if cOffsets != nil {
+			C.free(unsafe.Pointer(cOffsets))
+		}
+		if cLengths != nil {
+			C.free(unsafe.Pointer(cLengths))
+		}
+	}()
+
+	n := int(cCount)
+	if n == 0 {
+		return nil, nil
+	}
+
+	offsetSlice := unsafe.Slice((*uint64)(unsafe.Pointer(cOffsets)), n)
+	lengthSlice := unsafe.Slice((*uint64)(unsafe.Pointer(cLengths)), n)
+	out := make([]allocatedExtent, 0, n)
+	for i := 0; i < n; i++ {
+		if lengthSlice[i] == 0 {
+			continue
+		}
+		offBytes := int64(offsetSlice[i]) * sectorSize
+		lenBytes := int64(lengthSlice[i]) * sectorSize
+		if offBytes < 0 || lenBytes <= 0 {
+			continue
+		}
+		out = append(out, allocatedExtent{Offset: offBytes, Length: lenBytes})
+	}
+	return out, nil
 }
 
 func vixErrorText(vixErr C.VixError) string {
@@ -991,6 +1110,102 @@ func detectSourceDiskSizeBytes(cfg vddkConnCfg, diskPath string) (int64, error) 
 	return handle.capacityBytes()
 }
 
+func mergeAllocatedExtents(extents []allocatedExtent, diskSizeBytes int64) []allocatedExtent {
+	if len(extents) == 0 {
+		return nil
+	}
+	sort.Slice(extents, func(i, j int) bool {
+		return extents[i].Offset < extents[j].Offset
+	})
+	out := make([]allocatedExtent, 0, len(extents))
+	for _, e := range extents {
+		if e.Length <= 0 || e.Offset >= diskSizeBytes {
+			continue
+		}
+		if e.Offset < 0 {
+			e.Length += e.Offset
+			e.Offset = 0
+		}
+		if e.Length <= 0 {
+			continue
+		}
+		end := e.Offset + e.Length
+		if end > diskSizeBytes {
+			end = diskSizeBytes
+		}
+		e.Length = end - e.Offset
+		if e.Length <= 0 {
+			continue
+		}
+		n := len(out)
+		if n == 0 {
+			out = append(out, e)
+			continue
+		}
+		last := &out[n-1]
+		lastEnd := last.Offset + last.Length
+		if e.Offset <= lastEnd {
+			if end > lastEnd {
+				last.Length = end - last.Offset
+			}
+			continue
+		}
+		out = append(out, e)
+	}
+	return out
+}
+
+func queryAllocatedExtents(cfg vddkConnCfg, diskPath string, diskSizeBytes int64, chunkBytes int64) ([]allocatedExtent, error) {
+	conn, err := connectVDDK(cfg)
+	if err != nil {
+		return nil, err
+	}
+	defer conn.close()
+	handle, err := conn.open(diskPath)
+	if err != nil {
+		return nil, err
+	}
+	defer handle.close()
+
+	totalSectors := uint64(diskSizeBytes / sectorSize)
+	if totalSectors == 0 {
+		return nil, nil
+	}
+	chunkSectors := uint64(chunkBytes / sectorSize)
+	if chunkSectors == 0 {
+		chunkSectors = 1
+	}
+	// Query in windows to keep list sizes bounded on very large disks.
+	const windowSectors = uint64((1 << 30) / sectorSize) // 1 GiB window
+	if windowSectors == 0 {
+		return nil, errors.New("invalid allocated-block query window")
+	}
+
+	extents := make([]allocatedExtent, 0, 1024)
+	var start uint64
+	for start < totalSectors {
+		n := windowSectors
+		if rem := totalSectors - start; rem < n {
+			n = rem
+		}
+		got, err := handle.queryAllocatedBlocks(start, n, chunkSectors)
+		if err != nil {
+			return nil, err
+		}
+		extents = append(extents, got...)
+		start += n
+	}
+
+	// Per VDDK docs: final non-chunk-aligned tail should be treated as allocated.
+	if rem := totalSectors % chunkSectors; rem != 0 {
+		tailStart := int64(totalSectors-rem) * sectorSize
+		tailLen := int64(rem) * sectorSize
+		extents = append(extents, allocatedExtent{Offset: tailStart, Length: tailLen})
+	}
+
+	return mergeAllocatedExtents(extents, diskSizeBytes), nil
+}
+
 func (o *baseCopyOptions) normalize() {
 	if o.Readers <= 0 {
 		o.Readers = 4
@@ -1081,6 +1296,24 @@ func runBaseCopy(ctx context.Context, opts baseCopyOptions) (copyStats, error) {
 		opts.FastMBps,
 		opts.SlowMBps,
 	)
+	allocChunkBytes := int64(alignUp(opts.MinChunkMB*1024*1024, sectorSize))
+	allocatedExtents, allocErr := queryAllocatedExtents(opts.VDDK, opts.DiskPath, opts.DiskSizeBytes, allocChunkBytes)
+	useAllocatedExtents := allocErr == nil
+	if allocErr != nil {
+		fmt.Fprintf(os.Stderr, "[base-copy] QueryAllocatedBlocks unavailable (%v), falling back to full read\n", allocErr)
+	} else {
+		var allocBytes int64
+		for _, e := range allocatedExtents {
+			allocBytes += e.Length
+		}
+		fmt.Fprintf(
+			os.Stderr,
+			"[base-copy] QueryAllocatedBlocks enabled extents=%d allocated_bytes=%d total_bytes=%d\n",
+			len(allocatedExtents),
+			allocBytes,
+			opts.DiskSizeBytes,
+		)
+	}
 
 	var bytesRead int64
 	var bytesWritten int64
@@ -1137,27 +1370,54 @@ func runBaseCopy(ctx context.Context, opts baseCopyOptions) (copyStats, error) {
 
 	go func() {
 		defer close(readQ)
-		var offset int64
-		for offset < opts.DiskSizeBytes {
-			select {
-			case <-ctx.Done():
-				return
-			default:
+		enqueueRange := func(start, end int64) bool {
+			offset := start
+			for offset < end {
+				select {
+				case <-ctx.Done():
+					return false
+				default:
+				}
+				chunk := sizer.current()
+				remaining := end - offset
+				if int64(chunk) > remaining {
+					chunk = alignDown(int(remaining), sectorSize)
+					if chunk <= 0 {
+						chunk = sectorSize
+					}
+				}
+				select {
+				case <-ctx.Done():
+					return false
+				case readQ <- block{Offset: offset, Length: chunk}:
+				}
+				offset += int64(chunk)
 			}
-			chunk := sizer.current()
-			remaining := opts.DiskSizeBytes - offset
-			if int64(chunk) > remaining {
-				chunk = alignDown(int(remaining), sectorSize)
-				if chunk <= 0 {
-					chunk = sectorSize
+			return true
+		}
+
+		if useAllocatedExtents {
+			for _, e := range allocatedExtents {
+				start := e.Offset
+				end := e.Offset + e.Length
+				if start < 0 {
+					start = 0
+				}
+				if end > opts.DiskSizeBytes {
+					end = opts.DiskSizeBytes
+				}
+				if end <= start {
+					continue
+				}
+				if ok := enqueueRange(start, end); !ok {
+					return
 				}
 			}
-			select {
-			case <-ctx.Done():
-				return
-			case readQ <- block{Offset: offset, Length: chunk}:
-			}
-			offset += int64(chunk)
+			return
+		}
+
+		if ok := enqueueRange(0, opts.DiskSizeBytes); !ok {
+			return
 		}
 	}()
 
