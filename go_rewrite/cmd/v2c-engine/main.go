@@ -59,6 +59,7 @@ static VixError v2c_vddk_get_capacity(VixDiskLibHandle handle, uint64_t *capacit
 import "C"
 
 import (
+	"bytes"
 	"crypto/hmac"
 	"crypto/sha1"
 	"crypto/tls"
@@ -458,14 +459,39 @@ func runVirtV2VInPlace(path string, virtioISO string) error {
 	if err != nil {
 		return fmt.Errorf("virt-v2v-in-place not found: %w", err)
 	}
-	args := []string{"-i", "disk", path}
-	if virtioISO != "" {
-		args = append(args, "--inject-virtio-win", virtioISO)
+
+	runCmd := func(args []string) (string, error) {
+		cmd := exec.Command(v2vPath, args...)
+		var buf bytes.Buffer
+		cmd.Stdout = io.MultiWriter(os.Stdout, &buf)
+		cmd.Stderr = io.MultiWriter(os.Stderr, &buf)
+		err := cmd.Run()
+		return buf.String(), err
 	}
-	cmd := exec.Command(v2vPath, args...)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	return cmd.Run()
+
+	baseArgs := []string{"-i", "disk", path}
+	if strings.TrimSpace(virtioISO) == "" {
+		_, err := runCmd(baseArgs)
+		return err
+	}
+
+	withInject := append(append([]string{}, baseArgs...), "--inject-virtio-win", virtioISO)
+	out, err := runCmd(withInject)
+	if err == nil {
+		return nil
+	}
+
+	msg := strings.ToLower(out)
+	if strings.Contains(msg, "unrecognized option '--inject-virtio-win'") ||
+		strings.Contains(msg, "unknown option '--inject-virtio-win'") {
+		fmt.Fprintf(
+			os.Stderr,
+			"[virt-v2v] warning: --inject-virtio-win unsupported by this virt-v2v-in-place version, retrying without it\n",
+		)
+		_, retryErr := runCmd(baseArgs)
+		return retryErr
+	}
+	return err
 }
 
 type readMetric struct {

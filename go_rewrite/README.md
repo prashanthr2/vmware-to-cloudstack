@@ -132,6 +132,7 @@ export CGO_LDFLAGS="-L/opt/vmware-vddk/lib64 -lvixDiskLib -ldl -lpthread"
 - Supports parallel VM migrations by passing multiple `--spec` values and setting `--parallel-vms` (or config `migration.parallel_vms`).
 - Also accepts spec files with top-level `vms:` list, same as Python behavior.
 - `run_virt_v2v` default comes from `config.yaml -> virt.run_virt_v2v`, and can be overridden per-VM via `spec.migration.run_virt_v2v`.
+- If `virt-v2v-in-place` does not support `--inject-virtio-win`, the engine retries conversion without that flag for compatibility.
 
 You can still override any value from spec with CLI flags:
 
