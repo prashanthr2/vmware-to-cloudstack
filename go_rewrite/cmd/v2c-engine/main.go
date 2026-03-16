@@ -2361,7 +2361,42 @@ func (c *cloudStackClient) waitJob(jobID string, kind string) (map[string]any, e
 }
 
 func sanitizeHostName(vmName string) string {
-	return strings.ReplaceAll(vmName, "_", "-")
+	name := strings.ToLower(strings.TrimSpace(vmName))
+	if name == "" {
+		return "vm"
+	}
+
+	var b strings.Builder
+	b.Grow(len(name))
+	lastHyphen := false
+	for i := 0; i < len(name); i++ {
+		ch := name[i]
+		isAlphaNum := (ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9')
+		if isAlphaNum {
+			b.WriteByte(ch)
+			lastHyphen = false
+			continue
+		}
+		if !lastHyphen {
+			b.WriteByte('-')
+			lastHyphen = true
+		}
+	}
+
+	out := strings.Trim(b.String(), "-")
+	if out == "" {
+		out = "vm"
+	}
+	if out[0] >= '0' && out[0] <= '9' {
+		out = "vm-" + out
+	}
+	if len(out) > 63 {
+		out = strings.Trim(out[:63], "-")
+		if out == "" {
+			out = "vm"
+		}
+	}
+	return out
 }
 
 func importVMToCloudStack(cs *cloudStackClient, vmName string, targetCloud cloudStackTargetSpec, bootDiskPath string) (string, error) {
