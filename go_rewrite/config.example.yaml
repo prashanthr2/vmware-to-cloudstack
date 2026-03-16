@@ -17,7 +17,11 @@ engine:
   slow_mbps: 40
   chunk_mb_delta: 4
 
+migration:
+  # Optional orchestrator defaults for run mode.
+  parallel_disks: 4
+  parallel_vms: 3
+
 virt:
   run_virt_v2v: true
   virtio_iso: /usr/share/virtio-win/virtio-win.iso
-

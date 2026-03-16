@@ -105,9 +105,11 @@ export CGO_LDFLAGS="-L/opt/vmware-vddk/lib64 -lvixDiskLib -ldl -lpthread"
 `run` mode follows the Python-style workflow for base copy and delta loop scheduling:
 - Uses a resumable JSON state machine per VM at `/var/lib/vm-migrator/<vm>_<moref>/state.json`.
 - Legacy `state.engine.json` is auto-read for resume, then new updates continue in `state.json`.
+- Writes Python-style migration logs with timestamps to `/var/lib/vm-migrator/<vm>_<moref>/migration.log` (also mirrored to stderr).
 - Stage order is: `init -> base_copy -> delta/final_sync -> import_root_disk -> import_data_disk -> done`.
 - The first snapshot is always created as `Migrate_Base_<vm>` during `init`; delta snapshots are only created in delta stages.
 - Persists per-disk progress fields (progress %, bytes read/written, speed, ETA) and overall VM progress.
+- `FINALIZE` file behavior is supported: if `/var/lib/vm-migrator/<vm>_<moref>/FINALIZE` exists, the engine runs one final delta round (`final_sync`) and proceeds to import.
 - Reads VM and migration strategy from spec (`delta_interval`, `finalize_at`, etc.).
 - Resolves destination disk path from CloudStack storage selection:
   - boot disk -> `target.cloudstack.storageid`

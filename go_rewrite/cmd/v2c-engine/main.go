@@ -686,9 +686,11 @@ type runDiskState struct {
 	AttachedToVMID string  `json:"attached_to_vm_id,omitempty"`
 	Stage          string  `json:"stage,omitempty"`
 	Progress       float64 `json:"progress,omitempty"`
+	QemuProgress   float64 `json:"qemu_progress,omitempty"`
 	BytesRead      int64   `json:"bytes_read,omitempty"`
 	BytesWritten   int64   `json:"bytes_written,omitempty"`
 	BytesZero      int64   `json:"bytes_zero_skipped,omitempty"`
+	CopiedBytes    int64   `json:"copied_bytes,omitempty"`
 	SpeedMBps      float64 `json:"speed_mbps,omitempty"`
 	EtaSeconds     int64   `json:"eta_seconds,omitempty"`
 	BaseCopied     bool    `json:"base_copied,omitempty"`
@@ -1990,6 +1992,41 @@ func (m *multiStringFlag) Set(v string) error {
 	return nil
 }
 
+type runLogger struct {
+	mu sync.Mutex
+	f  *os.File
+}
+
+func newRunLogger(controlDir string) (*runLogger, error) {
+	logPath := filepath.Join(controlDir, "migration.log")
+	f, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return nil, err
+	}
+	return &runLogger{f: f}, nil
+}
+
+func (l *runLogger) Close() {
+	if l == nil || l.f == nil {
+		return
+	}
+	_ = l.f.Close()
+}
+
+func (l *runLogger) Printf(format string, args ...any) {
+	if l == nil {
+		return
+	}
+	msg := fmt.Sprintf(format, args...)
+	line := fmt.Sprintf("[%s] %s\n", time.Now().UTC().Format("2006-01-02 15:04:05"), msg)
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	fmt.Fprint(os.Stderr, line)
+	if l.f != nil {
+		_, _ = l.f.WriteString(line)
+	}
+}
+
 func recomputeStateProgress(st *runState) {
 	total := 0.0
 	speed := 0.0
@@ -2030,12 +2067,15 @@ func makeProgressUpdater(
 	stateMu *sync.Mutex,
 	statePath string,
 	st *runState,
+	log *runLogger,
 	unit int,
 	totalBytes int64,
 	stage string,
 ) func(copyStats) {
 	unitKey := strconv.Itoa(unit)
 	var lastSave time.Time
+	var lastLog time.Time
+	var lastPct float64 = -1
 	return func(cs copyStats) {
 		stateMu.Lock()
 		defer stateMu.Unlock()
@@ -2057,12 +2097,14 @@ func makeProgressUpdater(
 				p = 100
 			}
 			ds.Progress = math.Round(p*100) / 100
+			ds.QemuProgress = ds.Progress
 		}
 		if cs.ElapsedSec > 0 {
 			ds.SpeedMBps = math.Round((float64(cs.BytesRead)/1024.0/1024.0/float64(cs.ElapsedSec))*100) / 100
 		} else {
 			ds.SpeedMBps = 0
 		}
+		ds.CopiedBytes = ds.BytesWritten
 		remaining := totalBytes - cs.BytesRead
 		if remaining > 0 && ds.SpeedMBps > 0 {
 			ds.EtaSeconds = int64(float64(remaining) / (ds.SpeedMBps * 1024.0 * 1024.0))
@@ -2070,6 +2112,28 @@ func makeProgressUpdater(
 			ds.EtaSeconds = 0
 		}
 		recomputeStateProgress(st)
+
+		if log != nil {
+			shouldLog := lastLog.IsZero() || time.Since(lastLog) >= 10*time.Second
+			if ds.Progress >= 100 || (ds.Progress-lastPct) >= 5 {
+				shouldLog = true
+			}
+			if shouldLog {
+				log.Printf(
+					"[disk%d] %s progress=%.2f%% read=%d written=%d zero_skipped=%d speed=%.2fMB/s eta=%ds",
+					unit,
+					stage,
+					ds.Progress,
+					ds.BytesRead,
+					ds.BytesWritten,
+					ds.BytesZero,
+					ds.SpeedMBps,
+					ds.EtaSeconds,
+				)
+				lastLog = time.Now()
+				lastPct = ds.Progress
+			}
+		}
 
 		if lastSave.IsZero() || time.Since(lastSave) >= 2*time.Second || ds.Progress >= 100 {
 			_ = saveRunState(statePath, st)
@@ -2107,9 +2171,16 @@ func runVMWorkflow(ctx context.Context, cfg *appConfig, spec *runSpec, opts runO
 	if err := os.MkdirAll(controlDir, 0o755); err != nil {
 		return err
 	}
+	log, err := newRunLogger(controlDir)
+	if err != nil {
+		return err
+	}
+	defer log.Close()
+
 	statePath := filepath.Join(controlDir, "state.json")
 	legacyStatePath := filepath.Join(controlDir, "state.engine.json")
 	finalizeFile := filepath.Join(controlDir, "FINALIZE")
+	log.Printf("Starting workflow vm=%s moref=%s", spec.VM.Name, vmMoref)
 
 	disks, bootUnit, err := listVMDisksAndBootUnit(ctx, client, vmObj)
 	if err != nil {
@@ -2148,6 +2219,7 @@ func runVMWorkflow(ctx context.Context, cfg *appConfig, spec *runSpec, opts runO
 	if opts.OverrideV2V {
 		runVirtV2V = opts.RunVirtV2V
 	}
+	log.Printf("Runtime settings readers=%d parallel_disks=%d run_virt_v2v=%t", readers, parallelDisks, runVirtV2V)
 
 	quiesceMode := strings.ToLower(strings.TrimSpace(cfg.Migration.SnapshotQuiesce))
 	if strings.TrimSpace(spec.Migration.SnapshotQuiesce) != "" {
@@ -2194,6 +2266,7 @@ func runVMWorkflow(ctx context.Context, cfg *appConfig, spec *runSpec, opts runO
 	if st.Stage == "converting" {
 		st.Stage = stageImportRoot
 	}
+	log.Printf("Resuming from stage: %s", st.Stage)
 
 	stateMu := &sync.Mutex{}
 	saveState := func() error {
@@ -2204,6 +2277,13 @@ func runVMWorkflow(ctx context.Context, cfg *appConfig, spec *runSpec, opts runO
 		stateMu.Lock()
 		defer stateMu.Unlock()
 		return saveState()
+	}
+	setStage := func(next string) error {
+		stateMu.Lock()
+		st.Stage = next
+		stateMu.Unlock()
+		log.Printf("Stage: %s", next)
+		return saveStateLocked()
 	}
 
 	for _, d := range disks {
@@ -2246,11 +2326,11 @@ func runVMWorkflow(ctx context.Context, cfg *appConfig, spec *runSpec, opts runO
 		if err != nil {
 			return err
 		}
+		log.Printf("Created base snapshot: %s", baseSnap.Value)
 		stateMu.Lock()
 		st.ActiveSnapshot = baseSnap.Value
-		st.Stage = stageBaseCopy
 		stateMu.Unlock()
-		if err := saveStateLocked(); err != nil {
+		if err := setStage(stageBaseCopy); err != nil {
 			return err
 		}
 	}
@@ -2307,7 +2387,8 @@ func runVMWorkflow(ctx context.Context, cfg *appConfig, spec *runSpec, opts runO
 				}
 				defer func() { <-sem }()
 
-				progress := makeProgressUpdater(stateMu, statePath, st, d.Unit, d.Capacity, stageBaseCopy)
+				progress := makeProgressUpdater(stateMu, statePath, st, log, d.Unit, d.Capacity, stageBaseCopy)
+				log.Printf("[disk%d] base copy started source=%s target=%s", d.Unit, meta.Path, st.Disks[strconv.Itoa(d.Unit)].TargetQCOW2)
 				optsBase := baseCopyOptions{
 					VDDK: vddkConnCfg{
 						LibDir:        cfg.Migration.VDDKPath,
@@ -2350,6 +2431,7 @@ func runVMWorkflow(ctx context.Context, cfg *appConfig, spec *runSpec, opts runO
 				recomputeStateProgress(st)
 				_ = saveRunState(statePath, st)
 				stateMu.Unlock()
+				log.Printf("[disk%d] base copy completed read=%d written=%d zero_skipped=%d", d.Unit, stats.BytesRead, stats.BytesWritten, stats.BytesZeroSkipped)
 			}()
 		}
 		wg.Wait()
@@ -2361,10 +2443,9 @@ func runVMWorkflow(ctx context.Context, cfg *appConfig, spec *runSpec, opts runO
 			return firstErr
 		}
 		stateMu.Lock()
-		st.Stage = stageDelta
 		st.LastError = ""
 		stateMu.Unlock()
-		if err := saveStateLocked(); err != nil {
+		if err := setStage(stageDelta); err != nil {
 			return err
 		}
 	}
@@ -2391,6 +2472,7 @@ func runVMWorkflow(ctx context.Context, cfg *appConfig, spec *runSpec, opts runO
 		if err != nil {
 			return err
 		}
+		log.Printf("Created delta snapshot (%s): %s", stageName, newSnap.Value)
 		newMeta, err := snapshotDiskMetadata(ctx, client, newSnap)
 		if err != nil {
 			return err
@@ -2465,7 +2547,7 @@ func runVMWorkflow(ctx context.Context, cfg *appConfig, spec *runSpec, opts runO
 						if totalChanged <= 0 {
 							totalChanged = d.Capacity
 						}
-						progress := makeProgressUpdater(stateMu, statePath, st, d.Unit, totalChanged, stageName)
+						progress := makeProgressUpdater(stateMu, statePath, st, log, d.Unit, totalChanged, stageName)
 						_, err = runDeltaSync(deltaCtx, deltaSyncOptions{
 							VDDK: vddkConnCfg{
 								LibDir:        cfg.Migration.VDDKPath,
@@ -2529,6 +2611,9 @@ func runVMWorkflow(ctx context.Context, cfg *appConfig, spec *runSpec, opts runO
 		if prevSnapshot != "" && prevSnapshot != newSnap.Value {
 			if err := removeSnapshot(ctx, client, types.ManagedObjectReference{Type: "VirtualMachineSnapshot", Value: prevSnapshot}); err != nil {
 				fmt.Fprintf(os.Stderr, "[run] warning: failed to remove snapshot %s: %v\n", prevSnapshot, err)
+				log.Printf("Warning: failed to remove snapshot %s: %v", prevSnapshot, err)
+			} else {
+				log.Printf("Removed previous snapshot: %s", prevSnapshot)
 			}
 		}
 		return nil
@@ -2547,24 +2632,20 @@ func runVMWorkflow(ctx context.Context, cfg *appConfig, spec *runSpec, opts runO
 			}
 
 			if finalizeNow {
-				stateMu.Lock()
-				st.Stage = stageFinalSync
-				stateMu.Unlock()
-				if err := saveStateLocked(); err != nil {
+				if err := setStage(stageFinalSync); err != nil {
 					return err
 				}
+				log.Printf("FINALIZE detected, running final delta sync")
 				if err := runDeltaRound(stageFinalSync); err != nil {
 					return err
 				}
 				break
 			}
 
-			stateMu.Lock()
-			st.Stage = stageDelta
-			stateMu.Unlock()
-			if err := saveStateLocked(); err != nil {
+			if err := setStage(stageDelta); err != nil {
 				return err
 			}
+			log.Printf("Running delta sync round")
 			if err := runDeltaRound(stageDelta); err != nil {
 				return err
 			}
@@ -2587,10 +2668,7 @@ func runVMWorkflow(ctx context.Context, cfg *appConfig, spec *runSpec, opts runO
 			}
 			time.Sleep(time.Duration(sleepSec) * time.Second)
 		}
-		stateMu.Lock()
-		st.Stage = stageImportRoot
-		stateMu.Unlock()
-		if err := saveStateLocked(); err != nil {
+		if err := setStage(stageImportRoot); err != nil {
 			return err
 		}
 	}
@@ -2605,19 +2683,16 @@ func runVMWorkflow(ctx context.Context, cfg *appConfig, spec *runSpec, opts runO
 			if err != nil {
 				return fmt.Errorf("cloudstack root import failed: %w", err)
 			}
+			log.Printf("Imported root disk as VM in CloudStack vm_id=%s", vmID)
 			stateMu.Lock()
 			st.CloudStackVMID = vmID
 			st.LastError = ""
-			st.Stage = stageImportData
 			stateMu.Unlock()
-			if err := saveStateLocked(); err != nil {
+			if err := setStage(stageImportData); err != nil {
 				return err
 			}
 		} else {
-			stateMu.Lock()
-			st.Stage = stageImportData
-			stateMu.Unlock()
-			if err := saveStateLocked(); err != nil {
+			if err := setStage(stageImportData); err != nil {
 				return err
 			}
 		}
@@ -2656,9 +2731,11 @@ func runVMWorkflow(ctx context.Context, cfg *appConfig, spec *runSpec, opts runO
 			if err != nil {
 				return fmt.Errorf("cloudstack data disk import failed for unit=%d: %w", unit, err)
 			}
+			log.Printf("[disk%d] imported data volume volume_id=%s", unit, volumeID)
 			if err := attachVolumeToVM(csClient, volumeID, st.CloudStackVMID); err != nil {
 				return fmt.Errorf("attach volume failed for unit=%d: %w", unit, err)
 			}
+			log.Printf("[disk%d] attached data volume %s to vm_id=%s", unit, volumeID, st.CloudStackVMID)
 			stateMu.Lock()
 			ds.StorageID = storageID
 			ds.DiskOfferingID = diskOfferingID
@@ -2671,10 +2748,11 @@ func runVMWorkflow(ctx context.Context, cfg *appConfig, spec *runSpec, opts runO
 				return err
 			}
 		}
-		stateMu.Lock()
-		st.Stage = stageDone
-		stateMu.Unlock()
-		return saveStateLocked()
+		if err := setStage(stageDone); err != nil {
+			return err
+		}
+		log.Printf("Workflow completed successfully")
+		return nil
 	}
 
 	return nil
