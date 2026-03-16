@@ -85,6 +85,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 	"unsafe"
 
@@ -112,6 +113,9 @@ const (
 
 	nbdCmdWrite = 1
 	nbdCmdDisc  = 2
+	nbdCmdFlush = 3
+
+	nbdFlagSendFlush = 1 << 2
 )
 
 type vddkConnCfg struct {
@@ -257,6 +261,7 @@ func vixErrorText(vixErr C.VixError) string {
 type nbdClient struct {
 	conn   net.Conn
 	handle uint64
+	canFlush bool
 	mu     sync.Mutex
 }
 
@@ -314,6 +319,7 @@ func (c *nbdClient) handshake() error {
 	if _, err := io.ReadFull(c.conn, padding); err != nil {
 		return err
 	}
+	c.canFlush = (transFlags & nbdFlagSendFlush) != 0
 	return nil
 }
 
@@ -376,6 +382,62 @@ func (c *nbdClient) writeAt(offset int64, data []byte) error {
 	return nil
 }
 
+func (c *nbdClient) flush() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.conn == nil {
+		return errors.New("nbd connection closed")
+	}
+	if !c.canFlush {
+		return nil
+	}
+
+	c.handle++
+	h := c.handle
+
+	if err := binary.Write(c.conn, binary.BigEndian, uint32(nbdRequestMagic)); err != nil {
+		return err
+	}
+	if err := binary.Write(c.conn, binary.BigEndian, uint16(0)); err != nil {
+		return err
+	}
+	if err := binary.Write(c.conn, binary.BigEndian, uint16(nbdCmdFlush)); err != nil {
+		return err
+	}
+	if err := binary.Write(c.conn, binary.BigEndian, h); err != nil {
+		return err
+	}
+	if err := binary.Write(c.conn, binary.BigEndian, uint64(0)); err != nil {
+		return err
+	}
+	if err := binary.Write(c.conn, binary.BigEndian, uint32(0)); err != nil {
+		return err
+	}
+
+	var replyMagic uint32
+	var replyErr uint32
+	var replyHandle uint64
+	if err := binary.Read(c.conn, binary.BigEndian, &replyMagic); err != nil {
+		return err
+	}
+	if err := binary.Read(c.conn, binary.BigEndian, &replyErr); err != nil {
+		return err
+	}
+	if err := binary.Read(c.conn, binary.BigEndian, &replyHandle); err != nil {
+		return err
+	}
+	if replyMagic != nbdReplyMagic {
+		return fmt.Errorf("invalid nbd reply magic")
+	}
+	if replyHandle != h {
+		return fmt.Errorf("nbd handle mismatch: got=%d want=%d", replyHandle, h)
+	}
+	if replyErr != 0 {
+		return fmt.Errorf("nbd flush returned error=%d", replyErr)
+	}
+	return nil
+}
+
 func (c *nbdClient) close() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -426,8 +488,18 @@ func (e *qcow2Endpoint) close() {
 		return
 	}
 	if e.cmd != nil && e.cmd.Process != nil {
-		_ = e.cmd.Process.Kill()
-		_, _ = e.cmd.Process.Wait()
+		_ = e.cmd.Process.Signal(syscall.SIGTERM)
+		waitDone := make(chan struct{})
+		go func() {
+			_, _ = e.cmd.Process.Wait()
+			close(waitDone)
+		}()
+		select {
+		case <-waitDone:
+		case <-time.After(5 * time.Second):
+			_ = e.cmd.Process.Kill()
+			<-waitDone
+		}
 	}
 	if e.sock != "" {
 		_ = os.Remove(e.sock)
@@ -455,6 +527,10 @@ func createSparseQCOW2(path string, sizeBytes int64) error {
 }
 
 func runVirtV2VInPlace(path string, virtioISO string) error {
+	if err := verifyImageBeforeV2V(path); err != nil {
+		return fmt.Errorf("pre-v2v integrity check failed: %w", err)
+	}
+
 	v2vPath, err := exec.LookPath("virt-v2v-in-place")
 	if err != nil {
 		return fmt.Errorf("virt-v2v-in-place not found: %w", err)
@@ -492,6 +568,25 @@ func runVirtV2VInPlace(path string, virtioISO string) error {
 		return retryErr
 	}
 	return err
+}
+
+func verifyImageBeforeV2V(path string) error {
+	run := func(name string, args ...string) error {
+		cmd := exec.Command(name, args...)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("%s %v failed: %w\n%s", name, args, err, string(out))
+		}
+		return nil
+	}
+
+	if err := run("qemu-img", "check", "-r", "none", path); err != nil {
+		return err
+	}
+	if err := run("virt-inspector", "-a", path); err != nil {
+		return err
+	}
+	return nil
 }
 
 type readMetric struct {
@@ -903,13 +998,23 @@ func runBaseCopy(ctx context.Context, opts baseCopyOptions) (copyStats, error) {
 	if err != nil {
 		return copyStats{}, err
 	}
-	defer endpoint.close()
+	endpointClosed := false
+	defer func() {
+		if !endpointClosed {
+			endpoint.close()
+		}
+	}()
 
 	writerClient, err := dialNBDUnix(endpoint.sock)
 	if err != nil {
 		return copyStats{}, fmt.Errorf("nbd writer connect failed: %w", err)
 	}
-	defer writerClient.close()
+	writerClosed := false
+	defer func() {
+		if !writerClosed {
+			_ = writerClient.close()
+		}
+	}()
 
 	readQ := make(chan block, opts.QueueDepth)
 	writeQ := make(chan blockData, opts.QueueDepth)
@@ -1060,14 +1165,30 @@ func runBaseCopy(ctx context.Context, opts baseCopyOptions) (copyStats, error) {
 	workerWG.Wait()
 	close(writeQ)
 	writerWG.Wait()
-	close(progressStop)
-	report()
 
 	select {
 	case e := <-errCh:
+		close(progressStop)
+		report()
 		return copyStats{}, e
 	default:
 	}
+
+	if err := writerClient.flush(); err != nil {
+		close(progressStop)
+		report()
+		return copyStats{}, fmt.Errorf("qcow2 flush failed: %w", err)
+	}
+	if err := writerClient.close(); err != nil {
+		close(progressStop)
+		report()
+		return copyStats{}, fmt.Errorf("nbd writer close failed: %w", err)
+	}
+	writerClosed = true
+	endpoint.close()
+	endpointClosed = true
+	close(progressStop)
+	report()
 
 	if opts.RunVirtV2V {
 		if err := runVirtV2VInPlace(opts.TargetQCOW2, opts.VirtioISO); err != nil {
@@ -1307,14 +1428,22 @@ func runDeltaSync(ctx context.Context, opts deltaSyncOptions) (copyStats, error)
 	workerWG.Wait()
 	close(writeQ)
 	writerWG.Wait()
-	close(progressStop)
-	report()
 
 	select {
 	case e := <-errCh:
+		close(progressStop)
+		report()
 		return copyStats{}, e
 	default:
 	}
+
+	if err := writerClient.flush(); err != nil {
+		close(progressStop)
+		report()
+		return copyStats{}, fmt.Errorf("delta qcow2 flush failed: %w", err)
+	}
+	close(progressStop)
+	report()
 
 	return copyStats{
 		BytesRead:    atomic.LoadInt64(&bytesRead),
