@@ -632,6 +632,7 @@ type appConfig struct {
 	Migration struct {
 		VDDKPath        string `yaml:"vddk_path"`
 		SnapshotQuiesce string `yaml:"snapshot_quiesce"`
+		ShutdownMode    string `yaml:"shutdown_mode"`
 		ParallelDisks   int    `yaml:"parallel_disks"`
 		ParallelVMs     int    `yaml:"parallel_vms"`
 	} `yaml:"migration"`
@@ -666,6 +667,7 @@ type runSpec struct {
 		Readers              int    `yaml:"readers"`
 		RunVirtV2V           *bool  `yaml:"run_virt_v2v"`
 		SnapshotQuiesce      string `yaml:"snapshot_quiesce"`
+		ShutdownMode         string `yaml:"shutdown_mode"`
 		ParallelDisks        int    `yaml:"parallel_disks"`
 	} `yaml:"migration"`
 	Target struct {
@@ -1148,6 +1150,20 @@ func runDeltaSync(ctx context.Context, opts deltaSyncOptions) (copyStats, error)
 	if err != nil {
 		return copyStats{}, err
 	}
+	for i, r := range ranges {
+		if r.Start < 0 || r.Length <= 0 {
+			return copyStats{}, fmt.Errorf("invalid range[%d]: start=%d length=%d", i, r.Start, r.Length)
+		}
+		if r.Start%sectorSize != 0 || r.Length%sectorSize != 0 {
+			return copyStats{}, fmt.Errorf(
+				"unaligned range[%d]: start=%d length=%d (must be %d-byte aligned)",
+				i,
+				r.Start,
+				r.Length,
+				sectorSize,
+			)
+		}
+	}
 	endpoint, err := startQcow2Endpoint(opts.TargetQCOW2)
 	if err != nil {
 		return copyStats{}, err
@@ -1221,7 +1237,7 @@ func runDeltaSync(ctx context.Context, opts deltaSyncOptions) (copyStats, error)
 		defer close(readQ)
 		chunk := alignUp(opts.ChunkMB*1024*1024, sectorSize)
 		for _, r := range ranges {
-			offset := alignDown(int(r.Start), sectorSize)
+			offset := int(r.Start)
 			end := r.Start + r.Length
 			for int64(offset) < end {
 				select {
@@ -1515,6 +1531,89 @@ func createSnapshot(ctx context.Context, vm *object.VirtualMachine, name string,
 		return *v, nil
 	default:
 		return types.ManagedObjectReference{}, fmt.Errorf("unexpected snapshot result type %T", result.Result)
+	}
+}
+
+func isVMPoweredOff(ctx context.Context, vm *object.VirtualMachine) (bool, error) {
+	state, err := vm.PowerState(ctx)
+	if err != nil {
+		return false, err
+	}
+	return state == types.VirtualMachinePowerStatePoweredOff, nil
+}
+
+func waitForPowerOff(ctx context.Context, vm *object.VirtualMachine, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for {
+		off, err := isVMPoweredOff(ctx, vm)
+		if err != nil {
+			return err
+		}
+		if off {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return errors.New("timeout waiting for VM power off")
+		}
+		time.Sleep(5 * time.Second)
+	}
+}
+
+func shutdownVMForFinalize(ctx context.Context, client *govmomi.Client, vm *object.VirtualMachine, mode string, log *runLogger) error {
+	mode = strings.ToLower(strings.TrimSpace(mode))
+	if mode == "" {
+		mode = "auto"
+	}
+	off, err := isVMPoweredOff(ctx, vm)
+	if err != nil {
+		return err
+	}
+	if off {
+		log.Printf("Source VM already powered off")
+		return nil
+	}
+
+	switch mode {
+	case "auto":
+		log.Printf("Attempting graceful guest shutdown (auto mode)")
+		if _, err := methods.ShutdownGuest(ctx, client.Client, &types.ShutdownGuest{This: vm.Reference()}); err != nil {
+			log.Printf("Graceful shutdown request failed: %v", err)
+		}
+		if err := waitForPowerOff(ctx, vm, 5*time.Minute); err == nil {
+			log.Printf("Guest shutdown completed")
+			return nil
+		} else {
+			log.Printf("Graceful shutdown timed out; forcing power off")
+		}
+		task, err := vm.PowerOff(ctx)
+		if err != nil {
+			return err
+		}
+		_, err = task.WaitForResult(ctx, nil)
+		return err
+	case "force":
+		log.Printf("Forcing source VM power off")
+		task, err := vm.PowerOff(ctx)
+		if err != nil {
+			return err
+		}
+		_, err = task.WaitForResult(ctx, nil)
+		return err
+	case "manual":
+		log.Printf("Waiting for manual shutdown of source VM")
+		for {
+			off, err := isVMPoweredOff(ctx, vm)
+			if err != nil {
+				return err
+			}
+			if off {
+				log.Printf("Manual shutdown detected")
+				return nil
+			}
+			time.Sleep(5 * time.Second)
+		}
+	default:
+		return fmt.Errorf("invalid shutdown_mode: %s (expected auto|force|manual)", mode)
 	}
 }
 
@@ -2251,15 +2350,23 @@ func runVMWorkflow(ctx context.Context, cfg *appConfig, spec *runSpec, opts runO
 	if opts.OverrideV2V {
 		runVirtV2V = opts.RunVirtV2V
 	}
+	shutdownMode := strings.ToLower(strings.TrimSpace(cfg.Migration.ShutdownMode))
+	if strings.TrimSpace(spec.Migration.ShutdownMode) != "" {
+		shutdownMode = strings.ToLower(strings.TrimSpace(spec.Migration.ShutdownMode))
+	}
+	if shutdownMode == "" {
+		shutdownMode = "auto"
+	}
 	virtioISO := strings.TrimSpace(cfg.Virt.VirtioISO)
 	if virtioISO == "" {
 		virtioISO = "/usr/share/virtio-win/virtio-win.iso"
 	}
 	log.Printf(
-		"Runtime settings readers=%d parallel_disks=%d run_virt_v2v=%t virtio_iso=%s",
+		"Runtime settings readers=%d parallel_disks=%d run_virt_v2v=%t shutdown_mode=%s virtio_iso=%s",
 		readers,
 		parallelDisks,
 		runVirtV2V,
+		shutdownMode,
 		virtioISO,
 	)
 
@@ -2668,10 +2775,14 @@ func runVMWorkflow(ctx context.Context, cfg *appConfig, spec *runSpec, opts runO
 			}
 
 			if finalizeNow {
+				log.Printf("FINALIZE detected, ensuring source VM is powered off (mode=%s)", shutdownMode)
+				if err := shutdownVMForFinalize(ctx, client, vmObj, shutdownMode, log); err != nil {
+					return fmt.Errorf("failed to shutdown source VM before final sync: %w", err)
+				}
 				if err := setStage(stageFinalSync); err != nil {
 					return err
 				}
-				log.Printf("FINALIZE detected, running final delta sync")
+				log.Printf("Running final delta sync on powered-off source VM")
 				if err := runDeltaRound(stageFinalSync); err != nil {
 					return err
 				}

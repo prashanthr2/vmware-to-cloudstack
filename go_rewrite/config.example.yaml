@@ -19,6 +19,7 @@ engine:
 
 migration:
   # Optional orchestrator defaults for run mode.
+  shutdown_mode: auto # auto | force | manual
   parallel_disks: 4
   parallel_vms: 3
 

@@ -110,6 +110,7 @@ export CGO_LDFLAGS="-L/opt/vmware-vddk/lib64 -lvixDiskLib -ldl -lpthread"
 - The first snapshot is always created as `Migrate_Base_<vm>` during `init`; delta snapshots are only created in delta stages.
 - Persists per-disk progress fields (progress %, bytes read/written, speed, ETA) and overall VM progress.
 - `FINALIZE` file behavior is supported: if `/var/lib/vm-migrator/<vm>_<moref>/FINALIZE` exists, the engine runs one final delta round (`final_sync`) and proceeds to import.
+- Before `final_sync`, source VM shutdown is enforced using `shutdown_mode` (`auto|force|manual`) from spec/config, matching Python finalize behavior.
 - Reads VM and migration strategy from spec (`delta_interval`, `finalize_at`, etc.).
 - Resolves destination disk path from CloudStack storage selection:
   - boot disk -> `target.cloudstack.storageid`
