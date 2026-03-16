@@ -2361,8 +2361,59 @@ func (c *cloudStackClient) waitJob(jobID string, kind string) (map[string]any, e
 }
 
 func sanitizeHostName(vmName string) string {
-	replacer := strings.NewReplacer("-", "_", " ", "_")
-	return replacer.Replace(vmName)
+	name := strings.TrimSpace(vmName)
+	if name == "" {
+		return "vm"
+	}
+
+	var b strings.Builder
+	b.Grow(len(name))
+	lastHyphen := false
+	for i := 0; i < len(name); i++ {
+		ch := name[i]
+		isLetter := (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z')
+		isDigit := ch >= '0' && ch <= '9'
+		if isLetter || isDigit {
+			b.WriteByte(ch)
+			lastHyphen = false
+			continue
+		}
+		if ch == '-' && !lastHyphen {
+			b.WriteByte(ch)
+			lastHyphen = true
+			continue
+		}
+		if !lastHyphen {
+			b.WriteByte('-')
+			lastHyphen = true
+		}
+	}
+
+	out := strings.Trim(b.String(), "-")
+	if out == "" {
+		out = "vm"
+	}
+	first := out[0]
+	if !((first >= 'a' && first <= 'z') || (first >= 'A' && first <= 'Z')) {
+		out = "vm-" + out
+	}
+	if len(out) > 63 {
+		out = out[:63]
+	}
+	out = strings.TrimRight(out, "-")
+	if out == "" {
+		out = "vm"
+	}
+	first = out[0]
+	if !((first >= 'a' && first <= 'z') || (first >= 'A' && first <= 'Z')) {
+		if len(out) >= 60 {
+			out = "vm-" + out[:60]
+		} else {
+			out = "vm-" + out
+		}
+		out = strings.TrimRight(out, "-")
+	}
+	return out
 }
 
 func importVMToCloudStack(cs *cloudStackClient, vmName string, targetCloud cloudStackTargetSpec, bootDiskPath string) (string, error) {
