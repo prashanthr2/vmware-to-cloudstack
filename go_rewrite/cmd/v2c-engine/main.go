@@ -466,6 +466,7 @@ func startQcow2Endpoint(path string) (*qcow2Endpoint, error) {
 	sock := filepath.Join(os.TempDir(), fmt.Sprintf("v2c_qcow_%d_%d.sock", os.Getpid(), time.Now().UnixNano()))
 	_ = os.Remove(sock)
 	cmd := exec.Command("qemu-nbd", "--socket", sock, "--format", "qcow2", path)
+	cmd.Env = sanitizedChildEnv()
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	if err := cmd.Start(); err != nil {
@@ -507,6 +508,39 @@ func (e *qcow2Endpoint) close() {
 	}
 }
 
+func sanitizedChildEnv() []string {
+	env := os.Environ()
+	out := make([]string, 0, len(env))
+	for _, kv := range env {
+		switch {
+		case strings.HasPrefix(kv, "LD_LIBRARY_PATH="):
+			raw := strings.TrimPrefix(kv, "LD_LIBRARY_PATH=")
+			parts := filepath.SplitList(raw)
+			kept := make([]string, 0, len(parts))
+			for _, part := range parts {
+				p := strings.ToLower(strings.TrimSpace(part))
+				if p == "" {
+					continue
+				}
+				if strings.Contains(p, "vmware-vddk") || strings.Contains(p, "vmware-vix-disklib-distrib") {
+					continue
+				}
+				kept = append(kept, part)
+			}
+			if len(kept) > 0 {
+				out = append(out, "LD_LIBRARY_PATH="+strings.Join(kept, string(os.PathListSeparator)))
+			}
+		case strings.HasPrefix(kv, "CGO_CFLAGS="),
+			strings.HasPrefix(kv, "CGO_LDFLAGS="),
+			strings.HasPrefix(kv, "CGO_ENABLED="):
+			continue
+		default:
+			out = append(out, kv)
+		}
+	}
+	return out
+}
+
 func createSparseQCOW2(path string, sizeBytes int64) error {
 	if sizeBytes <= 0 {
 		return fmt.Errorf("invalid qcow2 size: %d", sizeBytes)
@@ -522,6 +556,7 @@ func createSparseQCOW2(path string, sizeBytes int64) error {
 		path,
 		fmt.Sprintf("%d", sizeBytes),
 	)
+	cmd.Env = sanitizedChildEnv()
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	return cmd.Run()
@@ -539,6 +574,7 @@ func runVirtV2VInPlace(path string, virtioISO string) error {
 
 	runCmd := func(args []string) (string, error) {
 		cmd := exec.Command(v2vPath, args...)
+		cmd.Env = sanitizedChildEnv()
 		var buf bytes.Buffer
 		cmd.Stdout = io.MultiWriter(os.Stdout, &buf)
 		cmd.Stderr = io.MultiWriter(os.Stderr, &buf)
@@ -574,6 +610,7 @@ func runVirtV2VInPlace(path string, virtioISO string) error {
 func verifyImageBeforeV2V(path string) error {
 	run := func(name string, args ...string) error {
 		cmd := exec.Command(name, args...)
+		cmd.Env = sanitizedChildEnv()
 		out, err := cmd.CombinedOutput()
 		if err != nil {
 			return fmt.Errorf("%s %v failed: %w\n%s", name, args, err, string(out))
