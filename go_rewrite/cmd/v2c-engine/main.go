@@ -59,9 +59,11 @@ static VixError v2c_vddk_get_capacity(VixDiskLibHandle handle, uint64_t *capacit
 import "C"
 
 import (
+	"crypto/hmac"
 	"crypto/sha1"
 	"crypto/tls"
 	"context"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
@@ -71,6 +73,7 @@ import (
 	"io"
 	"math"
 	"net"
+	"net/http"
 	neturl "net/url"
 	"os"
 	"os/exec"
@@ -604,6 +607,19 @@ type appConfig struct {
 		VDDKPath        string `yaml:"vddk_path"`
 		SnapshotQuiesce string `yaml:"snapshot_quiesce"`
 	} `yaml:"migration"`
+	CloudStack struct {
+		Endpoint  string `yaml:"endpoint"`
+		APIKey    string `yaml:"api_key"`
+		SecretKey string `yaml:"secret_key"`
+	} `yaml:"cloudstack"`
+	CloudStackDefaults struct {
+		ZoneID            string `yaml:"zoneid"`
+		ClusterID         string `yaml:"clusterid"`
+		StorageID         string `yaml:"storageid"`
+		NetworkID         string `yaml:"networkid"`
+		ServiceOfferingID string `yaml:"serviceofferingid"`
+		DiskOfferingID    string `yaml:"diskofferingid"`
+	} `yaml:"cloudstack_defaults"`
 }
 
 type runSpec struct {
@@ -620,13 +636,21 @@ type runSpec struct {
 		SnapshotQuiesce     string `yaml:"snapshot_quiesce"`
 	} `yaml:"migration"`
 	Target struct {
-		CloudStack struct {
-			StorageID string `yaml:"storageid"`
-		} `yaml:"cloudstack"`
+		CloudStack cloudStackTargetSpec `yaml:"cloudstack"`
 	} `yaml:"target"`
 	Disks map[string]struct {
-		StorageID string `yaml:"storageid"`
+		StorageID      string `yaml:"storageid"`
+		DiskOfferingID string `yaml:"diskofferingid"`
 	} `yaml:"disks"`
+}
+
+type cloudStackTargetSpec struct {
+	ZoneID            string `yaml:"zoneid"`
+	ClusterID         string `yaml:"clusterid"`
+	StorageID         string `yaml:"storageid"`
+	NetworkID         string `yaml:"networkid"`
+	ServiceOfferingID string `yaml:"serviceofferingid"`
+	DiskOfferingID    string `yaml:"diskofferingid"`
 }
 
 type vmDisk struct {
@@ -647,6 +671,10 @@ type runDiskState struct {
 	TargetQCOW2  string `json:"target_qcow2"`
 	SourceDiskPath string `json:"source_disk_path"`
 	ChangeID     string `json:"change_id"`
+	StorageID    string `json:"storage_id,omitempty"`
+	DiskOfferingID string `json:"disk_offering_id,omitempty"`
+	VolumeID     string `json:"volume_id,omitempty"`
+	AttachedToVMID string `json:"attached_to_vm_id,omitempty"`
 }
 
 type runState struct {
@@ -656,6 +684,7 @@ type runState struct {
 	Stage         string                  `json:"stage"`
 	ActiveSnapshot string                 `json:"active_snapshot"`
 	Disks         map[string]*runDiskState `json:"disks"`
+	CloudStackVMID string                 `json:"cloudstack_vm_id,omitempty"`
 	UpdatedAt     string                  `json:"updated_at"`
 }
 
@@ -1380,10 +1409,93 @@ func resolveStorageID(spec *runSpec, unit int, bootUnit int) (string, error) {
 		return spec.Target.CloudStack.StorageID, nil
 	}
 	cfg, ok := spec.Disks[strconv.Itoa(unit)]
-	if !ok || cfg.StorageID == "" {
-		return "", fmt.Errorf("disks.%d.storageid is required for data disk", unit)
+	if ok && cfg.StorageID != "" {
+		return cfg.StorageID, nil
 	}
-	return cfg.StorageID, nil
+	if spec.Target.CloudStack.StorageID != "" {
+		return spec.Target.CloudStack.StorageID, nil
+	}
+	return "", fmt.Errorf("storageid is required for data disk unit %d", unit)
+}
+
+func resolveDataDiskConfig(spec *runSpec, unit int) (string, string, error) {
+	cfg, ok := spec.Disks[strconv.Itoa(unit)]
+	if !ok {
+		cfg = struct {
+			StorageID      string `yaml:"storageid"`
+			DiskOfferingID string `yaml:"diskofferingid"`
+		}{}
+	}
+	storageID := cfg.StorageID
+	if storageID == "" {
+		storageID = spec.Target.CloudStack.StorageID
+	}
+	if storageID == "" {
+		return "", "", fmt.Errorf("storageid missing for data disk unit %d", unit)
+	}
+	diskOfferingID := cfg.DiskOfferingID
+	if diskOfferingID == "" {
+		diskOfferingID = spec.Target.CloudStack.DiskOfferingID
+	}
+	if diskOfferingID == "" {
+		return "", "", fmt.Errorf("diskofferingid missing for data disk unit %d", unit)
+	}
+	return storageID, diskOfferingID, nil
+}
+
+func applyCloudStackDefaults(spec *runSpec, cfg *appConfig) {
+	firstNonEmpty := func(vals ...string) string {
+		for _, v := range vals {
+			if strings.TrimSpace(v) != "" {
+				return v
+			}
+		}
+		return ""
+	}
+
+	tgt := &spec.Target.CloudStack
+	def := cfg.CloudStackDefaults
+	tgt.ZoneID = firstNonEmpty(tgt.ZoneID, def.ZoneID)
+	tgt.ClusterID = firstNonEmpty(tgt.ClusterID, def.ClusterID)
+	tgt.StorageID = firstNonEmpty(tgt.StorageID, def.StorageID)
+	tgt.NetworkID = firstNonEmpty(tgt.NetworkID, def.NetworkID)
+	tgt.ServiceOfferingID = firstNonEmpty(tgt.ServiceOfferingID, def.ServiceOfferingID)
+	tgt.DiskOfferingID = firstNonEmpty(tgt.DiskOfferingID, def.DiskOfferingID)
+
+	if spec.Disks == nil {
+		spec.Disks = map[string]struct {
+			StorageID      string `yaml:"storageid"`
+			DiskOfferingID string `yaml:"diskofferingid"`
+		}{}
+	}
+	for unit, diskCfg := range spec.Disks {
+		diskCfg.StorageID = firstNonEmpty(diskCfg.StorageID, tgt.StorageID, def.StorageID)
+		diskCfg.DiskOfferingID = firstNonEmpty(diskCfg.DiskOfferingID, tgt.DiskOfferingID, def.DiskOfferingID)
+		spec.Disks[unit] = diskCfg
+	}
+}
+
+func validateCloudStackTarget(target cloudStackTargetSpec) error {
+	missing := make([]string, 0)
+	if strings.TrimSpace(target.ZoneID) == "" {
+		missing = append(missing, "zoneid")
+	}
+	if strings.TrimSpace(target.ClusterID) == "" {
+		missing = append(missing, "clusterid")
+	}
+	if strings.TrimSpace(target.StorageID) == "" {
+		missing = append(missing, "storageid")
+	}
+	if strings.TrimSpace(target.NetworkID) == "" {
+		missing = append(missing, "networkid")
+	}
+	if strings.TrimSpace(target.ServiceOfferingID) == "" {
+		missing = append(missing, "serviceofferingid")
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf("missing cloudstack target fields: %s", strings.Join(missing, ", "))
+	}
+	return nil
 }
 
 func ensureStorageMounted(storageID string) (string, error) {
@@ -1480,6 +1592,248 @@ func saveRunState(path string, st *runState) error {
 	return os.WriteFile(path, raw, 0o644)
 }
 
+type cloudStackClient struct {
+	Endpoint  string
+	APIKey    string
+	SecretKey string
+	HTTP      *http.Client
+}
+
+func newCloudStackClient(cfg *appConfig) (*cloudStackClient, error) {
+	if strings.TrimSpace(cfg.CloudStack.Endpoint) == "" ||
+		strings.TrimSpace(cfg.CloudStack.APIKey) == "" ||
+		strings.TrimSpace(cfg.CloudStack.SecretKey) == "" {
+		return nil, errors.New("cloudstack endpoint/api_key/secret_key are required in config.yaml")
+	}
+	return &cloudStackClient{
+		Endpoint:  cfg.CloudStack.Endpoint,
+		APIKey:    cfg.CloudStack.APIKey,
+		SecretKey: cfg.CloudStack.SecretKey,
+		HTTP: &http.Client{
+			Timeout: 45 * time.Second,
+		},
+	}, nil
+}
+
+func (c *cloudStackClient) request(command string, params map[string]string) (map[string]any, error) {
+	if params == nil {
+		params = map[string]string{}
+	}
+	params["command"] = command
+	params["apikey"] = c.APIKey
+	params["response"] = "json"
+
+	keys := make([]string, 0, len(params))
+	for k := range params {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	queryParts := make([]string, 0, len(keys))
+	for _, k := range keys {
+		queryParts = append(queryParts, fmt.Sprintf("%s=%s", k, neturl.QueryEscape(params[k])))
+	}
+	query := strings.Join(queryParts, "&")
+
+	mac := hmac.New(sha1.New, []byte(c.SecretKey))
+	_, _ = mac.Write([]byte(strings.ToLower(query)))
+	signature := base64.StdEncoding.EncodeToString(mac.Sum(nil))
+
+	reqURL := fmt.Sprintf("%s?%s&signature=%s", c.Endpoint, query, neturl.QueryEscape(signature))
+	resp, err := c.HTTP.Get(reqURL)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	var out map[string]any
+	if err := json.Unmarshal(body, &out); err != nil {
+		return nil, fmt.Errorf("invalid cloudstack response: %w", err)
+	}
+	if e, ok := out["errorresponse"]; ok {
+		return nil, fmt.Errorf("cloudstack error response: %v", e)
+	}
+	return out, nil
+}
+
+func mapGetMap(m map[string]any, key string) (map[string]any, bool) {
+	v, ok := m[key]
+	if !ok || v == nil {
+		return nil, false
+	}
+	out, ok := v.(map[string]any)
+	return out, ok
+}
+
+func mapGetString(m map[string]any, key string) string {
+	if m == nil {
+		return ""
+	}
+	v, ok := m[key]
+	if !ok || v == nil {
+		return ""
+	}
+	switch t := v.(type) {
+	case string:
+		return t
+	case float64:
+		return strconv.FormatInt(int64(t), 10)
+	case int:
+		return strconv.Itoa(t)
+	default:
+		return fmt.Sprintf("%v", t)
+	}
+}
+
+func mapGetInt(m map[string]any, key string) int {
+	if m == nil {
+		return 0
+	}
+	v, ok := m[key]
+	if !ok || v == nil {
+		return 0
+	}
+	switch t := v.(type) {
+	case float64:
+		return int(t)
+	case int:
+		return t
+	case string:
+		n, _ := strconv.Atoi(t)
+		return n
+	default:
+		return 0
+	}
+}
+
+func (c *cloudStackClient) waitJob(jobID string, kind string) (map[string]any, error) {
+	if strings.TrimSpace(jobID) == "" {
+		return nil, errors.New("cloudstack job id is empty")
+	}
+	for {
+		res, err := c.request("queryAsyncJobResult", map[string]string{
+			"jobid": jobID,
+		})
+		if err != nil {
+			return nil, err
+		}
+		root, ok := mapGetMap(res, "queryasyncjobresultresponse")
+		if !ok {
+			return nil, fmt.Errorf("unexpected queryAsyncJobResult response: %v", res)
+		}
+		status := mapGetInt(root, "jobstatus")
+		if status == 1 {
+			jobResult, ok := mapGetMap(root, "jobresult")
+			if !ok {
+				return root, nil
+			}
+			return jobResult, nil
+		}
+		if status == 2 {
+			return nil, fmt.Errorf("%s job %s failed: %v", kind, jobID, root)
+		}
+		time.Sleep(5 * time.Second)
+	}
+}
+
+func sanitizeHostName(vmName string) string {
+	return strings.ReplaceAll(vmName, "_", "-")
+}
+
+func importVMToCloudStack(cs *cloudStackClient, vmName string, targetCloud cloudStackTargetSpec, bootDiskPath string) (string, error) {
+	params := map[string]string{
+		"name":              sanitizeHostName(vmName),
+		"displayname":       vmName,
+		"clusterid":         targetCloud.ClusterID,
+		"zoneid":            targetCloud.ZoneID,
+		"importsource":      "shared",
+		"hypervisor":        "kvm",
+		"storageid":         targetCloud.StorageID,
+		"diskpath":          filepath.Base(bootDiskPath),
+		"networkid":         targetCloud.NetworkID,
+		"serviceofferingid": targetCloud.ServiceOfferingID,
+	}
+	resp, err := cs.request("importVm", params)
+	if err != nil {
+		return "", err
+	}
+	root, ok := mapGetMap(resp, "importvmresponse")
+	if !ok {
+		return "", fmt.Errorf("unexpected importVm response: %v", resp)
+	}
+	jobID := mapGetString(root, "jobid")
+	jobRes, err := cs.waitJob(jobID, "importVm")
+	if err != nil {
+		return "", err
+	}
+	vmNode, ok := mapGetMap(jobRes, "virtualmachine")
+	if !ok {
+		return "", fmt.Errorf("importVm job result missing virtualmachine: %v", jobRes)
+	}
+	vmID := mapGetString(vmNode, "id")
+	if vmID == "" {
+		return "", fmt.Errorf("importVm job result missing vm id: %v", jobRes)
+	}
+	return vmID, nil
+}
+
+func importDataDiskToCloudStack(cs *cloudStackClient, zoneID, storageID, diskOfferingID, diskPath string) (string, error) {
+	params := map[string]string{
+		"name":           filepath.Base(diskPath),
+		"zoneid":         zoneID,
+		"diskofferingid": diskOfferingID,
+		"storageid":      storageID,
+		"path":           filepath.Base(diskPath),
+	}
+	resp, err := cs.request("importVolume", params)
+	if err != nil {
+		return "", err
+	}
+	root, ok := mapGetMap(resp, "importvolumeresponse")
+	if !ok {
+		return "", fmt.Errorf("unexpected importVolume response: %v", resp)
+	}
+	jobID := mapGetString(root, "jobid")
+	jobRes, err := cs.waitJob(jobID, "importVolume")
+	if err != nil {
+		return "", err
+	}
+	volNode, ok := mapGetMap(jobRes, "volume")
+	if !ok {
+		return "", fmt.Errorf("importVolume job result missing volume: %v", jobRes)
+	}
+	volumeID := mapGetString(volNode, "id")
+	if volumeID == "" {
+		return "", fmt.Errorf("importVolume job result missing volume id: %v", jobRes)
+	}
+	return volumeID, nil
+}
+
+func attachVolumeToVM(cs *cloudStackClient, volumeID, vmID string) error {
+	resp, err := cs.request("attachVolume", map[string]string{
+		"id":               volumeID,
+		"virtualmachineid": vmID,
+	})
+	if err != nil {
+		return err
+	}
+	root, ok := mapGetMap(resp, "attachvolumeresponse")
+	if !ok {
+		return nil
+	}
+	jobID := mapGetString(root, "jobid")
+	if jobID == "" {
+		return nil
+	}
+	_, err = cs.waitJob(jobID, "attachVolume")
+	return err
+}
+
 type runOptions struct {
 	SpecPath      string
 	ConfigPath    string
@@ -1500,6 +1854,7 @@ func runWorkflow(ctx context.Context, opts runOptions) error {
 	if err != nil {
 		return err
 	}
+	applyCloudStackDefaults(spec, cfg)
 	if cfg.VCenter.Password == "" {
 		cfg.VCenter.Password = os.Getenv("VC_PASSWORD")
 	}
@@ -1511,6 +1866,13 @@ func runWorkflow(ctx context.Context, opts runOptions) error {
 	}
 	if spec.VM.Name == "" {
 		return errors.New("spec.vm.name is required")
+	}
+	if err := validateCloudStackTarget(spec.Target.CloudStack); err != nil {
+		return err
+	}
+	csClient, err := newCloudStackClient(cfg)
+	if err != nil {
+		return err
 	}
 
 	client, err := connectVCenter(ctx, cfg)
@@ -1619,6 +1981,7 @@ func runWorkflow(ctx context.Context, opts runOptions) error {
 			TargetQCOW2:    targetQCOW2,
 			SourceDiskPath: meta.Path,
 			ChangeID:       meta.ChangeID,
+			StorageID:      storageID,
 		}
 		if err := saveRunState(statePath, st); err != nil {
 			return err
@@ -1717,12 +2080,18 @@ func runWorkflow(ctx context.Context, opts runOptions) error {
 		if !finalizeAt.IsZero() && time.Now().After(finalizeAt) {
 			st.Stage = "final_sync"
 			_ = saveRunState(statePath, st)
-			return runDeltaOnce()
+			if err := runDeltaOnce(); err != nil {
+				return err
+			}
+			break
 		}
 		if _, err := os.Stat(finalizeFile); err == nil {
 			st.Stage = "final_sync"
 			_ = saveRunState(statePath, st)
-			return runDeltaOnce()
+			if err := runDeltaOnce(); err != nil {
+				return err
+			}
+			break
 		}
 		if err := runDeltaOnce(); err != nil {
 			return err
@@ -1745,6 +2114,71 @@ func runWorkflow(ctx context.Context, opts runOptions) error {
 		}
 		time.Sleep(time.Duration(sleepSec) * time.Second)
 	}
+
+	st.Stage = "import_root_disk"
+	if err := saveRunState(statePath, st); err != nil {
+		return err
+	}
+
+	bootDiskState := st.Disks[strconv.Itoa(bootUnit)]
+	if bootDiskState == nil {
+		return fmt.Errorf("boot disk state not found for unit=%d", bootUnit)
+	}
+
+	vmID, err := importVMToCloudStack(csClient, spec.VM.Name, spec.Target.CloudStack, bootDiskState.TargetQCOW2)
+	if err != nil {
+		return fmt.Errorf("cloudstack root import failed: %w", err)
+	}
+	st.CloudStackVMID = vmID
+	if err := saveRunState(statePath, st); err != nil {
+		return err
+	}
+
+	st.Stage = "import_data_disk"
+	if err := saveRunState(statePath, st); err != nil {
+		return err
+	}
+
+	units := make([]int, 0, len(disks))
+	for _, d := range disks {
+		if d.Unit != bootUnit {
+			units = append(units, d.Unit)
+		}
+	}
+	sort.Ints(units)
+	for _, unit := range units {
+		ds := st.Disks[strconv.Itoa(unit)]
+		if ds == nil {
+			return fmt.Errorf("data disk state missing for unit=%d", unit)
+		}
+		storageID, diskOfferingID, err := resolveDataDiskConfig(spec, unit)
+		if err != nil {
+			return err
+		}
+		volumeID, err := importDataDiskToCloudStack(
+			csClient,
+			spec.Target.CloudStack.ZoneID,
+			storageID,
+			diskOfferingID,
+			ds.TargetQCOW2,
+		)
+		if err != nil {
+			return fmt.Errorf("cloudstack data disk import failed for unit=%d: %w", unit, err)
+		}
+		if err := attachVolumeToVM(csClient, volumeID, vmID); err != nil {
+			return fmt.Errorf("attach volume failed for unit=%d: %w", unit, err)
+		}
+		ds.StorageID = storageID
+		ds.DiskOfferingID = diskOfferingID
+		ds.VolumeID = volumeID
+		ds.AttachedToVMID = vmID
+		if err := saveRunState(statePath, st); err != nil {
+			return err
+		}
+	}
+
+	st.Stage = "done"
+	return saveRunState(statePath, st)
 }
 
 func main() {

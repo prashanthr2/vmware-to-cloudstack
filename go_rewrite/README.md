@@ -106,6 +106,18 @@ export CGO_LDFLAGS="-L/opt/vmware-vddk/lib64 -lvixDiskLib -ldl -lpthread"
   - boot disk -> `target.cloudstack.storageid`
   - data disk -> `disks.<unit>.storageid`
   - output path format -> `/mnt/<storageid>/<vm>_<vmMoref>_disk<unit>.qcow2`
+- Imports root VM and data disks into CloudStack and attaches imported data volumes.
+- Uses CloudStack target fields from spec:
+  - `target.cloudstack.zoneid`
+  - `target.cloudstack.clusterid`
+  - `target.cloudstack.networkid`
+  - `target.cloudstack.serviceofferingid`
+  - `target.cloudstack.storageid`
+- Merges defaults from `config.yaml -> cloudstack_defaults` when these fields are omitted in spec.
+- For data disks, `diskofferingid` resolves with fallback order:
+  - `disks.<unit>.diskofferingid`
+  - `target.cloudstack.diskofferingid`
+  - `config.yaml cloudstack_defaults.diskofferingid`
 - Uses `migration.readers` and `migration.run_virt_v2v` from spec.
 
 You can still override any value from spec with CLI flags:
