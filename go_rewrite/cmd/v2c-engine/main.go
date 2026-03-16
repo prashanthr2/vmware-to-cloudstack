@@ -1556,7 +1556,7 @@ func queryChangedRanges(
 		if err != nil {
 			return nil, err
 		}
-		if resp.Returnval == nil {
+		if resp == nil {
 			break
 		}
 		for _, area := range resp.Returnval.ChangedArea {
