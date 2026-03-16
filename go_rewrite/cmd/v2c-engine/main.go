@@ -2361,7 +2361,8 @@ func (c *cloudStackClient) waitJob(jobID string, kind string) (map[string]any, e
 }
 
 func sanitizeHostName(vmName string) string {
-	return strings.ReplaceAll(vmName, "-", "_")
+	replacer := strings.NewReplacer("-", "_", " ", "_")
+	return replacer.Replace(vmName)
 }
 
 func importVMToCloudStack(cs *cloudStackClient, vmName string, targetCloud cloudStackTargetSpec, bootDiskPath string) (string, error) {
