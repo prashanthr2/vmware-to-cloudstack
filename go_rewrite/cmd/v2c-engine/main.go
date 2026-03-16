@@ -1534,6 +1534,163 @@ func createSnapshot(ctx context.Context, vm *object.VirtualMachine, name string,
 	}
 }
 
+func vmToolsStatus(ctx context.Context, client *govmomi.Client, vmRef types.ManagedObjectReference) (string, error) {
+	pc := property.DefaultCollector(client.Client)
+	var vmMo mo.VirtualMachine
+	if err := pc.RetrieveOne(ctx, vmRef, []string{"guest.toolsStatus"}, &vmMo); err != nil {
+		return "", err
+	}
+	root := reflect.ValueOf(vmMo)
+	guest := root.FieldByName("Guest")
+	if !guest.IsValid() {
+		return "", nil
+	}
+	if guest.Kind() == reflect.Ptr {
+		if guest.IsNil() {
+			return "", nil
+		}
+		guest = guest.Elem()
+	}
+	f := guest.FieldByName("ToolsStatus")
+	if !f.IsValid() {
+		return "", nil
+	}
+	switch f.Kind() {
+	case reflect.String:
+		return strings.TrimSpace(f.String()), nil
+	default:
+		return strings.TrimSpace(fmt.Sprintf("%v", f.Interface())), nil
+	}
+}
+
+func vmToolsUsable(status string) bool {
+	return status == "toolsOk" || status == "toolsOld"
+}
+
+func createSnapshotWithMode(
+	ctx context.Context,
+	client *govmomi.Client,
+	vm *object.VirtualMachine,
+	name string,
+	mode string,
+	log *runLogger,
+) (types.ManagedObjectReference, error) {
+	mode = strings.ToLower(strings.TrimSpace(mode))
+	if mode == "" {
+		mode = "auto"
+	}
+
+	switch mode {
+	case "false":
+		log.Printf("Creating non-quiesced snapshot: %s", name)
+		return createSnapshot(ctx, vm, name, false)
+	case "true":
+		log.Printf("Creating quiesced snapshot: %s", name)
+		return createSnapshot(ctx, vm, name, true)
+	case "auto":
+		status, err := vmToolsStatus(ctx, client, vm.Reference())
+		if err != nil {
+			log.Printf("Warning: failed to read VMware Tools status, using non-quiesced snapshot: %v", err)
+			return createSnapshot(ctx, vm, name, false)
+		}
+		if vmToolsUsable(status) {
+			log.Printf("Trying quiesced snapshot (tools status=%s): %s", status, name)
+			snap, err := createSnapshot(ctx, vm, name, true)
+			if err == nil {
+				return snap, nil
+			}
+			log.Printf("Quiesced snapshot failed (%v), falling back to non-quiesced", err)
+		} else {
+			log.Printf("VMware Tools not running (status=%s), using non-quiesced snapshot", status)
+		}
+		return createSnapshot(ctx, vm, name, false)
+	default:
+		return types.ManagedObjectReference{}, fmt.Errorf("invalid snapshot_quiesce mode: %s", mode)
+	}
+}
+
+func vmCBTEnabled(ctx context.Context, client *govmomi.Client, vmRef types.ManagedObjectReference) (bool, error) {
+	pc := property.DefaultCollector(client.Client)
+	var vmMo mo.VirtualMachine
+	if err := pc.RetrieveOne(ctx, vmRef, []string{"config.changeTrackingEnabled"}, &vmMo); err != nil {
+		return false, err
+	}
+	root := reflect.ValueOf(vmMo)
+	cfg := root.FieldByName("Config")
+	if !cfg.IsValid() {
+		return false, nil
+	}
+	if cfg.Kind() == reflect.Ptr {
+		if cfg.IsNil() {
+			return false, nil
+		}
+		cfg = cfg.Elem()
+	}
+	f := cfg.FieldByName("ChangeTrackingEnabled")
+	if !f.IsValid() {
+		return false, nil
+	}
+	switch f.Kind() {
+	case reflect.Bool:
+		return f.Bool(), nil
+	case reflect.Ptr:
+		if f.IsNil() {
+			return false, nil
+		}
+		if f.Elem().Kind() == reflect.Bool {
+			return f.Elem().Bool(), nil
+		}
+	}
+	return false, nil
+}
+
+func setCBTInConfigSpec(spec *types.VirtualMachineConfigSpec, enabled bool) error {
+	rv := reflect.ValueOf(spec).Elem()
+	f := rv.FieldByName("ChangeTrackingEnabled")
+	if !f.IsValid() || !f.CanSet() {
+		return errors.New("ChangeTrackingEnabled field not settable in VirtualMachineConfigSpec")
+	}
+	switch f.Kind() {
+	case reflect.Bool:
+		f.SetBool(enabled)
+		return nil
+	case reflect.Ptr:
+		if f.Type().Elem().Kind() != reflect.Bool {
+			return errors.New("unexpected ChangeTrackingEnabled pointer element type")
+		}
+		b := enabled
+		f.Set(reflect.ValueOf(&b))
+		return nil
+	default:
+		return fmt.Errorf("unsupported ChangeTrackingEnabled kind: %s", f.Kind())
+	}
+}
+
+func ensureCBTEnabled(ctx context.Context, client *govmomi.Client, vm *object.VirtualMachine, log *runLogger) error {
+	enabled, err := vmCBTEnabled(ctx, client, vm.Reference())
+	if err != nil {
+		return err
+	}
+	if enabled {
+		log.Printf("CBT already enabled")
+		return nil
+	}
+	log.Printf("CBT not enabled, enabling now")
+	spec := types.VirtualMachineConfigSpec{}
+	if err := setCBTInConfigSpec(&spec, true); err != nil {
+		return err
+	}
+	task, err := vm.Reconfigure(ctx, spec)
+	if err != nil {
+		return err
+	}
+	if _, err := task.WaitForResult(ctx, nil); err != nil {
+		return err
+	}
+	log.Printf("CBT enabled successfully")
+	return nil
+}
+
 func isVMPoweredOff(ctx context.Context, vm *object.VirtualMachine) (bool, error) {
 	state, err := vm.PowerState(ctx)
 	if err != nil {
@@ -1575,15 +1732,19 @@ func shutdownVMForFinalize(ctx context.Context, client *govmomi.Client, vm *obje
 
 	switch mode {
 	case "auto":
-		log.Printf("Attempting graceful guest shutdown (auto mode)")
-		if _, err := methods.ShutdownGuest(ctx, client.Client, &types.ShutdownGuest{This: vm.Reference()}); err != nil {
-			log.Printf("Graceful shutdown request failed: %v", err)
-		}
-		if err := waitForPowerOff(ctx, vm, 5*time.Minute); err == nil {
-			log.Printf("Guest shutdown completed")
-			return nil
-		} else {
+		status, err := vmToolsStatus(ctx, client, vm.Reference())
+		if err == nil && vmToolsUsable(status) {
+			log.Printf("Attempting graceful guest shutdown (auto mode)")
+			if _, err := methods.ShutdownGuest(ctx, client.Client, &types.ShutdownGuest{This: vm.Reference()}); err != nil {
+				log.Printf("Graceful shutdown request failed: %v", err)
+			}
+			if err := waitForPowerOff(ctx, vm, 5*time.Minute); err == nil {
+				log.Printf("Guest shutdown completed")
+				return nil
+			}
 			log.Printf("Graceful shutdown timed out; forcing power off")
+		} else {
+			log.Printf("VMware Tools not running (status=%s); forcing power off", status)
 		}
 		task, err := vm.PowerOff(ctx)
 		if err != nil {
@@ -2361,20 +2522,22 @@ func runVMWorkflow(ctx context.Context, cfg *appConfig, spec *runSpec, opts runO
 	if virtioISO == "" {
 		virtioISO = "/usr/share/virtio-win/virtio-win.iso"
 	}
-	log.Printf(
-		"Runtime settings readers=%d parallel_disks=%d run_virt_v2v=%t shutdown_mode=%s virtio_iso=%s",
-		readers,
-		parallelDisks,
-		runVirtV2V,
-		shutdownMode,
-		virtioISO,
-	)
-
 	quiesceMode := strings.ToLower(strings.TrimSpace(cfg.Migration.SnapshotQuiesce))
 	if strings.TrimSpace(spec.Migration.SnapshotQuiesce) != "" {
 		quiesceMode = strings.ToLower(strings.TrimSpace(spec.Migration.SnapshotQuiesce))
 	}
-	quiesce := quiesceMode == "true"
+	if quiesceMode == "" {
+		quiesceMode = "auto"
+	}
+	log.Printf(
+		"Runtime settings readers=%d parallel_disks=%d run_virt_v2v=%t shutdown_mode=%s snapshot_quiesce=%s virtio_iso=%s",
+		readers,
+		parallelDisks,
+		runVirtV2V,
+		shutdownMode,
+		quiesceMode,
+		virtioISO,
+	)
 
 	thumb, err := getServerThumbprint(cfg.VCenter.Host)
 	if err != nil {
@@ -2467,8 +2630,14 @@ func runVMWorkflow(ctx context.Context, cfg *appConfig, spec *runSpec, opts runO
 		return nil
 	}
 
+	if st.Stage == stageInit || st.Stage == stageBaseCopy || st.Stage == stageDelta || st.Stage == stageFinalSync {
+		if err := ensureCBTEnabled(ctx, client, vmObj, log); err != nil {
+			return fmt.Errorf("ensure CBT enabled failed: %w", err)
+		}
+	}
+
 	if st.Stage == stageInit {
-		baseSnap, err := createSnapshot(ctx, vmObj, "Migrate_Base_"+spec.VM.Name, quiesce)
+		baseSnap, err := createSnapshotWithMode(ctx, client, vmObj, "Migrate_Base_"+spec.VM.Name, quiesceMode, log)
 		if err != nil {
 			return err
 		}
@@ -2483,7 +2652,7 @@ func runVMWorkflow(ctx context.Context, cfg *appConfig, spec *runSpec, opts runO
 
 	if st.Stage == stageBaseCopy {
 		if strings.TrimSpace(st.ActiveSnapshot) == "" {
-			baseSnap, err := createSnapshot(ctx, vmObj, "Migrate_Base_"+spec.VM.Name, quiesce)
+			baseSnap, err := createSnapshotWithMode(ctx, client, vmObj, "Migrate_Base_"+spec.VM.Name, quiesceMode, log)
 			if err != nil {
 				return err
 			}
@@ -2612,7 +2781,14 @@ func runVMWorkflow(ctx context.Context, cfg *appConfig, spec *runSpec, opts runO
 	}
 
 	runDeltaRound := func(stageName string) error {
-		newSnap, err := createSnapshot(ctx, vmObj, fmt.Sprintf("Migrate_Delta_%s_%d", spec.VM.Name, time.Now().Unix()), quiesce)
+		newSnap, err := createSnapshotWithMode(
+			ctx,
+			client,
+			vmObj,
+			fmt.Sprintf("Migrate_Delta_%s_%d", spec.VM.Name, time.Now().Unix()),
+			quiesceMode,
+			log,
+		)
 		if err != nil {
 			return err
 		}

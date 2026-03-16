@@ -4,6 +4,8 @@ vm:
 migration:
   # Delta loop interval in seconds.
   delta_interval: 300
+  # Source VM shutdown behavior before final sync: auto | force | manual
+  shutdown_mode: auto
   # Optional, used when finalize_at is near.
   finalize_delta_interval: 30
   finalize_window: 600

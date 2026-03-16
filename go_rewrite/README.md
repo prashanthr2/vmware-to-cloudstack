@@ -108,6 +108,8 @@ export CGO_LDFLAGS="-L/opt/vmware-vddk/lib64 -lvixDiskLib -ldl -lpthread"
 - Writes Python-style migration logs with timestamps to `/var/lib/vm-migrator/<vm>_<moref>/migration.log` (also mirrored to stderr).
 - Stage order is: `init -> base_copy -> delta/final_sync -> converting -> import_root_disk -> import_data_disk -> done`.
 - The first snapshot is always created as `Migrate_Base_<vm>` during `init`; delta snapshots are only created in delta stages.
+- Snapshot policy matches Python: `snapshot_quiesce=auto` tries quiesced snapshots only when VMware Tools is healthy, then falls back to non-quiesced.
+- CBT policy matches Python: if CBT is not enabled, the engine enables CBT before base/delta work.
 - Persists per-disk progress fields (progress %, bytes read/written, speed, ETA) and overall VM progress.
 - `FINALIZE` file behavior is supported: if `/var/lib/vm-migrator/<vm>_<moref>/FINALIZE` exists, the engine runs one final delta round (`final_sync`) and proceeds to import.
 - Before `final_sync`, source VM shutdown is enforced using `shutdown_mode` (`auto|force|manual`) from spec/config, matching Python finalize behavior.
