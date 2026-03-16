@@ -93,6 +93,7 @@ import (
 	"github.com/vmware/govmomi/find"
 	"github.com/vmware/govmomi/object"
 	"github.com/vmware/govmomi/property"
+	"github.com/vmware/govmomi/vim25/soap"
 	"github.com/vmware/govmomi/vim25/methods"
 	"github.com/vmware/govmomi/vim25/mo"
 	"github.com/vmware/govmomi/vim25/types"
@@ -1598,6 +1599,20 @@ func connectVCenter(ctx context.Context, cfg *appConfig) (*govmomi.Client, error
 	return govmomi.NewClient(ctx, u, true)
 }
 
+func isNotAuthenticatedError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var sf *soap.Fault
+	if errors.As(err, &sf) {
+		if _, ok := sf.VimFault().(*types.NotAuthenticated); ok {
+			return true
+		}
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "notauthenticated") || strings.Contains(msg, "not authenticated")
+}
+
 func findVM(ctx context.Context, client *govmomi.Client, vmName string) (*object.VirtualMachine, error) {
 	finder := find.NewFinder(client.Client, true)
 	dc, err := finder.DefaultDatacenter(ctx)
@@ -2616,8 +2631,98 @@ func runVMWorkflow(ctx context.Context, cfg *appConfig, spec *runSpec, opts runO
 	finalizeFile := filepath.Join(controlDir, "FINALIZE")
 	log.Printf("Starting workflow vm=%s moref=%s", spec.VM.Name, vmMoref)
 
-	disks, bootUnit, err := listVMDisksAndBootUnit(ctx, client, vmObj)
-	if err != nil {
+	vmRef := vmObj.Reference()
+	var vcMu sync.RWMutex
+	var reconnectMu sync.Mutex
+
+	reconnectVCenter := func(reason string) error {
+		reconnectMu.Lock()
+		defer reconnectMu.Unlock()
+
+		log.Printf("vCenter reconnect requested (%s)", reason)
+		newClient, err := connectVCenter(ctx, cfg)
+		if err != nil {
+			return err
+		}
+		newVM := object.NewVirtualMachine(newClient.Client, vmRef)
+
+		vcMu.Lock()
+		oldClient := client
+		client = newClient
+		vmObj = newVM
+		vcMu.Unlock()
+
+		if oldClient != nil {
+			logoutCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			_ = oldClient.Logout(logoutCtx)
+			cancel()
+		}
+		log.Printf("vCenter reconnect completed")
+		return nil
+	}
+
+	withVCenterRetry := func(op string, fn func(*govmomi.Client, *object.VirtualMachine) error) error {
+		for attempt := 0; attempt < 2; attempt++ {
+			vcMu.RLock()
+			c := client
+			v := vmObj
+			vcMu.RUnlock()
+
+			err := fn(c, v)
+			if err == nil {
+				return nil
+			}
+			if !isNotAuthenticatedError(err) || attempt == 1 {
+				return err
+			}
+			log.Printf("%s hit expired vCenter session, reconnecting and retrying", op)
+			if recErr := reconnectVCenter(op); recErr != nil {
+				return fmt.Errorf("%s reconnect failed: %w (original error: %v)", op, recErr, err)
+			}
+		}
+		return nil
+	}
+
+	keepaliveStop := make(chan struct{})
+	defer close(keepaliveStop)
+	go func() {
+		tk := time.NewTicker(60 * time.Second)
+		defer tk.Stop()
+		for {
+			select {
+			case <-keepaliveStop:
+				return
+			case <-ctx.Done():
+				return
+			case <-tk.C:
+				vcMu.RLock()
+				v := vmObj
+				vcMu.RUnlock()
+				pingCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+				_, err := v.PowerState(pingCtx)
+				cancel()
+				if err == nil {
+					continue
+				}
+				if isNotAuthenticatedError(err) {
+					log.Printf("vCenter keepalive detected expired session")
+					if recErr := reconnectVCenter("keepalive"); recErr != nil {
+						log.Printf("vCenter keepalive reconnect failed: %v", recErr)
+					}
+					continue
+				}
+				log.Printf("vCenter keepalive warning: %v", err)
+			}
+		}
+	}()
+
+	var disks []vmDisk
+	bootUnit := 0
+	if err := withVCenterRetry("list VM disks", func(c *govmomi.Client, v *object.VirtualMachine) error {
+		var callErr error
+		disks, bootUnit, callErr = listVMDisksAndBootUnit(ctx, c, v)
+		return callErr
+	}); err != nil {
 		return err
 	}
 
@@ -2773,14 +2878,20 @@ func runVMWorkflow(ctx context.Context, cfg *appConfig, spec *runSpec, opts runO
 	}
 
 	if st.Stage == stageInit || st.Stage == stageBaseCopy || st.Stage == stageDelta || st.Stage == stageFinalSync {
-		if err := ensureCBTEnabled(ctx, client, vmObj, log); err != nil {
+		if err := withVCenterRetry("ensure CBT enabled", func(c *govmomi.Client, v *object.VirtualMachine) error {
+			return ensureCBTEnabled(ctx, c, v, log)
+		}); err != nil {
 			return fmt.Errorf("ensure CBT enabled failed: %w", err)
 		}
 	}
 
 	if st.Stage == stageInit {
-		baseSnap, err := createSnapshotWithMode(ctx, client, vmObj, "Migrate_Base_"+spec.VM.Name, quiesceMode, log)
-		if err != nil {
+		var baseSnap types.ManagedObjectReference
+		if err := withVCenterRetry("create base snapshot", func(c *govmomi.Client, v *object.VirtualMachine) error {
+			var callErr error
+			baseSnap, callErr = createSnapshotWithMode(ctx, c, v, "Migrate_Base_"+spec.VM.Name, quiesceMode, log)
+			return callErr
+		}); err != nil {
 			return err
 		}
 		log.Printf("Created base snapshot: %s", baseSnap.Value)
@@ -2794,8 +2905,12 @@ func runVMWorkflow(ctx context.Context, cfg *appConfig, spec *runSpec, opts runO
 
 	if st.Stage == stageBaseCopy {
 		if strings.TrimSpace(st.ActiveSnapshot) == "" {
-			baseSnap, err := createSnapshotWithMode(ctx, client, vmObj, "Migrate_Base_"+spec.VM.Name, quiesceMode, log)
-			if err != nil {
+			var baseSnap types.ManagedObjectReference
+			if err := withVCenterRetry("create base snapshot", func(c *govmomi.Client, v *object.VirtualMachine) error {
+				var callErr error
+				baseSnap, callErr = createSnapshotWithMode(ctx, c, v, "Migrate_Base_"+spec.VM.Name, quiesceMode, log)
+				return callErr
+			}); err != nil {
 				return err
 			}
 			stateMu.Lock()
@@ -2805,12 +2920,16 @@ func runVMWorkflow(ctx context.Context, cfg *appConfig, spec *runSpec, opts runO
 				return err
 			}
 		}
-		baseMeta, err := snapshotDiskMetadata(
-			ctx,
-			client,
-			types.ManagedObjectReference{Type: "VirtualMachineSnapshot", Value: st.ActiveSnapshot},
-		)
-		if err != nil {
+		baseMeta := map[int32]snapshotDiskMeta{}
+		if err := withVCenterRetry("read base snapshot metadata", func(c *govmomi.Client, _ *object.VirtualMachine) error {
+			var callErr error
+			baseMeta, callErr = snapshotDiskMetadata(
+				ctx,
+				c,
+				types.ManagedObjectReference{Type: "VirtualMachineSnapshot", Value: st.ActiveSnapshot},
+			)
+			return callErr
+		}); err != nil {
 			return err
 		}
 
@@ -2923,20 +3042,28 @@ func runVMWorkflow(ctx context.Context, cfg *appConfig, spec *runSpec, opts runO
 	}
 
 	runDeltaRound := func(stageName string) error {
-		newSnap, err := createSnapshotWithMode(
-			ctx,
-			client,
-			vmObj,
-			fmt.Sprintf("Migrate_Delta_%s_%d", spec.VM.Name, time.Now().Unix()),
-			quiesceMode,
-			log,
-		)
-		if err != nil {
+		var newSnap types.ManagedObjectReference
+		if err := withVCenterRetry("create delta snapshot", func(c *govmomi.Client, v *object.VirtualMachine) error {
+			var callErr error
+			newSnap, callErr = createSnapshotWithMode(
+				ctx,
+				c,
+				v,
+				fmt.Sprintf("Migrate_Delta_%s_%d", spec.VM.Name, time.Now().Unix()),
+				quiesceMode,
+				log,
+			)
+			return callErr
+		}); err != nil {
 			return err
 		}
 		log.Printf("Created delta snapshot (%s): %s", stageName, newSnap.Value)
-		newMeta, err := snapshotDiskMetadata(ctx, client, newSnap)
-		if err != nil {
+		newMeta := map[int32]snapshotDiskMeta{}
+		if err := withVCenterRetry("read delta snapshot metadata", func(c *govmomi.Client, _ *object.VirtualMachine) error {
+			var callErr error
+			newMeta, callErr = snapshotDiskMetadata(ctx, c, newSnap)
+			return callErr
+		}); err != nil {
 			return err
 		}
 
@@ -2990,7 +3117,15 @@ func runVMWorkflow(ctx context.Context, cfg *appConfig, spec *runSpec, opts runO
 					errMu.Unlock()
 					return
 				}
-				ranges, err := queryChangedRanges(ctx, client, vmObj.Reference(), newSnap, d.Key, prevChangeID, d.Capacity)
+				var ranges []changedRange
+				err := withVCenterRetry(
+					fmt.Sprintf("query changed ranges unit=%d", d.Unit),
+					func(c *govmomi.Client, v *object.VirtualMachine) error {
+						var callErr error
+						ranges, callErr = queryChangedRanges(ctx, c, v.Reference(), newSnap, d.Key, prevChangeID, d.Capacity)
+						return callErr
+					},
+				)
 				if err != nil {
 					errMu.Lock()
 					if firstErr == nil {
@@ -3076,7 +3211,9 @@ func runVMWorkflow(ctx context.Context, cfg *appConfig, spec *runSpec, opts runO
 		stateMu.Unlock()
 
 		if prevSnapshot != "" && prevSnapshot != newSnap.Value {
-			if err := removeSnapshot(ctx, client, types.ManagedObjectReference{Type: "VirtualMachineSnapshot", Value: prevSnapshot}); err != nil {
+			if err := withVCenterRetry("remove previous snapshot", func(c *govmomi.Client, _ *object.VirtualMachine) error {
+				return removeSnapshot(ctx, c, types.ManagedObjectReference{Type: "VirtualMachineSnapshot", Value: prevSnapshot})
+			}); err != nil {
 				fmt.Fprintf(os.Stderr, "[run] warning: failed to remove snapshot %s: %v\n", prevSnapshot, err)
 				log.Printf("Warning: failed to remove snapshot %s: %v", prevSnapshot, err)
 			} else {
@@ -3100,7 +3237,9 @@ func runVMWorkflow(ctx context.Context, cfg *appConfig, spec *runSpec, opts runO
 
 			if finalizeNow {
 				log.Printf("FINALIZE detected, ensuring source VM is powered off (mode=%s)", shutdownMode)
-				if err := shutdownVMForFinalize(ctx, client, vmObj, shutdownMode, log); err != nil {
+				if err := withVCenterRetry("shutdown source VM for finalize", func(c *govmomi.Client, v *object.VirtualMachine) error {
+					return shutdownVMForFinalize(ctx, c, v, shutdownMode, log)
+				}); err != nil {
 					return fmt.Errorf("failed to shutdown source VM before final sync: %w", err)
 				}
 				if err := setStage(stageFinalSync); err != nil {
