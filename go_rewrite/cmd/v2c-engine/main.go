@@ -622,6 +622,10 @@ type appConfig struct {
 		ServiceOfferingID string `yaml:"serviceofferingid"`
 		DiskOfferingID    string `yaml:"diskofferingid"`
 	} `yaml:"cloudstack_defaults"`
+	Virt struct {
+		RunVirtV2V bool   `yaml:"run_virt_v2v"`
+		VirtioISO  string `yaml:"virtio_iso"`
+	} `yaml:"virt"`
 }
 
 type runSpec struct {
@@ -705,6 +709,7 @@ type runState struct {
 	ActiveSnapshot  string                   `json:"active_snapshot"`
 	Disks           map[string]*runDiskState `json:"disks"`
 	CloudStackVMID  string                   `json:"cloudstack_vm_id,omitempty"`
+	VirtV2VDone     bool                     `json:"virt_v2v_done,omitempty"`
 	Progress        float64                  `json:"progress,omitempty"`
 	TransferSpeedMB float64                  `json:"transfer_speed_mbps,omitempty"`
 	LastError       string                   `json:"last_error,omitempty"`
@@ -716,6 +721,7 @@ const (
 	stageBaseCopy      = "base_copy"
 	stageDelta         = "delta"
 	stageFinalSync     = "final_sync"
+	stageConverting    = "converting"
 	stageImportRoot    = "import_root_disk"
 	stageImportData    = "import_data_disk"
 	stageDone          = "done"
@@ -2212,14 +2218,24 @@ func runVMWorkflow(ctx context.Context, cfg *appConfig, spec *runSpec, opts runO
 		parallelDisks = 1
 	}
 
-	runVirtV2V := false
+	runVirtV2V := cfg.Virt.RunVirtV2V
 	if spec.Migration.RunVirtV2V != nil {
 		runVirtV2V = *spec.Migration.RunVirtV2V
 	}
 	if opts.OverrideV2V {
 		runVirtV2V = opts.RunVirtV2V
 	}
-	log.Printf("Runtime settings readers=%d parallel_disks=%d run_virt_v2v=%t", readers, parallelDisks, runVirtV2V)
+	virtioISO := strings.TrimSpace(cfg.Virt.VirtioISO)
+	if virtioISO == "" {
+		virtioISO = "/usr/share/virtio-win/virtio-win.iso"
+	}
+	log.Printf(
+		"Runtime settings readers=%d parallel_disks=%d run_virt_v2v=%t virtio_iso=%s",
+		readers,
+		parallelDisks,
+		runVirtV2V,
+		virtioISO,
+	)
 
 	quiesceMode := strings.ToLower(strings.TrimSpace(cfg.Migration.SnapshotQuiesce))
 	if strings.TrimSpace(spec.Migration.SnapshotQuiesce) != "" {
@@ -2262,9 +2278,6 @@ func runVMWorkflow(ctx context.Context, cfg *appConfig, spec *runSpec, opts runO
 	st.MigrationID = migrationID
 	if st.Stage == "" {
 		st.Stage = stageInit
-	}
-	if st.Stage == "converting" {
-		st.Stage = stageImportRoot
 	}
 	log.Printf("Resuming from stage: %s", st.Stage)
 
@@ -2401,7 +2414,7 @@ func runVMWorkflow(ctx context.Context, cfg *appConfig, spec *runSpec, opts runO
 					TargetQCOW2:   st.Disks[strconv.Itoa(d.Unit)].TargetQCOW2,
 					DiskSizeBytes: d.Capacity,
 					Readers:       readers,
-					RunVirtV2V:    runVirtV2V && d.Unit == bootUnit,
+					RunVirtV2V:    false,
 					OnProgress:    progress,
 				}
 				stats, err := runBaseCopy(baseCtx, optsBase)
@@ -2664,6 +2677,42 @@ func runVMWorkflow(ctx context.Context, cfg *appConfig, spec *runSpec, opts runO
 				continue
 			}
 			time.Sleep(time.Duration(sleepSec) * time.Second)
+		}
+		nextStage := stageImportRoot
+		if runVirtV2V {
+			nextStage = stageConverting
+		}
+		if err := setStage(nextStage); err != nil {
+			return err
+		}
+	}
+
+	if st.Stage == stageImportRoot && runVirtV2V && !st.VirtV2VDone && strings.TrimSpace(st.CloudStackVMID) == "" {
+		log.Printf("Root import stage reached without virt-v2v completion; moving to converting stage")
+		if err := setStage(stageConverting); err != nil {
+			return err
+		}
+	}
+
+	if st.Stage == stageConverting {
+		if runVirtV2V {
+			bootDiskState := st.Disks[strconv.Itoa(bootUnit)]
+			if bootDiskState == nil {
+				return fmt.Errorf("boot disk state not found for unit=%d", bootUnit)
+			}
+			log.Printf("Running virt-v2v-in-place on boot disk: %s", bootDiskState.TargetQCOW2)
+			if err := runVirtV2VInPlace(bootDiskState.TargetQCOW2, virtioISO); err != nil {
+				return fmt.Errorf("virt-v2v-in-place failed: %w", err)
+			}
+			log.Printf("virt-v2v-in-place completed for boot disk")
+			stateMu.Lock()
+			st.VirtV2VDone = true
+			stateMu.Unlock()
+		} else {
+			log.Printf("Skipping converting stage because run_virt_v2v is false")
+			stateMu.Lock()
+			st.VirtV2VDone = false
+			stateMu.Unlock()
 		}
 		if err := setStage(stageImportRoot); err != nil {
 			return err

@@ -106,7 +106,7 @@ export CGO_LDFLAGS="-L/opt/vmware-vddk/lib64 -lvixDiskLib -ldl -lpthread"
 - Uses a resumable JSON state machine per VM at `/var/lib/vm-migrator/<vm>_<moref>/state.json`.
 - Legacy `state.engine.json` is auto-read for resume, then new updates continue in `state.json`.
 - Writes Python-style migration logs with timestamps to `/var/lib/vm-migrator/<vm>_<moref>/migration.log` (also mirrored to stderr).
-- Stage order is: `init -> base_copy -> delta/final_sync -> import_root_disk -> import_data_disk -> done`.
+- Stage order is: `init -> base_copy -> delta/final_sync -> converting -> import_root_disk -> import_data_disk -> done`.
 - The first snapshot is always created as `Migrate_Base_<vm>` during `init`; delta snapshots are only created in delta stages.
 - Persists per-disk progress fields (progress %, bytes read/written, speed, ETA) and overall VM progress.
 - `FINALIZE` file behavior is supported: if `/var/lib/vm-migrator/<vm>_<moref>/FINALIZE` exists, the engine runs one final delta round (`final_sync`) and proceeds to import.
@@ -131,6 +131,7 @@ export CGO_LDFLAGS="-L/opt/vmware-vddk/lib64 -lvixDiskLib -ldl -lpthread"
 - Supports parallel disk migration within the same VM via `migration.parallel_disks` (or `--parallel-disks`).
 - Supports parallel VM migrations by passing multiple `--spec` values and setting `--parallel-vms` (or config `migration.parallel_vms`).
 - Also accepts spec files with top-level `vms:` list, same as Python behavior.
+- `run_virt_v2v` default comes from `config.yaml -> virt.run_virt_v2v`, and can be overridden per-VM via `spec.migration.run_virt_v2v`.
 
 You can still override any value from spec with CLI flags:
 
