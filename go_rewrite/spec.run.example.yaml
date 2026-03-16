@@ -12,6 +12,8 @@ migration:
 
   # Engine options
   readers: 4
+  # Number of disks to process in parallel for this VM.
+  parallel_disks: 4
   run_virt_v2v: false
   # Optional override for snapshot mode: true|false|auto
   snapshot_quiesce: auto
@@ -30,3 +32,10 @@ disks:
   "1":
     storageid: 68f38850-a051-3ff1-9865-6a24a2ba2864
     diskofferingid: 93e1314f-3d5f-44f0-9e63-315553e50ec6
+
+# Multi-VM format is also supported (Python-style):
+# vms:
+#   - vm: { name: VM1 }
+#     migration: { delta_interval: 300, readers: 4, parallel_disks: 4 }
+#     target: { cloudstack: { zoneid: "...", clusterid: "...", storageid: "...", networkid: "...", serviceofferingid: "..." } }
+#   - vm: { name: VM2 }

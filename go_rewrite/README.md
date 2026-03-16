@@ -96,11 +96,18 @@ export CGO_LDFLAGS="-L/opt/vmware-vddk/lib64 -lvixDiskLib -ldl -lpthread"
 
 ```bash
 ./v2c-engine run --spec ./spec.run.example.yaml --config ../config.yaml
+./v2c-engine run --spec ./spec.run.example.yaml --spec ./another-vm.yaml --config ../config.yaml
+./v2c-engine run --spec ./spec.run.multi.example.yaml --parallel-vms 3 --config ../config.yaml
 ./v2c-engine base-copy --spec ./spec.engine.example.yaml
 ./v2c-engine delta-sync --spec ./spec.engine.example.yaml
 ```
 
 `run` mode follows the Python-style workflow for base copy and delta loop scheduling:
+- Uses a resumable JSON state machine per VM at `/var/lib/vm-migrator/<vm>_<moref>/state.json`.
+- Legacy `state.engine.json` is auto-read for resume, then new updates continue in `state.json`.
+- Stage order is: `init -> base_copy -> delta/final_sync -> import_root_disk -> import_data_disk -> done`.
+- The first snapshot is always created as `Migrate_Base_<vm>` during `init`; delta snapshots are only created in delta stages.
+- Persists per-disk progress fields (progress %, bytes read/written, speed, ETA) and overall VM progress.
 - Reads VM and migration strategy from spec (`delta_interval`, `finalize_at`, etc.).
 - Resolves destination disk path from CloudStack storage selection:
   - boot disk -> `target.cloudstack.storageid`
@@ -119,16 +126,21 @@ export CGO_LDFLAGS="-L/opt/vmware-vddk/lib64 -lvixDiskLib -ldl -lpthread"
   - `target.cloudstack.diskofferingid`
   - `config.yaml cloudstack_defaults.diskofferingid`
 - Uses `migration.readers` and `migration.run_virt_v2v` from spec.
+- Supports parallel disk migration within the same VM via `migration.parallel_disks` (or `--parallel-disks`).
+- Supports parallel VM migrations by passing multiple `--spec` values and setting `--parallel-vms` (or config `migration.parallel_vms`).
+- Also accepts spec files with top-level `vms:` list, same as Python behavior.
 
 You can still override any value from spec with CLI flags:
 
 ```bash
 ./v2c-engine base-copy --spec ./spec.engine.example.yaml -readers 8
 ./v2c-engine run --spec ./spec.run.example.yaml --readers 8 --override-run-virt-v2v --run-virt-v2v=true
+./v2c-engine run --spec ./specs.yaml --parallel-vms 3 --parallel-disks 4
 ```
 
 Use [spec.engine.example.yaml](./spec.engine.example.yaml) as the template for UI-generated specs.
 Use [spec.run.example.yaml](./spec.run.example.yaml) as the template for full run-mode specs.
+Use [spec.run.multi.example.yaml](./spec.run.multi.example.yaml) for top-level `vms:` batch format.
 
 ## Mapping from current Python flow
 
