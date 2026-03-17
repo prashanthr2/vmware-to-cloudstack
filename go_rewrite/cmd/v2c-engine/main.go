@@ -2354,6 +2354,29 @@ func applyCloudStackDefaults(spec *runSpec, cfg *appConfig) {
 	}
 }
 
+func persistSpecForRun(controlDir string, spec *runSpec) error {
+	if spec == nil {
+		return errors.New("nil run spec")
+	}
+	raw, err := yaml.Marshal(spec)
+	if err != nil {
+		return fmt.Errorf("marshal run spec: %w", err)
+	}
+	latestPath := filepath.Join(controlDir, "spec.latest.yaml")
+	if err := os.WriteFile(latestPath, raw, 0o644); err != nil {
+		return fmt.Errorf("write %s: %w", latestPath, err)
+	}
+	stablePath := filepath.Join(controlDir, "spec.yaml")
+	if _, err := os.Stat(stablePath); os.IsNotExist(err) {
+		if err := os.WriteFile(stablePath, raw, 0o644); err != nil {
+			return fmt.Errorf("write %s: %w", stablePath, err)
+		}
+	} else if err != nil {
+		return fmt.Errorf("stat %s: %w", stablePath, err)
+	}
+	return nil
+}
+
 func validateCloudStackTarget(target cloudStackTargetSpec) error {
 	missing := make([]string, 0)
 	if strings.TrimSpace(target.ZoneID) == "" {
@@ -2974,6 +2997,9 @@ func runVMWorkflow(ctx context.Context, cfg *appConfig, spec *runSpec, opts runO
 		return err
 	}
 	defer log.Close()
+	if err := persistSpecForRun(controlDir, spec); err != nil {
+		return err
+	}
 
 	statePath := filepath.Join(controlDir, "state.json")
 	legacyStatePath := filepath.Join(controlDir, "state.engine.json")
