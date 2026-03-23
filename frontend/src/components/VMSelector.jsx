@@ -1,41 +1,58 @@
 export default function VMSelector({
   vmOptions,
-  vmName,
-  vmMoref,
-  onVmChange,
-  onMorefChange,
-  onDetectDisks,
+  selectedVmNames,
+  activeVmName,
+  onToggleVm,
+  onSetActiveVm,
+  onSelectAll,
+  onClearSelection,
+  onRefreshSelected,
   loading,
 }) {
   return (
     <section className="panel">
       <div className="subsection-title-row">
         <h2>VM Selection</h2>
-        <button className="secondary" onClick={onDetectDisks} disabled={loading || !vmName}>
-          {loading ? "Detecting..." : "Refresh VM Disks"}
-        </button>
+        <div className="actions compact">
+          <button className="secondary" onClick={onSelectAll} disabled={!vmOptions.length || loading}>
+            Select All
+          </button>
+          <button className="secondary" onClick={onClearSelection} disabled={!selectedVmNames.length || loading}>
+            Clear
+          </button>
+          <button className="secondary" onClick={onRefreshSelected} disabled={loading || !selectedVmNames.length}>
+            {loading ? "Refreshing..." : "Refresh Selected VMs"}
+          </button>
+        </div>
+      </div>
+
+      <div className="vm-select-grid">
+        {vmOptions.map((vm) => (
+          <label key={`${vm.name}-${vm.moref}`} className="vm-select-card">
+            <input
+              type="checkbox"
+              checked={selectedVmNames.includes(vm.name)}
+              onChange={(e) => onToggleVm(vm.name, e.target.checked)}
+            />
+            <span>{vm.name}</span>
+            <code>{vm.moref}</code>
+          </label>
+        ))}
       </div>
 
       <div className="form-grid compact">
         <label>
-          Source VM
-          <select value={vmName} onChange={(e) => onVmChange(e.target.value)}>
-            <option value="">Select VM</option>
-            {vmOptions.map((vm) => (
-              <option key={`${vm.name}-${vm.moref}`} value={vm.name}>
-                {vm.name} ({vm.moref})
+          Active VM for Editing
+          <select value={activeVmName} onChange={(e) => onSetActiveVm(e.target.value)} disabled={!selectedVmNames.length}>
+            <option value="">Select active VM</option>
+            {selectedVmNames.map((name) => (
+              <option key={name} value={name}>
+                {name}
               </option>
             ))}
           </select>
         </label>
-
-        <label>
-          VM MoRef
-          <input value={vmMoref} onChange={(e) => onMorefChange(e.target.value)} placeholder="vm-123" />
-        </label>
       </div>
-
-      {loading ? <p className="hint">Fetching VM disks from vCenter...</p> : null}
     </section>
   );
 }

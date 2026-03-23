@@ -3,6 +3,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import DiskTable from "./components/DiskTable";
 import EnvironmentManager from "./components/EnvironmentManager";
 import MigrationProgress from "./components/MigrationProgress";
+import NicTable from "./components/NicTable";
 import VMSelector from "./components/VMSelector";
 
 const API_BASE = import.meta.env.VITE_API_BASE || `${window.location.protocol}//${window.location.hostname}:8000`;
@@ -15,6 +16,15 @@ const DEFAULT_ENV_STATE = {
   cloudstacks: [],
 };
 
+const DEFAULT_MIGRATION = {
+  delta_interval: 300,
+  finalize_at: "",
+  finalize_delta_interval: "",
+  finalize_window: "",
+  shutdown_mode: "",
+  snapshot_quiesce: "",
+};
+
 function optionLabel(item) {
   return item.name || item.displaytext || item.id || "Unknown";
 }
@@ -23,18 +33,73 @@ function uniqueByVm(jobs) {
   const seen = new Set();
   const result = [];
   jobs.forEach((job) => {
-    if (seen.has(job.vm_name)) {
-      return;
-    }
+    if (seen.has(job.vm_name)) return;
     seen.add(job.vm_name);
     result.push(job.vm_name);
   });
   return result;
 }
 
+function pickValidOrFirst(currentId, items) {
+  if (!items.length) return "";
+  return items.some((item) => item.id === currentId) ? currentId : items[0].id;
+}
+
+function normalizeMigration(input = {}) {
+  return {
+    delta_interval: input.delta_interval ?? DEFAULT_MIGRATION.delta_interval,
+    finalize_at: input.finalize_at ?? DEFAULT_MIGRATION.finalize_at,
+    finalize_delta_interval: input.finalize_delta_interval ?? DEFAULT_MIGRATION.finalize_delta_interval,
+    finalize_window: input.finalize_window ?? DEFAULT_MIGRATION.finalize_window,
+    shutdown_mode: input.shutdown_mode ?? DEFAULT_MIGRATION.shutdown_mode,
+    snapshot_quiesce: input.snapshot_quiesce ?? DEFAULT_MIGRATION.snapshot_quiesce,
+  };
+}
+
+function validateDraft(draft) {
+  if (!draft) {
+    return { valid: false, message: "VM spec is not initialized.", diskErrors: {}, nicErrors: {} };
+  }
+  const core = [];
+  if (!draft.vm_name) core.push("vm_name");
+  if (!draft.vm_moref) core.push("vm_moref");
+  if (!draft.zoneid) core.push("zoneid");
+  if (!draft.clusterid) core.push("clusterid");
+  if (!draft.serviceofferingid) core.push("serviceofferingid");
+  if (!draft.boot_storageid) core.push("boot_storageid");
+
+  const diskErrors = {};
+  (draft.disks || []).forEach((disk) => {
+    if (disk.diskType === "os") return;
+    if (!disk.storageid) {
+      diskErrors[disk.unit] = "Storage target is required for data disks.";
+      return;
+    }
+    if (!disk.diskofferingid) diskErrors[disk.unit] = "Disk offering is required for data disks.";
+  });
+
+  const nicErrors = {};
+  const nics = draft.nics || [];
+  if (nics.length > 0) {
+    nics.forEach((nic) => {
+      if (!nic.networkid) nicErrors[nic.id] = "CloudStack network is required for each NIC.";
+    });
+  } else if (!draft.networkid) {
+    core.push("networkid");
+  }
+
+  const valid = core.length === 0 && Object.keys(diskErrors).length === 0 && Object.keys(nicErrors).length === 0;
+  let message = "";
+  if (!valid) {
+    if (core.length > 0) message = `Missing required fields: ${core.join(", ")}`;
+    else if (Object.keys(diskErrors).length > 0) message = "Complete storage and disk offering for all data disks.";
+    else message = "Please map all VM NICs to CloudStack networks.";
+  }
+  return { valid, message, diskErrors, nicErrors };
+}
+
 async function apiRequest(path, options = {}) {
   const { headers: customHeaders = {}, ...fetchOptions } = options;
-
   const response = await fetch(`${API_BASE}${path}`, {
     ...fetchOptions,
     headers: {
@@ -45,7 +110,6 @@ async function apiRequest(path, options = {}) {
 
   const text = await response.text();
   let payload = null;
-
   if (text) {
     try {
       payload = JSON.parse(text);
@@ -58,12 +122,7 @@ async function apiRequest(path, options = {}) {
     const detail = payload?.detail || text || response.statusText;
     throw new Error(typeof detail === "string" ? detail : JSON.stringify(detail));
   }
-
-  if (payload !== null) {
-    return payload;
-  }
-
-  return text || null;
+  return payload !== null ? payload : text || null;
 }
 
 export default function App() {
@@ -80,47 +139,23 @@ export default function App() {
   const [serviceOfferings, setServiceOfferings] = useState([]);
   const [diskOfferings, setDiskOfferings] = useState([]);
 
-  const [detectedDisks, setDetectedDisks] = useState([]);
-
-  const [form, setForm] = useState({
-    vm_name: "",
-    vm_moref: "",
-    zoneid: "",
-    clusterid: "",
-    networkid: "",
-    serviceofferingid: "",
-    boot_storageid: "",
-    migration: {
-      delta_interval: 300,
-      finalize_at: "",
-      finalize_delta_interval: "",
-      finalize_window: "",
-      shutdown_mode: "",
-      snapshot_quiesce: "",
-    },
-  });
+  const [selectedVmNames, setSelectedVmNames] = useState([]);
+  const [activeVmName, setActiveVmName] = useState("");
+  const [vmSpecsByName, setVmSpecsByName] = useState({});
 
   const [lastSpecFile, setLastSpecFile] = useState("");
-
   const [jobs, setJobs] = useState([]);
   const [statusByVm, setStatusByVm] = useState({});
   const [selectedJob, setSelectedJob] = useState(null);
   const [logs, setLogs] = useState({ stdout: "", stderr: "", stdout_path: "", stderr_path: "", job_id: "" });
   const [logsBusy, setLogsBusy] = useState(false);
-
   const [toasts, setToasts] = useState([]);
 
   const [envState, setEnvState] = useState(() => {
     try {
       const raw = localStorage.getItem(ENV_STORAGE_KEY);
-      if (!raw) {
-        return DEFAULT_ENV_STATE;
-      }
-      const parsed = JSON.parse(raw);
-      return {
-        ...DEFAULT_ENV_STATE,
-        ...parsed,
-      };
+      if (!raw) return DEFAULT_ENV_STATE;
+      return { ...DEFAULT_ENV_STATE, ...JSON.parse(raw) };
     } catch {
       return DEFAULT_ENV_STATE;
     }
@@ -140,9 +175,7 @@ export default function App() {
   );
 
   const vmwareHeaders = useMemo(() => {
-    if (!selectedVcenter) {
-      return {};
-    }
+    if (!selectedVcenter) return {};
     return {
       "x-vcenter-host": selectedVcenter.host || "",
       "x-vcenter-user": selectedVcenter.username || "",
@@ -151,9 +184,7 @@ export default function App() {
   }, [selectedVcenter]);
 
   const cloudstackHeaders = useMemo(() => {
-    if (!selectedCloudstack) {
-      return {};
-    }
+    if (!selectedCloudstack) return {};
     return {
       "x-cloudstack-endpoint": selectedCloudstack.apiUrl || "",
       "x-cloudstack-api-key": selectedCloudstack.apiKey || "",
@@ -170,88 +201,151 @@ export default function App() {
   }, []);
 
   const vmOptions = useMemo(
-    () => vmwareVms.map((vm) => ({ name: vm.name, moref: vm.moref, disks: vm.disks || [] })),
+    () =>
+      vmwareVms.map((vm) => ({
+        name: vm.name,
+        moref: vm.moref,
+        disks: vm.disks || [],
+        nics: vm.nics || [],
+      })),
     [vmwareVms]
   );
 
-  const validationByUnit = useMemo(() => {
-    const errors = {};
-    detectedDisks.forEach((disk) => {
-      if (disk.diskType === "os") {
-        return;
-      }
-
-      if (!disk.storageid) {
-        errors[disk.unit] = "Storage target is required for data disks.";
-        return;
-      }
-
-      if (!disk.diskofferingid) {
-        errors[disk.unit] = "Disk offering is required for data disks.";
-      }
-    });
-    return errors;
-  }, [detectedDisks]);
-
-  const canStartMigration = useMemo(() => {
-    const hasRequiredCoreFields =
-      !!form.vm_name &&
-      !!form.vm_moref &&
-      !!form.zoneid &&
-      !!form.clusterid &&
-      !!form.networkid &&
-      !!form.serviceofferingid &&
-      !!form.boot_storageid;
-
-    return hasRequiredCoreFields && detectedDisks.length > 0 && Object.keys(validationByUnit).length === 0 && !busy;
-  }, [busy, detectedDisks, form, validationByUnit]);
-
-  const mapDetectedDisks = useCallback(
-    (vmDisks, previousDisks = []) => {
-      const previousByUnit = Object.fromEntries(previousDisks.map((disk) => [disk.unit, disk]));
-
-      return vmDisks.map((disk, index) => {
-        const unit = disk.unit !== null && disk.unit !== undefined ? String(disk.unit) : String(index);
-        const existing = previousByUnit[unit];
-        const diskType = disk.disk_type || (index === 0 ? "os" : "data");
-
-        return {
-          unit,
-          label: disk.label || `Disk ${index + 1}`,
-          sizeGb: disk.size_gb,
-          sizeText: disk.size_gb ? `${disk.size_gb} GB` : "-",
-          datastore: disk.datastore || "-",
-          diskType,
-          storageid: existing?.storageid || form.boot_storageid || "",
-          diskofferingid: diskType === "os" ? "" : existing?.diskofferingid || "",
-        };
-      });
-    },
-    [form.boot_storageid]
+  const defaultSelections = useMemo(
+    () => ({
+      zoneid: zones[0]?.id || "",
+      clusterid: clusters[0]?.id || "",
+      networkid: networks[0]?.id || "",
+      serviceofferingid: serviceOfferings[0]?.id || "",
+      boot_storageid: storagePools[0]?.id || "",
+    }),
+    [clusters, networks, serviceOfferings, storagePools, zones]
   );
 
-  const pickValidOrFirst = useCallback((currentId, items) => {
-    if (!items.length) {
-      return "";
-    }
-    return items.some((item) => item.id === currentId) ? currentId : items[0].id;
-  }, []);
-
-  const mapInventoryDisks = useCallback((vmDisks, bootStorageId) => {
-    return vmDisks.map((disk, index) => {
+  const mapInventoryDisks = useCallback((vmDisks, bootStorageId, previousDisks = []) => {
+    const prevByUnit = Object.fromEntries((previousDisks || []).map((disk) => [disk.unit, disk]));
+    return (vmDisks || []).map((disk, index) => {
       const unit = disk.unit !== null && disk.unit !== undefined ? String(disk.unit) : String(index);
+      const prev = prevByUnit[unit];
+      const diskType = disk.disk_type || (index === 0 ? "os" : "data");
       return {
         unit,
         label: disk.label || `Disk ${index + 1}`,
         sizeGb: disk.size_gb,
         sizeText: disk.size_gb ? `${disk.size_gb} GB` : "-",
         datastore: disk.datastore || "-",
-        diskType: disk.disk_type || (index === 0 ? "os" : "data"),
-        storageid: bootStorageId || "",
-        diskofferingid: "",
+        diskType,
+        storageid: diskType === "os" ? bootStorageId || "" : prev?.storageid || bootStorageId || "",
+        diskofferingid: diskType === "os" ? "" : prev?.diskofferingid || "",
       };
     });
   }, []);
+
+  const mapInventoryNics = useCallback((vmNics, defaultNetworkId, previousNics = []) => {
+    const prevByID = Object.fromEntries((previousNics || []).map((nic) => [nic.id, nic]));
+    return (vmNics || []).map((nic, index) => {
+      const id = String(nic.device_key ?? index);
+      const prev = prevByID[id];
+      return {
+        id,
+        source_label: nic.label || `NIC ${index + 1}`,
+        source_network: nic.network || "",
+        source_mac: nic.mac_address || "",
+        source_device_key: nic.device_key ?? 0,
+        source_index: nic.index ?? index,
+        networkid: prev?.networkid || defaultNetworkId || "",
+      };
+    });
+  }, []);
+
+  const buildDraftForVm = useCallback(
+    (vm, template = null) => {
+      const base = template
+        ? {
+            zoneid: template.zoneid || defaultSelections.zoneid,
+            clusterid: template.clusterid || defaultSelections.clusterid,
+            networkid: template.networkid || defaultSelections.networkid,
+            serviceofferingid: template.serviceofferingid || defaultSelections.serviceofferingid,
+            boot_storageid: template.boot_storageid || defaultSelections.boot_storageid,
+            migration: normalizeMigration(template.migration),
+          }
+        : {
+            ...defaultSelections,
+            migration: normalizeMigration(),
+          };
+      return {
+        vm_name: vm.name,
+        vm_moref: vm.moref || "",
+        zoneid: base.zoneid,
+        clusterid: base.clusterid,
+        networkid: base.networkid,
+        serviceofferingid: base.serviceofferingid,
+        boot_storageid: base.boot_storageid,
+        migration: base.migration,
+        disks: mapInventoryDisks(vm.disks || [], base.boot_storageid, template?.disks || []),
+        nics: mapInventoryNics(vm.nics || [], base.networkid, template?.nics || []),
+      };
+    },
+    [defaultSelections, mapInventoryDisks, mapInventoryNics]
+  );
+
+  useEffect(() => {
+    const vmNames = new Set(vmwareVms.map((vm) => vm.name));
+    setSelectedVmNames((prev) => {
+      const filtered = prev.filter((name) => vmNames.has(name));
+      if (filtered.length > 0) return filtered;
+      return vmwareVms[0] ? [vmwareVms[0].name] : [];
+    });
+    setVmSpecsByName((prev) => {
+      const next = {};
+      Object.keys(prev).forEach((name) => {
+        if (vmNames.has(name)) next[name] = prev[name];
+      });
+      return next;
+    });
+  }, [vmwareVms]);
+
+  useEffect(() => {
+    if (!selectedVmNames.includes(activeVmName)) setActiveVmName(selectedVmNames[0] || "");
+  }, [activeVmName, selectedVmNames]);
+
+  useEffect(() => {
+    if (!selectedVmNames.length) return;
+    setVmSpecsByName((prev) => {
+      const next = { ...prev };
+      let changed = false;
+      const templateName = selectedVmNames.find((name) => !!next[name]);
+      const template = templateName ? next[templateName] : null;
+      selectedVmNames.forEach((vmName) => {
+        if (next[vmName]) return;
+        const vm = vmwareVms.find((item) => item.name === vmName);
+        if (!vm) return;
+        next[vmName] = buildDraftForVm(vm, template);
+        changed = true;
+      });
+      return changed ? next : prev;
+    });
+  }, [buildDraftForVm, selectedVmNames, vmwareVms]);
+
+  const activeDraft = activeVmName ? vmSpecsByName[activeVmName] || null : null;
+  const activeValidation = useMemo(() => validateDraft(activeDraft), [activeDraft]);
+
+  const canStartMigration = useMemo(() => {
+    if (busy || selectedVmNames.length === 0) return false;
+    return selectedVmNames.every((vmName) => validateDraft(vmSpecsByName[vmName]).valid);
+  }, [busy, selectedVmNames, vmSpecsByName]);
+
+  const updateActiveDraft = useCallback(
+    (updater) => {
+      if (!activeVmName) return;
+      setVmSpecsByName((prev) => {
+        const current = prev[activeVmName];
+        if (!current) return prev;
+        return { ...prev, [activeVmName]: updater(current) };
+      });
+    },
+    [activeVmName]
+  );
 
   const loadInventory = useCallback(async () => {
     setInventoryBusy(true);
@@ -262,43 +356,21 @@ export default function App() {
         { key: "clusters", label: "CloudStack clusters", path: "/cloudstack/clusters", headers: cloudstackHeaders },
         { key: "storage", label: "CloudStack storage", path: "/cloudstack/storage", headers: cloudstackHeaders },
         { key: "networks", label: "CloudStack networks", path: "/cloudstack/networks", headers: cloudstackHeaders },
-        {
-          key: "serviceOfferings",
-          label: "CloudStack service offerings",
-          path: "/cloudstack/serviceofferings",
-          headers: cloudstackHeaders,
-        },
-        {
-          key: "diskOfferings",
-          label: "CloudStack disk offerings",
-          path: "/cloudstack/diskofferings",
-          headers: cloudstackHeaders,
-        },
+        { key: "serviceOfferings", label: "CloudStack service offerings", path: "/cloudstack/serviceofferings", headers: cloudstackHeaders },
+        { key: "diskOfferings", label: "CloudStack disk offerings", path: "/cloudstack/diskofferings", headers: cloudstackHeaders },
       ];
-
       const responses = await Promise.all(
         requests.map(async (req) => {
           try {
             const data = await apiRequest(req.path, { headers: req.headers });
-            return {
-              key: req.key,
-              label: req.label,
-              data: Array.isArray(data) ? data : [],
-              error: "",
-            };
+            return { key: req.key, label: req.label, data: Array.isArray(data) ? data : [], error: "" };
           } catch (err) {
-            return {
-              key: req.key,
-              label: req.label,
-              data: [],
-              error: err?.message || "request failed",
-            };
+            return { key: req.key, label: req.label, data: [], error: err?.message || "request failed" };
           }
         })
       );
-
       const byKey = Object.fromEntries(responses.map((item) => [item.key, item]));
-      const vms = byKey.vms?.data || [];
+      const vmList = byKey.vms?.data || [];
       const zoneList = byKey.zones?.data || [];
       const clusterList = byKey.clusters?.data || [];
       const storageList = byKey.storage?.data || [];
@@ -306,7 +378,7 @@ export default function App() {
       const serviceList = byKey.serviceOfferings?.data || [];
       const diskOfferingList = byKey.diskOfferings?.data || [];
 
-      setVmwareVms(vms);
+      setVmwareVms(vmList);
       setZones(zoneList);
       setClusters(clusterList);
       setStoragePools(storageList);
@@ -314,68 +386,75 @@ export default function App() {
       setServiceOfferings(serviceList);
       setDiskOfferings(diskOfferingList);
 
+      setVmSpecsByName((prev) => {
+        const next = { ...prev };
+        let changed = false;
+        Object.keys(next).forEach((name) => {
+          const draft = next[name];
+          const vm = vmList.find((item) => item.name === name);
+          if (!draft || !vm) return;
+          const updated = {
+            ...draft,
+            vm_name: vm.name,
+            vm_moref: vm.moref || draft.vm_moref || "",
+            zoneid: pickValidOrFirst(draft.zoneid, zoneList),
+            clusterid: pickValidOrFirst(draft.clusterid, clusterList),
+            networkid: pickValidOrFirst(draft.networkid, networkList),
+            serviceofferingid: pickValidOrFirst(draft.serviceofferingid, serviceList),
+            boot_storageid: pickValidOrFirst(draft.boot_storageid, storageList),
+            migration: normalizeMigration(draft.migration),
+          };
+          updated.disks = mapInventoryDisks(vm.disks || [], updated.boot_storageid, draft.disks || []);
+          updated.nics = mapInventoryNics(vm.nics || [], updated.networkid, draft.nics || []);
+          next[name] = updated;
+          changed = true;
+        });
+        return changed ? next : prev;
+      });
+
       const failures = responses.filter((item) => item.error);
       if (failures.length) {
         const msg = failures.map((item) => `${item.label}: ${item.error}`).join(" | ");
         pushToast("error", msg);
       }
-
-      setForm((prev) => {
-        const nextVmName = vms.some((vm) => vm.name === prev.vm_name) ? prev.vm_name : vms[0]?.name || "";
-        const vmForSelection = vms.find((vm) => vm.name === nextVmName);
-        const nextBootStorage = pickValidOrFirst(prev.boot_storageid, storageList);
-
-        setDetectedDisks(vmForSelection ? mapInventoryDisks(vmForSelection.disks || [], nextBootStorage) : []);
-
-        return {
-          ...prev,
-          vm_name: nextVmName,
-          vm_moref: vmForSelection?.moref || "",
-          zoneid: pickValidOrFirst(prev.zoneid, zoneList),
-          clusterid: pickValidOrFirst(prev.clusterid, clusterList),
-          networkid: pickValidOrFirst(prev.networkid, networkList),
-          serviceofferingid: pickValidOrFirst(prev.serviceofferingid, serviceList),
-          boot_storageid: nextBootStorage,
-        };
-      });
     } finally {
       setInventoryBusy(false);
     }
-  }, [cloudstackHeaders, mapInventoryDisks, pickValidOrFirst, pushToast, vmwareHeaders]);
+  }, [cloudstackHeaders, mapInventoryDisks, mapInventoryNics, pushToast, vmwareHeaders]);
 
-  const detectVmDisks = useCallback(
-    async (vmNameOverride = null) => {
-      const targetVmName = vmNameOverride || form.vm_name;
-      if (!targetVmName) {
-        return;
-      }
-
-      setVmDisksLoading(true);
-      try {
-        const vms = await apiRequest("/vmware/vms", { headers: vmwareHeaders });
-        setVmwareVms(vms);
-
-        const selectedVm = vms.find((vm) => vm.name === targetVmName);
-        if (!selectedVm) {
-          setDetectedDisks([]);
-          pushToast("error", `VM ${targetVmName} not found in vCenter.`);
-          return;
-        }
-
-        setForm((prev) => ({
-          ...prev,
-          vm_moref: selectedVm.moref || prev.vm_moref || "",
-        }));
-
-        setDetectedDisks((prevDisks) => mapDetectedDisks(selectedVm.disks || [], prevDisks));
-      } catch (err) {
-        pushToast("error", err.message || "Failed to detect VM disks.");
-      } finally {
-        setVmDisksLoading(false);
-      }
-    },
-    [form.vm_name, mapDetectedDisks, pushToast, vmwareHeaders]
-  );
+  const refreshSelectedVmDetails = useCallback(async () => {
+    if (selectedVmNames.length === 0) {
+      pushToast("error", "Select at least one VM to refresh.");
+      return;
+    }
+    setVmDisksLoading(true);
+    try {
+      const vms = await apiRequest("/vmware/vms", { headers: vmwareHeaders });
+      setVmwareVms(vms);
+      const missing = [];
+      setVmSpecsByName((prev) => {
+        const next = { ...prev };
+        selectedVmNames.forEach((name) => {
+          const vm = vms.find((item) => item.name === name);
+          if (!vm) {
+            missing.push(name);
+            return;
+          }
+          const current = next[name] || buildDraftForVm(vm);
+          const updated = { ...current, vm_name: vm.name, vm_moref: vm.moref || current.vm_moref || "" };
+          updated.disks = mapInventoryDisks(vm.disks || [], updated.boot_storageid, current.disks || []);
+          updated.nics = mapInventoryNics(vm.nics || [], updated.networkid, current.nics || []);
+          next[name] = updated;
+        });
+        return next;
+      });
+      if (missing.length > 0) pushToast("error", `VMs not found: ${missing.join(", ")}`);
+    } catch (err) {
+      pushToast("error", err.message || "Failed to refresh selected VMs.");
+    } finally {
+      setVmDisksLoading(false);
+    }
+  }, [buildDraftForVm, mapInventoryDisks, mapInventoryNics, pushToast, selectedVmNames, vmwareHeaders]);
 
   const refreshJobs = useCallback(async () => {
     try {
@@ -388,10 +467,7 @@ export default function App() {
 
   const pollStatuses = useCallback(async () => {
     const vmNames = uniqueByVm(jobs);
-    if (!vmNames.length) {
-      return;
-    }
-
+    if (!vmNames.length) return;
     try {
       const responses = await Promise.all(
         vmNames.map(async (vmName) => {
@@ -403,51 +479,38 @@ export default function App() {
           }
         })
       );
-
       const updates = {};
       responses.forEach(([vmName, payload]) => {
-        if (payload) {
-          updates[vmName] = payload;
-        }
+        if (payload) updates[vmName] = payload;
       });
-
-      if (Object.keys(updates).length) {
-        setStatusByVm((prev) => ({ ...prev, ...updates }));
-      }
+      if (Object.keys(updates).length > 0) setStatusByVm((prev) => ({ ...prev, ...updates }));
     } catch {
-      // keep silent to avoid noisy polling toasts
+      // silence polling failures
     }
   }, [jobs]);
 
-  const loadLogsForJob = useCallback(async (job) => {
-    if (!job) {
-      return;
-    }
-
-    setLogsBusy(true);
-    try {
-      const response = await apiRequest(
-        `/migration/logs/${encodeURIComponent(job.vm_name)}?job_id=${encodeURIComponent(job.job_id)}&lines=300`
-      );
-      setLogs(response);
-    } catch (err) {
-      pushToast("error", err.message || "Failed to load logs.");
-    } finally {
-      setLogsBusy(false);
-    }
-  }, [pushToast]);
+  const loadLogsForJob = useCallback(
+    async (job) => {
+      if (!job) return;
+      setLogsBusy(true);
+      try {
+        const response = await apiRequest(
+          `/migration/logs/${encodeURIComponent(job.vm_name)}?job_id=${encodeURIComponent(job.job_id)}&lines=300`
+        );
+        setLogs(response);
+      } catch (err) {
+        pushToast("error", err.message || "Failed to load logs.");
+      } finally {
+        setLogsBusy(false);
+      }
+    },
+    [pushToast]
+  );
 
   useEffect(() => {
     loadInventory();
     refreshJobs();
   }, [loadInventory, refreshJobs]);
-
-  useEffect(() => {
-    if (!form.vm_name) {
-      return;
-    }
-    detectVmDisks(form.vm_name);
-  }, [form.vm_name, detectVmDisks]);
 
   useEffect(() => {
     const interval = setInterval(refreshJobs, 8000);
@@ -461,120 +524,183 @@ export default function App() {
   }, [pollStatuses]);
 
   useEffect(() => {
-    if (!selectedJob) {
-      return;
-    }
-
+    if (!selectedJob) return;
     loadLogsForJob(selectedJob);
     const interval = setInterval(() => loadLogsForJob(selectedJob), 2000);
     return () => clearInterval(interval);
   }, [selectedJob, loadLogsForJob]);
 
-  const updateField = (field, value) => {
-    setForm((prev) => ({ ...prev, [field]: value }));
-  };
+  const updateField = useCallback(
+    (field, value) => {
+      updateActiveDraft((draft) => {
+        const next = { ...draft, [field]: value };
+        if (field === "boot_storageid") {
+          next.disks = (draft.disks || []).map((disk) =>
+            disk.diskType === "os" ? { ...disk, storageid: value } : disk
+          );
+        }
+        if (field === "networkid") {
+          next.nics = (draft.nics || []).map((nic) => (nic.networkid ? nic : { ...nic, networkid: value }));
+        }
+        return next;
+      });
+    },
+    [updateActiveDraft]
+  );
 
-  const updateMigrationField = (field, value) => {
-    setForm((prev) => ({
-      ...prev,
-      migration: {
-        ...prev.migration,
-        [field]: value,
-      },
-    }));
-  };
+  const updateMigrationField = useCallback(
+    (field, value) => {
+      updateActiveDraft((draft) => ({
+        ...draft,
+        migration: {
+          ...normalizeMigration(draft.migration),
+          [field]: value,
+        },
+      }));
+    },
+    [updateActiveDraft]
+  );
 
-  const updateDisk = (unit, field, value) => {
-    setDetectedDisks((prev) => prev.map((disk) => (disk.unit === unit ? { ...disk, [field]: value } : disk)));
-  };
+  const updateDisk = useCallback(
+    (unit, field, value) => {
+      updateActiveDraft((draft) => ({
+        ...draft,
+        disks: (draft.disks || []).map((disk) => (disk.unit === unit ? { ...disk, [field]: value } : disk)),
+      }));
+    },
+    [updateActiveDraft]
+  );
 
-  const buildSpecPayload = () => {
-    const disks = {};
-    detectedDisks.forEach((disk) => {
-      if (disk.diskType === "os") {
-        return;
+  const updateNic = useCallback(
+    (id, field, value) => {
+      updateActiveDraft((draft) => ({
+        ...draft,
+        nics: (draft.nics || []).map((nic) => (nic.id === id ? { ...nic, [field]: value } : nic)),
+      }));
+    },
+    [updateActiveDraft]
+  );
+
+  const toggleVmSelection = useCallback((vmName, checked) => {
+    setSelectedVmNames((prev) => {
+      if (checked) {
+        if (prev.includes(vmName)) return prev;
+        return [...prev, vmName];
       }
+      return prev.filter((name) => name !== vmName);
+    });
+  }, []);
+
+  const selectAllVms = useCallback(() => setSelectedVmNames(vmwareVms.map((vm) => vm.name)), [vmwareVms]);
+  const clearVmSelection = useCallback(() => setSelectedVmNames([]), []);
+
+  const buildSpecPayload = useCallback((draft) => {
+    const disks = {};
+    (draft.disks || []).forEach((disk) => {
+      if (disk.diskType === "os") return;
       disks[disk.unit] = {
-        storageid: disk.storageid || form.boot_storageid,
+        storageid: disk.storageid || draft.boot_storageid,
         diskofferingid: disk.diskofferingid,
       };
     });
 
-    const migration = {
-      delta_interval: Number(form.migration.delta_interval) || 300,
-    };
+    const nicMappings = {};
+    (draft.nics || []).forEach((nic) => {
+      nicMappings[nic.id] = {
+        source_label: nic.source_label || "",
+        source_network: nic.source_network || "",
+        source_mac: nic.source_mac || "",
+        source_device_key: Number(nic.source_device_key) || 0,
+        source_index: Number(nic.source_index) || 0,
+        networkid: nic.networkid || "",
+      };
+    });
 
-    if (form.migration.finalize_at) {
-      migration.finalize_at = form.migration.finalize_at;
-    }
-    if (form.migration.finalize_delta_interval) {
-      migration.finalize_delta_interval = Number(form.migration.finalize_delta_interval);
-    }
-    if (form.migration.finalize_window) {
-      migration.finalize_window = Number(form.migration.finalize_window);
-    }
-    if (form.migration.shutdown_mode) {
-      migration.shutdown_mode = form.migration.shutdown_mode;
-    }
-    if (form.migration.snapshot_quiesce) {
-      migration.snapshot_quiesce = form.migration.snapshot_quiesce;
-    }
+    const migration = {
+      delta_interval: Number(draft.migration?.delta_interval) || 300,
+    };
+    if (draft.migration?.finalize_at) migration.finalize_at = draft.migration.finalize_at;
+    if (draft.migration?.finalize_delta_interval) migration.finalize_delta_interval = Number(draft.migration.finalize_delta_interval);
+    if (draft.migration?.finalize_window) migration.finalize_window = Number(draft.migration.finalize_window);
+    if (draft.migration?.shutdown_mode) migration.shutdown_mode = draft.migration.shutdown_mode;
+    if (draft.migration?.snapshot_quiesce) migration.snapshot_quiesce = draft.migration.snapshot_quiesce;
 
     return {
-      vm_name: form.vm_name,
-      vm_moref: form.vm_moref,
-      zoneid: form.zoneid,
-      clusterid: form.clusterid,
-      networkid: form.networkid,
-      serviceofferingid: form.serviceofferingid,
-      boot_storageid: form.boot_storageid,
+      vm_name: draft.vm_name,
+      vm_moref: draft.vm_moref,
+      zoneid: draft.zoneid,
+      clusterid: draft.clusterid,
+      networkid: draft.networkid,
+      serviceofferingid: draft.serviceofferingid,
+      boot_storageid: draft.boot_storageid,
       disks,
+      nic_mappings: nicMappings,
       migration,
     };
-  };
+  }, []);
 
-  const createSpec = async (startAfter) => {
-    if (!canStartMigration) {
-      pushToast("error", "Please resolve validation errors before starting migration.");
-      return;
-    }
-
-    setBusy(true);
-    try {
-      const specResp = await apiRequest("/migration/spec", {
-        method: "POST",
-        headers: vmwareHeaders,
-        body: JSON.stringify(buildSpecPayload()),
-      });
-
-      setLastSpecFile(specResp.spec_file);
-      pushToast("success", `Spec generated: ${specResp.spec_file}`);
-
-      if (startAfter) {
-        const startResp = await apiRequest("/migration/start", {
-          method: "POST",
-          body: JSON.stringify({ vm_name: form.vm_name, spec_file: specResp.spec_file }),
-        });
-
-        pushToast("success", `Migration started: ${startResp.job_id}`);
-        setTab("progress");
-        refreshJobs();
+  const createSpec = useCallback(
+    async (startAfter) => {
+      if (selectedVmNames.length === 0) {
+        pushToast("error", "Select at least one VM.");
+        return;
       }
-    } catch (err) {
-      pushToast("error", err.message || "Failed to generate/start migration.");
-    } finally {
-      setBusy(false);
-    }
-  };
+      const invalid = selectedVmNames
+        .map((vmName) => ({ vmName, validation: validateDraft(vmSpecsByName[vmName]) }))
+        .find((item) => !item.validation.valid);
+      if (invalid) {
+        setActiveVmName(invalid.vmName);
+        pushToast("error", `${invalid.vmName}: ${invalid.validation.message || "Invalid VM spec"}`);
+        return;
+      }
 
-  const finalizeVm = async (vmName) => {
-    try {
-      const response = await apiRequest(`/migration/finalize/${encodeURIComponent(vmName)}`, { method: "POST" });
-      pushToast("success", response.message);
-    } catch (err) {
-      pushToast("error", err.message || "Failed to finalize migration.");
-    }
-  };
+      setBusy(true);
+      try {
+        const specFiles = [];
+        const startedJobs = [];
+        for (const vmName of selectedVmNames) {
+          const draft = vmSpecsByName[vmName];
+          const specResp = await apiRequest("/migration/spec", {
+            method: "POST",
+            headers: { ...vmwareHeaders, ...cloudstackHeaders },
+            body: JSON.stringify(buildSpecPayload(draft)),
+          });
+          specFiles.push(specResp.spec_file);
+          if (startAfter) {
+            const startResp = await apiRequest("/migration/start", {
+              method: "POST",
+              body: JSON.stringify({ vm_name: vmName, spec_file: specResp.spec_file }),
+            });
+            startedJobs.push(startResp.job_id);
+          }
+        }
+        setLastSpecFile(specFiles.join("\n"));
+        pushToast("success", `Generated ${specFiles.length} spec file(s).`);
+        if (startAfter) {
+          pushToast("success", `Started ${startedJobs.length} migration job(s).`);
+          setTab("progress");
+          refreshJobs();
+        }
+      } catch (err) {
+        pushToast("error", err.message || "Failed to generate/start migration.");
+      } finally {
+        setBusy(false);
+      }
+    },
+    [buildSpecPayload, cloudstackHeaders, pushToast, refreshJobs, selectedVmNames, vmSpecsByName, vmwareHeaders]
+  );
+
+  const finalizeVm = useCallback(
+    async (vmName) => {
+      try {
+        const response = await apiRequest(`/migration/finalize/${encodeURIComponent(vmName)}`, { method: "POST" });
+        pushToast("success", response.message);
+      } catch (err) {
+        pushToast("error", err.message || "Failed to finalize migration.");
+      }
+    },
+    [pushToast]
+  );
 
   const selectedVmStatus = selectedJob ? statusByVm[selectedJob.vm_name] : null;
 
@@ -583,7 +709,7 @@ export default function App() {
       <header className="topbar">
         <div>
           <h1>VMware to CloudStack Migrator</h1>
-          <p>Auto-detect VM disks, validate offerings, and monitor migration in real time.</p>
+          <p>Select multiple VMs, define per-VM disk and NIC mappings, and run migrations in parallel.</p>
         </div>
         <div className="tab-buttons">
           <button className={tab === "new" ? "active" : ""} onClick={() => setTab("new")}>New Migration</button>
@@ -593,9 +719,7 @@ export default function App() {
 
       <div className="toast-stack">
         {toasts.map((toast) => (
-          <div key={toast.id} className={`toast ${toast.type}`}>
-            {toast.message}
-          </div>
+          <div key={toast.id} className={`toast ${toast.type}`}>{toast.message}</div>
         ))}
       </div>
 
@@ -605,154 +729,71 @@ export default function App() {
 
           <VMSelector
             vmOptions={vmOptions}
-            vmName={form.vm_name}
-            vmMoref={form.vm_moref}
-            onVmChange={(value) => updateField("vm_name", value)}
-            onMorefChange={(value) => updateField("vm_moref", value)}
-            onDetectDisks={() => detectVmDisks(form.vm_name)}
+            selectedVmNames={selectedVmNames}
+            activeVmName={activeVmName}
+            onToggleVm={toggleVmSelection}
+            onSetActiveVm={setActiveVmName}
+            onSelectAll={selectAllVms}
+            onClearSelection={clearVmSelection}
+            onRefreshSelected={refreshSelectedVmDetails}
             loading={vmDisksLoading}
           />
 
-          <section className="panel">
-            <div className="subsection-title-row">
-              <h2>Target and Strategy</h2>
-              <button className="secondary" onClick={loadInventory} disabled={inventoryBusy}>
-                {inventoryBusy ? "Loading..." : "Reload Inventory"}
-              </button>
-            </div>
+          {activeDraft ? (
+            <>
+              <section className="panel">
+                <div className="subsection-title-row">
+                  <h2>Target and Strategy ({activeDraft.vm_name})</h2>
+                  <button className="secondary" onClick={loadInventory} disabled={inventoryBusy}>
+                    {inventoryBusy ? "Loading..." : "Reload Inventory"}
+                  </button>
+                </div>
+                <div className="form-grid">
+                  <label>VM MoRef<input value={activeDraft.vm_moref} onChange={(e) => updateField("vm_moref", e.target.value)} placeholder="vm-123" /></label>
+                  <label>Zone<select value={activeDraft.zoneid} onChange={(e) => updateField("zoneid", e.target.value)}><option value="">Select zone</option>{zones.map((item) => <option key={item.id} value={item.id}>{optionLabel(item)}</option>)}</select></label>
+                  <label>Cluster<select value={activeDraft.clusterid} onChange={(e) => updateField("clusterid", e.target.value)}><option value="">Select cluster</option>{clusters.map((item) => <option key={item.id} value={item.id}>{optionLabel(item)}</option>)}</select></label>
+                  <label>Fallback Network<select value={activeDraft.networkid} onChange={(e) => updateField("networkid", e.target.value)}><option value="">Select network</option>{networks.map((item) => <option key={item.id} value={item.id}>{optionLabel(item)}</option>)}</select></label>
+                  <label>Service Offering<select value={activeDraft.serviceofferingid} onChange={(e) => updateField("serviceofferingid", e.target.value)}><option value="">Select service offering</option>{serviceOfferings.map((item) => <option key={item.id} value={item.id}>{optionLabel(item)}</option>)}</select></label>
+                  <label>Boot Storage<select value={activeDraft.boot_storageid} onChange={(e) => updateField("boot_storageid", e.target.value)}><option value="">Select boot storage</option>{storagePools.map((item) => <option key={item.id} value={item.id}>{optionLabel(item)}</option>)}</select></label>
+                  <label>Delta Interval (sec)<input type="number" min="1" value={activeDraft.migration.delta_interval} onChange={(e) => updateMigrationField("delta_interval", e.target.value)} /></label>
+                  <label>Finalize At (ISO)<input value={activeDraft.migration.finalize_at} onChange={(e) => updateMigrationField("finalize_at", e.target.value)} placeholder="2026-03-12T23:30:00+00:00" /></label>
+                  <label>Finalize Delta Interval<input type="number" min="1" value={activeDraft.migration.finalize_delta_interval} onChange={(e) => updateMigrationField("finalize_delta_interval", e.target.value)} /></label>
+                  <label>Finalize Window<input type="number" min="1" value={activeDraft.migration.finalize_window} onChange={(e) => updateMigrationField("finalize_window", e.target.value)} /></label>
+                  <label>Shutdown Mode<input value={activeDraft.migration.shutdown_mode} onChange={(e) => updateMigrationField("shutdown_mode", e.target.value)} placeholder="auto" /></label>
+                  <label>Snapshot Quiesce<input value={activeDraft.migration.snapshot_quiesce} onChange={(e) => updateMigrationField("snapshot_quiesce", e.target.value)} placeholder="auto" /></label>
+                </div>
+              </section>
 
-            <div className="form-grid">
-              <label>
-                Zone
-                <select value={form.zoneid} onChange={(e) => updateField("zoneid", e.target.value)}>
-                  <option value="">Select zone</option>
-                  {zones.map((item) => (
-                    <option key={item.id} value={item.id}>{optionLabel(item)}</option>
-                  ))}
-                </select>
-              </label>
+              <DiskTable
+                disks={activeDraft.disks || []}
+                storagePools={storagePools}
+                diskOfferings={diskOfferings}
+                onDiskChange={updateDisk}
+                validationByUnit={activeValidation.diskErrors}
+              />
 
-              <label>
-                Cluster
-                <select value={form.clusterid} onChange={(e) => updateField("clusterid", e.target.value)}>
-                  <option value="">Select cluster</option>
-                  {clusters.map((item) => (
-                    <option key={item.id} value={item.id}>{optionLabel(item)}</option>
-                  ))}
-                </select>
-              </label>
+              <NicTable
+                nics={activeDraft.nics || []}
+                networks={networks}
+                fallbackNetworkId={activeDraft.networkid}
+                onNicChange={updateNic}
+                validationByNic={activeValidation.nicErrors}
+              />
 
-              <label>
-                Network
-                <select value={form.networkid} onChange={(e) => updateField("networkid", e.target.value)}>
-                  <option value="">Select network</option>
-                  {networks.map((item) => (
-                    <option key={item.id} value={item.id}>{optionLabel(item)}</option>
-                  ))}
-                </select>
-              </label>
-
-              <label>
-                Service Offering
-                <select value={form.serviceofferingid} onChange={(e) => updateField("serviceofferingid", e.target.value)}>
-                  <option value="">Select service offering</option>
-                  {serviceOfferings.map((item) => (
-                    <option key={item.id} value={item.id}>{optionLabel(item)}</option>
-                  ))}
-                </select>
-              </label>
-
-              <label>
-                Boot Storage
-                <select value={form.boot_storageid} onChange={(e) => updateField("boot_storageid", e.target.value)}>
-                  <option value="">Select boot storage</option>
-                  {storagePools.map((item) => (
-                    <option key={item.id} value={item.id}>{optionLabel(item)}</option>
-                  ))}
-                </select>
-              </label>
-
-              <label>
-                Delta Interval (sec)
-                <input
-                  type="number"
-                  min="1"
-                  value={form.migration.delta_interval}
-                  onChange={(e) => updateMigrationField("delta_interval", e.target.value)}
-                />
-              </label>
-
-              <label>
-                Finalize At (ISO)
-                <input
-                  value={form.migration.finalize_at}
-                  onChange={(e) => updateMigrationField("finalize_at", e.target.value)}
-                  placeholder="2026-03-12T23:30:00+00:00"
-                />
-              </label>
-
-              <label>
-                Finalize Delta Interval
-                <input
-                  type="number"
-                  min="1"
-                  value={form.migration.finalize_delta_interval}
-                  onChange={(e) => updateMigrationField("finalize_delta_interval", e.target.value)}
-                />
-              </label>
-
-              <label>
-                Finalize Window
-                <input
-                  type="number"
-                  min="1"
-                  value={form.migration.finalize_window}
-                  onChange={(e) => updateMigrationField("finalize_window", e.target.value)}
-                />
-              </label>
-
-              <label>
-                Shutdown Mode
-                <input
-                  value={form.migration.shutdown_mode}
-                  onChange={(e) => updateMigrationField("shutdown_mode", e.target.value)}
-                  placeholder="auto"
-                />
-              </label>
-
-              <label>
-                Snapshot Quiesce
-                <input
-                  value={form.migration.snapshot_quiesce}
-                  onChange={(e) => updateMigrationField("snapshot_quiesce", e.target.value)}
-                  placeholder="auto"
-                />
-              </label>
-            </div>
-          </section>
-
-          <DiskTable
-            disks={detectedDisks}
-            storagePools={storagePools}
-            diskOfferings={diskOfferings}
-            onDiskChange={updateDisk}
-            validationByUnit={validationByUnit}
-          />
-
-          <section className="panel">
-            <div className="actions">
-              <button disabled={busy || !form.vm_name} onClick={() => createSpec(false)}>
-                Generate Spec
-              </button>
-              <button disabled={!canStartMigration} onClick={() => createSpec(true)}>
-                Start Migration
-              </button>
-            </div>
-            {Object.keys(validationByUnit).length > 0 ? (
-              <p className="field-error">Complete required disk offerings for all data disks before starting.</p>
-            ) : null}
-            {lastSpecFile ? <p className="hint">Last generated spec: <code>{lastSpecFile}</code></p> : null}
-          </section>
+              <section className="panel">
+                <div className="actions">
+                  <button disabled={busy || selectedVmNames.length === 0} onClick={() => createSpec(false)}>Generate Spec ({selectedVmNames.length})</button>
+                  <button disabled={!canStartMigration} onClick={() => createSpec(true)}>Start Migration ({selectedVmNames.length})</button>
+                </div>
+                {!activeValidation.valid ? <p className="field-error">{activeValidation.message}</p> : null}
+                {lastSpecFile ? <p className="hint">Last generated spec(s):<br /><code className="inline-block">{lastSpecFile}</code></p> : null}
+              </section>
+            </>
+          ) : (
+            <section className="panel">
+              <p className="hint">Select one or more VMs to define per-VM migration specs.</p>
+            </section>
+          )}
         </>
       ) : (
         <MigrationProgress
@@ -770,20 +811,10 @@ export default function App() {
                 <h3>Logs</h3>
                 {logsBusy ? <span className="hint">Loading...</span> : null}
               </div>
-              {selectedJob ? (
-                <p className="hint">
-                  Job <code>{selectedJob.job_id}</code> | VM <strong>{selectedJob.vm_name}</strong>
-                </p>
-              ) : null}
+              {selectedJob ? <p className="hint">Job <code>{selectedJob.job_id}</code> | VM <strong>{selectedJob.vm_name}</strong></p> : null}
               <div className="logs-grid">
-                <div>
-                  <h4>STDOUT</h4>
-                  <pre>{logs.stdout || "No stdout logs available."}</pre>
-                </div>
-                <div>
-                  <h4>STDERR</h4>
-                  <pre>{logs.stderr || "No stderr logs available."}</pre>
-                </div>
+                <div><h4>STDOUT</h4><pre>{logs.stdout || "No stdout logs available."}</pre></div>
+                <div><h4>STDERR</h4><pre>{logs.stderr || "No stderr logs available."}</pre></div>
               </div>
               {selectedVmStatus?.job_error ? <p className="field-error">{selectedVmStatus.job_error}</p> : null}
             </div>
@@ -793,4 +824,3 @@ export default function App() {
     </div>
   );
 }
-
