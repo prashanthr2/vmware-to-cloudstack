@@ -827,7 +827,7 @@ func listVMwareInventory(ctx context.Context, client *govmomi.Client) ([]vmwareV
 
 	var vms []mo.VirtualMachine
 	pc := property.DefaultCollector(client.Client)
-	if err := pc.Retrieve(ctx, cv.Reference(), []string{
+	if err := pc.Retrieve(ctx, []types.ManagedObjectReference{cv.Reference()}, []string{
 		"name",
 		"config.hardware.numCPU",
 		"config.hardware.memoryMB",
@@ -851,7 +851,7 @@ func listVMwareInventory(ctx context.Context, client *govmomi.Client) ([]vmwareV
 			if !ok {
 				continue
 			}
-			unit := int(vd.UnitNumber)
+			unit := int(*vd.UnitNumber)
 			capacity := int64(vd.CapacityInBytes)
 			if capacity <= 0 && vd.CapacityInKB > 0 {
 				capacity = int64(vd.CapacityInKB) * 1024
@@ -982,7 +982,7 @@ func detectBootDiskUnit(cfg *types.VirtualMachineConfigInfo) *int {
 		if !ok {
 			continue
 		}
-		unit := int(vd.UnitNumber)
+		unit := int(*vd.UnitNumber)
 		keyToUnit[vd.Key] = unit
 		if minUnit < 0 || unit < minUnit {
 			minUnit = unit
