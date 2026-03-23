@@ -686,9 +686,9 @@ func runVirtV2VInPlace(path string, virtioISO string) error {
 		return fmt.Errorf("pre-v2v integrity check failed: %w", err)
 	}
 
-	v2vPath, err := exec.LookPath("virt-v2v-in-place")
+	v2vPath, err := resolveVirtV2VInPlacePath()
 	if err != nil {
-		return fmt.Errorf("virt-v2v-in-place not found: %w", err)
+		return err
 	}
 
 	runCmd := func(args []string) (string, error) {
@@ -724,6 +724,47 @@ func runVirtV2VInPlace(path string, virtioISO string) error {
 		return retryErr
 	}
 	return err
+}
+
+func resolveVirtV2VInPlacePath() (string, error) {
+	// Optional explicit override for environments where PATH differs
+	// between service shells and interactive shells.
+	for _, envKey := range []string{"VIRT_V2V_IN_PLACE", "V2C_VIRT_V2V_BIN"} {
+		if p := strings.TrimSpace(os.Getenv(envKey)); p != "" {
+			if isExecutableFile(p) {
+				return p, nil
+			}
+			return "", fmt.Errorf("%s is set but not executable: %s", envKey, p)
+		}
+	}
+
+	if p, err := exec.LookPath("virt-v2v-in-place"); err == nil {
+		return p, nil
+	}
+
+	for _, p := range []string{
+		"/usr/libexec/virt-v2v-in-place",
+		"/usr/bin/virt-v2v-in-place",
+	} {
+		if isExecutableFile(p) {
+			return p, nil
+		}
+	}
+
+	return "", fmt.Errorf(
+		"virt-v2v-in-place not found in PATH and not present at known locations (/usr/libexec/virt-v2v-in-place, /usr/bin/virt-v2v-in-place)",
+	)
+}
+
+func isExecutableFile(path string) bool {
+	info, err := os.Stat(path)
+	if err != nil {
+		return false
+	}
+	if info.IsDir() {
+		return false
+	}
+	return info.Mode()&0o111 != 0
 }
 
 func verifyImageBeforeV2V(path string) error {

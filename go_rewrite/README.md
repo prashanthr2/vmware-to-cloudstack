@@ -149,6 +149,31 @@ Use [spec.engine.example.yaml](./spec.engine.example.yaml) as the template for U
 Use [spec.run.example.yaml](./spec.run.example.yaml) as the template for full run-mode specs.
 Use [spec.run.multi.example.yaml](./spec.run.multi.example.yaml) for top-level `vms:` batch format.
 
+## Backend/GUI integration
+
+The existing FastAPI backend can launch Go directly (no frontend changes required) by setting:
+
+```yaml
+migration:
+  workdir: "/opt/vmware-to-cloudstack/go_rewrite"
+  python_bin: "/opt/vmware-to-cloudstack/go_rewrite/v2c-engine"
+  migrate_script: "run"
+  runtime_config_flag: "--config"
+  runtime_config: "/opt/vmware-to-cloudstack/go_rewrite/config.yaml"
+  spec_flag: "--spec"
+```
+
+Equivalent environment variables:
+
+```bash
+export MIGRATOR_WORKDIR=/opt/vmware-to-cloudstack/go_rewrite
+export MIGRATOR_PYTHON=/opt/vmware-to-cloudstack/go_rewrite/v2c-engine
+export MIGRATOR_SCRIPT=run
+export MIGRATOR_RUNTIME_CONFIG_FLAG=--config
+export MIGRATOR_RUNTIME_CONFIG=/opt/vmware-to-cloudstack/go_rewrite/config.yaml
+export MIGRATOR_SPEC_FLAG=--spec
+```
+
 ## Mapping from current Python flow
 
 - Replace Python `copy_disk_base(...)` with `v2c-engine base-copy`.
