@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import threading
@@ -39,12 +40,20 @@ class MigrationManager:
         migrate_script: str,
         command_cwd: Union[str, Path],
         max_workers: int,
+        migrate_args: Optional[list[str]] = None,
+        runtime_config_path: Optional[str] = None,
+        runtime_config_flag: Optional[str] = None,
+        spec_flag: str = "--spec",
     ) -> None:
         self.base_dir = Path(base_dir)
         self.specs_dir = Path(specs_dir)
         self.python_cmd = python_cmd
         self.migrate_script = migrate_script
         self.command_cwd = Path(command_cwd)
+        self.migrate_args = list(migrate_args or [])
+        self.runtime_config_path = runtime_config_path or ""
+        self.runtime_config_flag = runtime_config_flag or ""
+        self.spec_flag = spec_flag or "--spec"
 
         self.executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="migration-worker")
 
@@ -66,6 +75,28 @@ class MigrationManager:
 
         python_cmd = os.getenv("MIGRATOR_PYTHON", str(migration_cfg.get("python_bin", sys.executable)))
         migrate_script = os.getenv("MIGRATOR_SCRIPT", str(migration_cfg.get("migrate_script", "migrate.py")))
+        runtime_config_path = os.getenv(
+            "MIGRATOR_RUNTIME_CONFIG",
+            str(migration_cfg.get("runtime_config", "")),
+        )
+        runtime_config_flag = os.getenv(
+            "MIGRATOR_RUNTIME_CONFIG_FLAG",
+            str(migration_cfg.get("runtime_config_flag", "")),
+        )
+        spec_flag = os.getenv("MIGRATOR_SPEC_FLAG", str(migration_cfg.get("spec_flag", "--spec")))
+
+        raw_migrate_args = os.getenv("MIGRATOR_ARGS", "")
+        if not raw_migrate_args:
+            cfg_args = migration_cfg.get("migrate_args", [])
+            if isinstance(cfg_args, str):
+                raw_migrate_args = cfg_args
+                migrate_args: list[str] = shlex.split(raw_migrate_args)
+            elif isinstance(cfg_args, list):
+                migrate_args = [str(arg) for arg in cfg_args if str(arg)]
+            else:
+                migrate_args = []
+        else:
+            migrate_args = shlex.split(raw_migrate_args)
 
         default_workdir = migration_cfg.get("workdir", os.getcwd())
         command_cwd = os.getenv("MIGRATOR_WORKDIR", str(default_workdir))
@@ -80,6 +111,10 @@ class MigrationManager:
             migrate_script=migrate_script,
             command_cwd=command_cwd,
             max_workers=max_workers,
+            migrate_args=migrate_args,
+            runtime_config_path=runtime_config_path,
+            runtime_config_flag=runtime_config_flag,
+            spec_flag=spec_flag,
         )
 
     @staticmethod
@@ -559,18 +594,19 @@ class MigrationManager:
         stdout_path = vm_dir / f"{job.job_id}.stdout.log"
         stderr_path = vm_dir / f"{job.job_id}.stderr.log"
 
-        command = [
-            self.python_cmd,
-            self.migrate_script,
-            "--spec",
-            job.spec_file,
-        ]
+        command = [self.python_cmd]
+        if self.migrate_script:
+            command.append(self.migrate_script)
+        command.extend(self.migrate_args)
+        if self.runtime_config_path and self.runtime_config_flag:
+            command.extend([self.runtime_config_flag, self.runtime_config_path])
+        command.extend([self.spec_flag, job.spec_file])
 
         try:
             with stdout_path.open("w", encoding="utf-8") as stdout_file, stderr_path.open(
                 "w", encoding="utf-8"
             ) as stderr_file:
-                stdout_file.write("$ " + " ".join(command) + "\n")
+                stdout_file.write("$ " + " ".join(shlex.quote(part) for part in command) + "\n")
                 stdout_file.flush()
 
                 process = subprocess.Popen(

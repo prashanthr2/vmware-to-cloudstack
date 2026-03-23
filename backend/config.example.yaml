@@ -17,4 +17,17 @@ migration:
   workdir: "/opt/vmware-to-cloudstack"
   migrate_script: "migrate.py"
   python_bin: "python3"
+  # Optional extra args appended before spec flag.
+  # migrate_args: []
+  #
+  # Optional runtime config forwarding (useful for Go engine):
+  # runtime_config_flag: "--config"
+  # runtime_config: "/opt/vmware-to-cloudstack/config.yaml"
+  # spec_flag: "--spec"
+  #
+  # Example Go launcher:
+  # python_bin: "/opt/vmware-to-cloudstack/go_rewrite/v2c-engine"
+  # migrate_script: "run"
+  # runtime_config_flag: "--config"
+  # runtime_config: "/opt/vmware-to-cloudstack/go_rewrite/config.yaml"
   parallel_vms: 4
