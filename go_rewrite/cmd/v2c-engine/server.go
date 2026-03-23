@@ -825,7 +825,7 @@ func listVMwareInventory(ctx context.Context, client *govmomi.Client) ([]vmwareV
 	defer cv.Destroy(ctx)
 
 	var vms []mo.VirtualMachine
-	if err := cv.Retrieve(ctx, []string{
+	if err := cv.Retrieve(ctx, []string{"VirtualMachine"}, []string{
 		"name",
 		"config.hardware.numCPU",
 		"config.hardware.memoryMB",
