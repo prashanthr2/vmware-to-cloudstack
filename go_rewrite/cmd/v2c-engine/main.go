@@ -941,6 +941,9 @@ type appConfig struct {
 		ShutdownMode    string `yaml:"shutdown_mode"`
 		ParallelDisks   int    `yaml:"parallel_disks"`
 		ParallelVMs     int    `yaml:"parallel_vms"`
+		ControlDir      string `yaml:"control_dir"`
+		SpecsDir        string `yaml:"specs_dir"`
+		Workdir         string `yaml:"workdir"`
 	} `yaml:"migration"`
 	CloudStack struct {
 		Endpoint  string `yaml:"endpoint"`
@@ -3029,7 +3032,11 @@ func runVMWorkflow(ctx context.Context, cfg *appConfig, spec *runSpec, opts runO
 	}
 	vmMoref := vmObj.Reference().Value
 	migrationID := fmt.Sprintf("%s_%s", spec.VM.Name, vmMoref)
-	controlDir := filepath.Join("/var/lib/vm-migrator", migrationID)
+	controlRoot := strings.TrimSpace(cfg.Migration.ControlDir)
+	if controlRoot == "" {
+		controlRoot = "/var/lib/vm-migrator"
+	}
+	controlDir := filepath.Join(controlRoot, migrationID)
 	if err := os.MkdirAll(controlDir, 0o755); err != nil {
 		return err
 	}
@@ -3901,6 +3908,11 @@ func main() {
 			fmt.Fprintf(os.Stderr, "run failed: %v\n", err)
 			os.Exit(1)
 		}
+	case "serve":
+		if err := cmdServe(os.Args[2:]); err != nil {
+			fmt.Fprintf(os.Stderr, "serve failed: %v\n", err)
+			os.Exit(1)
+		}
 	case "base-copy":
 		if err := cmdBaseCopy(os.Args[2:]); err != nil {
 			fmt.Fprintf(os.Stderr, "base-copy failed: %v\n", err)
@@ -3920,6 +3932,7 @@ func main() {
 func usage() {
 	fmt.Fprintf(os.Stderr, "Usage:\n")
 	fmt.Fprintf(os.Stderr, "  v2c-engine run        --spec /path/spec.yaml [--spec /path/spec2.yaml] [--config /path/config.yaml]\n")
+	fmt.Fprintf(os.Stderr, "  v2c-engine serve      [--config /path/config.yaml] [--listen :8000]\n")
 	fmt.Fprintf(os.Stderr, "  v2c-engine base-copy  [flags]\n")
 	fmt.Fprintf(os.Stderr, "  v2c-engine delta-sync [flags]\n")
 	fmt.Fprintf(os.Stderr, "  v2c-engine base-copy --spec /path/spec.yaml\n")

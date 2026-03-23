@@ -1,3 +1,22 @@
+vcenter:
+  host: 10.0.35.3
+  user: administrator@vsphere.local
+  # Prefer passing password as env var VC_PASSWORD at runtime.
+  password: ""
+
+cloudstack:
+  endpoint: "http://cloudstack.example.com:8080/client/api"
+  api_key: "change-me"
+  secret_key: "change-me"
+
+cloudstack_defaults:
+  zoneid: ""
+  clusterid: ""
+  storageid: ""
+  networkid: ""
+  serviceofferingid: ""
+  diskofferingid: ""
+
 vddk:
   libdir: /opt/vmware-vddk/vmware-vix-disklib-distrib
   server: 10.0.35.3
@@ -19,6 +38,9 @@ engine:
 
 migration:
   # Optional orchestrator defaults for run mode.
+  control_dir: /var/lib/vm-migrator
+  specs_dir: /var/lib/vm-migrator/specs
+  workdir: /opt/vmware-to-cloudstack/go_rewrite
   shutdown_mode: auto # auto | force | manual
   parallel_disks: 4
   parallel_vms: 3

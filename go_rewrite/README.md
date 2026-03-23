@@ -98,6 +98,7 @@ export CGO_LDFLAGS="-L/opt/vmware-vddk/lib64 -lvixDiskLib -ldl -lpthread"
 ./v2c-engine run --spec ./spec.run.example.yaml --config ../config.yaml
 ./v2c-engine run --spec ./spec.run.example.yaml --spec ./another-vm.yaml --config ../config.yaml
 ./v2c-engine run --spec ./spec.run.multi.example.yaml --parallel-vms 3 --config ../config.yaml
+./v2c-engine serve --config ../config.yaml --listen :8000
 ./v2c-engine base-copy --spec ./spec.engine.example.yaml
 ./v2c-engine delta-sync --spec ./spec.engine.example.yaml
 ```
@@ -149,30 +150,39 @@ Use [spec.engine.example.yaml](./spec.engine.example.yaml) as the template for U
 Use [spec.run.example.yaml](./spec.run.example.yaml) as the template for full run-mode specs.
 Use [spec.run.multi.example.yaml](./spec.run.multi.example.yaml) for top-level `vms:` batch format.
 
-## Backend/GUI integration
+## GUI integration (pure Go)
 
-The existing FastAPI backend can launch Go directly (no frontend changes required) by setting:
-
-```yaml
-migration:
-  workdir: "/opt/vmware-to-cloudstack/go_rewrite"
-  python_bin: "/opt/vmware-to-cloudstack/go_rewrite/v2c-engine"
-  migrate_script: "run"
-  runtime_config_flag: "--config"
-  runtime_config: "/opt/vmware-to-cloudstack/go_rewrite/config.yaml"
-  spec_flag: "--spec"
-```
-
-Equivalent environment variables:
+The React UI can run directly against `v2c-engine serve` (no Python backend required):
 
 ```bash
-export MIGRATOR_WORKDIR=/opt/vmware-to-cloudstack/go_rewrite
-export MIGRATOR_PYTHON=/opt/vmware-to-cloudstack/go_rewrite/v2c-engine
-export MIGRATOR_SCRIPT=run
-export MIGRATOR_RUNTIME_CONFIG_FLAG=--config
-export MIGRATOR_RUNTIME_CONFIG=/opt/vmware-to-cloudstack/go_rewrite/config.yaml
-export MIGRATOR_SPEC_FLAG=--spec
+cd go_rewrite
+./v2c-engine serve --config ./config.yaml --listen :8000
 ```
+
+`serve` implements the same API shape used by the UI:
+- `GET /vmware/vms`
+- `GET /cloudstack/{zones|clusters|storage|networks|diskofferings|serviceofferings}`
+- `POST /migration/spec`
+- `POST /migration/start`
+- `GET /migration/status/{vm}`
+- `GET /migration/jobs`
+- `POST /migration/finalize/{vm}`
+- `GET /migration/logs/{vm}`
+- `GET /health`
+
+Optional `serve` flags:
+
+```bash
+./v2c-engine serve \
+  --config ./config.yaml \
+  --listen :8000 \
+  --control-dir /var/lib/vm-migrator \
+  --specs-dir /var/lib/vm-migrator/specs \
+  --workdir /opt/vmware-to-cloudstack/go_rewrite \
+  --max-workers 3
+```
+
+Legacy compatibility mode still exists: the old FastAPI backend can launch Go `run` as a subprocess if needed.
 
 ## Mapping from current Python flow
 

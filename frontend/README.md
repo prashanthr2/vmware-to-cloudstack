@@ -2,6 +2,13 @@
 
 React + Vite dashboard for the VMware to CloudStack migration backend.
 
+## API backend (Go)
+
+```bash
+cd ../go_rewrite
+./v2c-engine serve --config ./config.yaml --listen :8000
+```
+
 ## Run
 
 ```bash
