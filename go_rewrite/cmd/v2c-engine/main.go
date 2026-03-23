@@ -3647,6 +3647,40 @@ func runVMWorkflow(ctx context.Context, cfg *appConfig, spec *runSpec, opts runO
 	}
 
 	if st.Stage == stageDelta || st.Stage == stageFinalSync {
+		firstDeltaDelayDone := false
+		stateMu.Lock()
+		if st.Stage != stageDelta {
+			firstDeltaDelayDone = true
+		} else {
+			for _, ds := range st.Disks {
+				if ds != nil && ds.DeltaRounds > 0 {
+					firstDeltaDelayDone = true
+					break
+				}
+			}
+		}
+		stateMu.Unlock()
+
+		computeDeltaSleep := func() int {
+			sleepSec := deltaInterval
+			if !finalizeAt.IsZero() {
+				remaining := int(time.Until(finalizeAt).Seconds())
+				if remaining <= 0 {
+					return 0
+				}
+				if remaining <= finalizeWindow {
+					sleepSec = finalizeDeltaInterval
+				}
+				if remaining < sleepSec {
+					sleepSec = remaining
+				}
+			}
+			if sleepSec < 0 {
+				return 0
+			}
+			return sleepSec
+		}
+
 		for {
 			finalizeNow := st.Stage == stageFinalSync
 			if !finalizeNow && !finalizeAt.IsZero() && time.Now().After(finalizeAt) {
@@ -3655,6 +3689,16 @@ func runVMWorkflow(ctx context.Context, cfg *appConfig, spec *runSpec, opts runO
 			if !finalizeNow {
 				if _, err := os.Stat(finalizeFile); err == nil {
 					finalizeNow = true
+				}
+			}
+
+			if !finalizeNow && !firstDeltaDelayDone && st.Stage == stageDelta {
+				sleepSec := computeDeltaSleep()
+				firstDeltaDelayDone = true
+				if sleepSec > 0 {
+					log.Printf("Waiting %ds before first delta sync round", sleepSec)
+					time.Sleep(time.Duration(sleepSec) * time.Second)
+					continue
 				}
 			}
 
@@ -3683,19 +3727,7 @@ func runVMWorkflow(ctx context.Context, cfg *appConfig, spec *runSpec, opts runO
 				return err
 			}
 
-			sleepSec := deltaInterval
-			if !finalizeAt.IsZero() {
-				remaining := int(time.Until(finalizeAt).Seconds())
-				if remaining <= 0 {
-					continue
-				}
-				if remaining <= finalizeWindow {
-					sleepSec = finalizeDeltaInterval
-				}
-				if remaining < sleepSec {
-					sleepSec = remaining
-				}
-			}
+			sleepSec := computeDeltaSleep()
 			if sleepSec <= 0 {
 				continue
 			}
