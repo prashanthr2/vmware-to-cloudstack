@@ -186,6 +186,35 @@ select {
   padding: 7px 8px;
 }
 
+.vm-select-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.vm-select-card {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  align-items: center;
+  gap: 8px;
+  border: 1px solid #dbe5e1;
+  border-radius: 8px;
+  background: #fff;
+  padding: 8px;
+}
+
+.vm-select-card code {
+  grid-column: 2 / 3;
+  font-size: 0.78rem;
+  color: #3b5550;
+}
+
+.inline-block {
+  display: inline-block;
+  white-space: pre-wrap;
+}
+
 .table-wrap {
   overflow-x: auto;
 }
