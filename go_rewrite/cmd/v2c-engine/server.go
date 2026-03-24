@@ -21,7 +21,6 @@ import (
 	"time"
 
 	"github.com/vmware/govmomi"
-	"github.com/vmware/govmomi/property"
 	"github.com/vmware/govmomi/view"
 	"github.com/vmware/govmomi/vim25/mo"
 	"github.com/vmware/govmomi/vim25/types"
@@ -826,8 +825,7 @@ func listVMwareInventory(ctx context.Context, client *govmomi.Client) ([]vmwareV
 	defer cv.Destroy(ctx)
 
 	var vms []mo.VirtualMachine
-	pc := property.DefaultCollector(client.Client)
-	if err := pc.Retrieve(ctx, []types.ManagedObjectReference{cv.Reference()}, []string{
+	if err := cv.Retrieve(ctx, []string{"VirtualMachine"}, []string{
 		"name",
 		"config.hardware.numCPU",
 		"config.hardware.memoryMB",
@@ -849,6 +847,9 @@ func listVMwareInventory(ctx context.Context, client *govmomi.Client) ([]vmwareV
 		for _, dev := range vm.Config.Hardware.Device {
 			vd, ok := dev.(*types.VirtualDisk)
 			if !ok {
+				continue
+			}
+			if vd.UnitNumber == nil {
 				continue
 			}
 			unit := int(*vd.UnitNumber)
@@ -980,6 +981,9 @@ func detectBootDiskUnit(cfg *types.VirtualMachineConfigInfo) *int {
 	for _, dev := range cfg.Hardware.Device {
 		vd, ok := dev.(*types.VirtualDisk)
 		if !ok {
+			continue
+		}
+		if vd.UnitNumber == nil {
 			continue
 		}
 		unit := int(*vd.UnitNumber)
