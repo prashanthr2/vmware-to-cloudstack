@@ -1085,6 +1085,23 @@ type cloudStackTargetSpec struct {
 	NetworkID         string `yaml:"networkid"`
 	ServiceOfferingID string `yaml:"serviceofferingid"`
 	DiskOfferingID    string `yaml:"diskofferingid"`
+	NICMappings       map[string]nicMappingSpec `yaml:"nic_mappings"`
+}
+
+type nicMappingSpec struct {
+	SourceLabel     string `yaml:"source_label"`
+	SourceNetwork   string `yaml:"source_network"`
+	SourceMAC       string `yaml:"source_mac"`
+	SourceDeviceKey int32  `yaml:"source_device_key"`
+	SourceIndex     int    `yaml:"source_index"`
+	NetworkID       string `yaml:"networkid"`
+}
+
+type nicAttachmentPlan struct {
+	MapKey      string
+	AdapterName string
+	SourceIndex int
+	NetworkID   string
 }
 
 type vmDisk struct {
@@ -1131,6 +1148,7 @@ type runState struct {
 	ActiveSnapshot  string                   `json:"active_snapshot"`
 	Disks           map[string]*runDiskState `json:"disks"`
 	CloudStackVMID  string                   `json:"cloudstack_vm_id,omitempty"`
+	AttachedNICs    map[string]string        `json:"attached_nics,omitempty"`
 	VirtV2VDone     bool                     `json:"virt_v2v_done,omitempty"`
 	Progress        float64                  `json:"progress,omitempty"`
 	TransferSpeedMB float64                  `json:"transfer_speed_mbps,omitempty"`
@@ -2610,6 +2628,82 @@ func persistSpecForRun(controlDir string, spec *runSpec) error {
 	return nil
 }
 
+func buildCloudStackNICPlan(target cloudStackTargetSpec) (string, []nicAttachmentPlan) {
+	primaryNetworkID := strings.TrimSpace(target.NetworkID)
+	if len(target.NICMappings) == 0 {
+		return primaryNetworkID, nil
+	}
+
+	entries := make([]nicAttachmentPlan, 0, len(target.NICMappings))
+	for key, mapping := range target.NICMappings {
+		networkID := strings.TrimSpace(mapping.NetworkID)
+		if networkID == "" {
+			continue
+		}
+		adapterName := strings.TrimSpace(mapping.SourceLabel)
+		if adapterName == "" {
+			adapterName = fmt.Sprintf("NIC %s", key)
+		}
+		entries = append(entries, nicAttachmentPlan{
+			MapKey:      strings.TrimSpace(key),
+			AdapterName: adapterName,
+			SourceIndex: mapping.SourceIndex,
+			NetworkID:   networkID,
+		})
+	}
+	if len(entries) == 0 {
+		return primaryNetworkID, nil
+	}
+
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].SourceIndex != entries[j].SourceIndex {
+			return entries[i].SourceIndex < entries[j].SourceIndex
+		}
+		if entries[i].AdapterName != entries[j].AdapterName {
+			return entries[i].AdapterName < entries[j].AdapterName
+		}
+		return entries[i].MapKey < entries[j].MapKey
+	})
+
+	primaryIdx := -1
+	for i := range entries {
+		if strings.EqualFold(strings.TrimSpace(entries[i].AdapterName), "Network adapter 1") {
+			primaryIdx = i
+			break
+		}
+	}
+	if primaryIdx == -1 {
+		for i := range entries {
+			if entries[i].SourceIndex == 0 {
+				primaryIdx = i
+				break
+			}
+		}
+	}
+	if primaryIdx == -1 {
+		for i := range entries {
+			if entries[i].MapKey == "4000" {
+				primaryIdx = i
+				break
+			}
+		}
+	}
+
+	additional := make([]nicAttachmentPlan, 0, len(entries))
+	if primaryIdx >= 0 {
+		primaryNetworkID = entries[primaryIdx].NetworkID
+		for i := range entries {
+			if i == primaryIdx {
+				continue
+			}
+			additional = append(additional, entries[i])
+		}
+		return primaryNetworkID, additional
+	}
+
+	return primaryNetworkID, entries
+}
+
 func validateCloudStackTarget(target cloudStackTargetSpec) error {
 	missing := make([]string, 0)
 	if strings.TrimSpace(target.ZoneID) == "" {
@@ -2621,7 +2715,8 @@ func validateCloudStackTarget(target cloudStackTargetSpec) error {
 	if strings.TrimSpace(target.StorageID) == "" {
 		missing = append(missing, "storageid")
 	}
-	if strings.TrimSpace(target.NetworkID) == "" {
+	primaryNetworkID, _ := buildCloudStackNICPlan(target)
+	if strings.TrimSpace(primaryNetworkID) == "" {
 		missing = append(missing, "networkid")
 	}
 	if strings.TrimSpace(target.ServiceOfferingID) == "" {
@@ -2932,7 +3027,11 @@ func sanitizeHostName(vmName string) string {
 	return out
 }
 
-func importVMToCloudStack(cs *cloudStackClient, vmName string, targetCloud cloudStackTargetSpec, bootDiskPath string) (string, error) {
+func importVMToCloudStack(cs *cloudStackClient, vmName string, targetCloud cloudStackTargetSpec, bootDiskPath string, importNetworkID string) (string, error) {
+	networkID := strings.TrimSpace(importNetworkID)
+	if networkID == "" {
+		networkID = strings.TrimSpace(targetCloud.NetworkID)
+	}
 	params := map[string]string{
 		"name":              sanitizeHostName(vmName),
 		"displayname":       vmName,
@@ -2942,7 +3041,7 @@ func importVMToCloudStack(cs *cloudStackClient, vmName string, targetCloud cloud
 		"hypervisor":        "kvm",
 		"storageid":         targetCloud.StorageID,
 		"diskpath":          filepath.Base(bootDiskPath),
-		"networkid":         targetCloud.NetworkID,
+		"networkid":         networkID,
 		"serviceofferingid": targetCloud.ServiceOfferingID,
 	}
 	resp, err := cs.request("importVm", params)
@@ -2967,6 +3066,26 @@ func importVMToCloudStack(cs *cloudStackClient, vmName string, targetCloud cloud
 		return "", fmt.Errorf("importVm job result missing vm id: %v", jobRes)
 	}
 	return vmID, nil
+}
+
+func attachNICToVM(cs *cloudStackClient, vmID, networkID string) error {
+	resp, err := cs.request("addNicToVirtualMachine", map[string]string{
+		"virtualmachineid": vmID,
+		"networkid":        networkID,
+	})
+	if err != nil {
+		return err
+	}
+	root, ok := mapGetMap(resp, "addnictovirtualmachineresponse")
+	if !ok {
+		return nil
+	}
+	jobID := mapGetString(root, "jobid")
+	if jobID == "" {
+		return nil
+	}
+	_, err = cs.waitJob(jobID, "addNicToVirtualMachine")
+	return err
 }
 
 func importDataDiskToCloudStack(cs *cloudStackClient, zoneID, storageID, diskOfferingID, diskPath string) (string, error) {
@@ -3388,6 +3507,15 @@ func runVMWorkflow(ctx context.Context, cfg *appConfig, spec *runSpec, opts runO
 	if quiesceMode == "" {
 		quiesceMode = "auto"
 	}
+	importNetworkID, additionalNICs := buildCloudStackNICPlan(spec.Target.CloudStack)
+	log.Printf(
+		"CloudStack NIC plan primary_network=%s additional_nics=%d",
+		importNetworkID,
+		len(additionalNICs),
+	)
+	for _, nic := range additionalNICs {
+		log.Printf("CloudStack additional NIC map=%s adapter=%s index=%d network=%s", nic.MapKey, nic.AdapterName, nic.SourceIndex, nic.NetworkID)
+	}
 	log.Printf(
 		"Runtime settings readers=%d parallel_disks=%d run_virt_v2v=%t shutdown_mode=%s snapshot_quiesce=%s virtio_iso=%s",
 		readers,
@@ -3420,6 +3548,7 @@ func runVMWorkflow(ctx context.Context, cfg *appConfig, spec *runSpec, opts runO
 			MigrationID: migrationID,
 			Stage:       stageInit,
 			Disks:       map[string]*runDiskState{},
+			AttachedNICs: map[string]string{},
 		}
 	}
 	if st.VMName != "" && st.VMName != spec.VM.Name {
@@ -3427,6 +3556,9 @@ func runVMWorkflow(ctx context.Context, cfg *appConfig, spec *runSpec, opts runO
 	}
 	if st.Disks == nil {
 		st.Disks = map[string]*runDiskState{}
+	}
+	if st.AttachedNICs == nil {
+		st.AttachedNICs = map[string]string{}
 	}
 	st.VMName = spec.VM.Name
 	st.VMMoref = vmMoref
@@ -3452,6 +3584,34 @@ func runVMWorkflow(ctx context.Context, cfg *appConfig, spec *runSpec, opts runO
 		stateMu.Unlock()
 		log.Printf("Stage: %s", next)
 		return saveStateLocked()
+	}
+	ensureAdditionalNICsAttached := func(vmID string) error {
+		if len(additionalNICs) == 0 {
+			return nil
+		}
+		for _, nic := range additionalNICs {
+			if strings.TrimSpace(nic.NetworkID) == "" {
+				continue
+			}
+			stateMu.Lock()
+			already := st.AttachedNICs[nic.MapKey]
+			stateMu.Unlock()
+			if already == nic.NetworkID {
+				continue
+			}
+			log.Printf("Attaching additional NIC map=%s adapter=%s index=%d network=%s to vm_id=%s", nic.MapKey, nic.AdapterName, nic.SourceIndex, nic.NetworkID, vmID)
+			if err := attachNICToVM(csClient, vmID, nic.NetworkID); err != nil {
+				return fmt.Errorf("attach additional NIC failed map=%s network=%s: %w", nic.MapKey, nic.NetworkID, err)
+			}
+			stateMu.Lock()
+			st.AttachedNICs[nic.MapKey] = nic.NetworkID
+			stateMu.Unlock()
+			if err := saveStateLocked(); err != nil {
+				return err
+			}
+			log.Printf("Attached additional NIC map=%s to vm_id=%s", nic.MapKey, vmID)
+		}
+		return nil
 	}
 
 	for _, d := range disks {
@@ -4002,7 +4162,7 @@ func runVMWorkflow(ctx context.Context, cfg *appConfig, spec *runSpec, opts runO
 			if bootDiskState == nil {
 				return fmt.Errorf("boot disk state not found for unit=%d", bootUnit)
 			}
-			vmID, err := importVMToCloudStack(csClient, spec.VM.Name, spec.Target.CloudStack, bootDiskState.TargetQCOW2)
+			vmID, err := importVMToCloudStack(csClient, spec.VM.Name, spec.Target.CloudStack, bootDiskState.TargetQCOW2, importNetworkID)
 			if err != nil {
 				return fmt.Errorf("cloudstack root import failed: %w", err)
 			}
@@ -4011,10 +4171,16 @@ func runVMWorkflow(ctx context.Context, cfg *appConfig, spec *runSpec, opts runO
 			st.CloudStackVMID = vmID
 			st.LastError = ""
 			stateMu.Unlock()
+			if err := ensureAdditionalNICsAttached(vmID); err != nil {
+				return err
+			}
 			if err := setStage(stageImportData); err != nil {
 				return err
 			}
 		} else {
+			if err := ensureAdditionalNICsAttached(st.CloudStackVMID); err != nil {
+				return err
+			}
 			if err := setStage(stageImportData); err != nil {
 				return err
 			}
@@ -4024,6 +4190,9 @@ func runVMWorkflow(ctx context.Context, cfg *appConfig, spec *runSpec, opts runO
 	if st.Stage == stageImportData {
 		if strings.TrimSpace(st.CloudStackVMID) == "" {
 			return errors.New("state is import_data_disk but cloudstack_vm_id is empty")
+		}
+		if err := ensureAdditionalNICsAttached(st.CloudStackVMID); err != nil {
+			return err
 		}
 		units := make([]int, 0, len(disks))
 		for _, d := range disks {
