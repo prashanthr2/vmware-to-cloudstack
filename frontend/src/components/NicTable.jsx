@@ -2,7 +2,7 @@ function optionLabel(item) {
   return item.name || item.displaytext || item.id || "Unknown";
 }
 
-export default function NicTable({ nics, networks, fallbackNetworkId, onNicChange, validationByNic }) {
+export default function NicTable({ nics, networks, onNicChange, validationByNic }) {
   return (
     <section className="panel">
       <h2>NIC Mapping</h2>
@@ -41,14 +41,6 @@ export default function NicTable({ nics, networks, fallbackNetworkId, onNicChang
                     <td>
                       <select value={nic.networkid || ""} onChange={(e) => onNicChange(nic.id, "networkid", e.target.value)}>
                         <option value="">Select network</option>
-                        {fallbackNetworkId ? (
-                          <option
-                            value={fallbackNetworkId}
-                            disabled={usedByOtherNICs.has(fallbackNetworkId) && (nic.networkid || "") !== fallbackNetworkId}
-                          >
-                            Use fallback network
-                          </option>
-                        ) : null}
                         {networks.map((item) => (
                           <option
                             key={item.id}

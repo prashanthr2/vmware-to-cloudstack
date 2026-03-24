@@ -98,14 +98,15 @@ function validateDraft(draft) {
       }
       nicByNetwork[networkID] = nic.id;
     });
-  } else if (!draft.networkid) {
-    core.push("networkid");
+  } else {
+    core.push("nic_mappings");
   }
 
   const valid = core.length === 0 && Object.keys(diskErrors).length === 0 && Object.keys(nicErrors).length === 0;
   let message = "";
   if (!valid) {
-    if (core.length > 0) message = `Missing required fields: ${core.join(", ")}`;
+    if (core.includes("nic_mappings")) message = "NIC mappings are required. No VMware NICs detected for this VM.";
+    else if (core.length > 0) message = `Missing required fields: ${core.join(", ")}`;
     else if (Object.keys(diskErrors).length > 0) message = "Complete storage and disk offering for all data disks.";
     else message = "Please map all VM NICs to unique CloudStack networks.";
   }
@@ -229,11 +230,10 @@ export default function App() {
     () => ({
       zoneid: zones[0]?.id || "",
       clusterid: clusters[0]?.id || "",
-      networkid: networks[0]?.id || "",
       serviceofferingid: serviceOfferings[0]?.id || "",
       boot_storageid: storagePools[0]?.id || "",
     }),
-    [clusters, networks, serviceOfferings, storagePools, zones]
+    [clusters, serviceOfferings, storagePools, zones]
   );
 
   const mapInventoryDisks = useCallback((vmDisks, bootStorageId, previousDisks = []) => {
@@ -255,7 +255,7 @@ export default function App() {
     });
   }, []);
 
-  const mapInventoryNics = useCallback((vmNics, defaultNetworkId, previousNics = []) => {
+  const mapInventoryNics = useCallback((vmNics, previousNics = []) => {
     const prevByID = Object.fromEntries((previousNics || []).map((nic) => [nic.id, nic]));
     return (vmNics || []).map((nic, index) => {
       const id = String(nic.device_key ?? index);
@@ -267,7 +267,7 @@ export default function App() {
         source_mac: nic.mac_address || "",
         source_device_key: nic.device_key ?? 0,
         source_index: nic.index ?? index,
-        networkid: prev?.networkid || defaultNetworkId || "",
+        networkid: prev?.networkid || "",
       };
     });
   }, []);
@@ -278,7 +278,6 @@ export default function App() {
         ? {
             zoneid: template.zoneid || defaultSelections.zoneid,
             clusterid: template.clusterid || defaultSelections.clusterid,
-            networkid: template.networkid || defaultSelections.networkid,
             serviceofferingid: template.serviceofferingid || defaultSelections.serviceofferingid,
             boot_storageid: template.boot_storageid || defaultSelections.boot_storageid,
             migration: normalizeMigration(template.migration),
@@ -292,12 +291,11 @@ export default function App() {
         vm_moref: vm.moref || "",
         zoneid: base.zoneid,
         clusterid: base.clusterid,
-        networkid: base.networkid,
         serviceofferingid: base.serviceofferingid,
         boot_storageid: base.boot_storageid,
         migration: base.migration,
         disks: mapInventoryDisks(vm.disks || [], base.boot_storageid, template?.disks || []),
-        nics: mapInventoryNics(vm.nics || [], base.networkid, template?.nics || []),
+        nics: mapInventoryNics(vm.nics || [], template?.nics || []),
       };
     },
     [defaultSelections, mapInventoryDisks, mapInventoryNics]
@@ -413,13 +411,12 @@ export default function App() {
             vm_moref: vm.moref || draft.vm_moref || "",
             zoneid: pickValidOrFirst(draft.zoneid, zoneList),
             clusterid: pickValidOrFirst(draft.clusterid, clusterList),
-            networkid: pickValidOrFirst(draft.networkid, networkList),
             serviceofferingid: pickValidOrFirst(draft.serviceofferingid, serviceList),
             boot_storageid: pickValidOrFirst(draft.boot_storageid, storageList),
             migration: normalizeMigration(draft.migration),
           };
           updated.disks = mapInventoryDisks(vm.disks || [], updated.boot_storageid, draft.disks || []);
-          updated.nics = mapInventoryNics(vm.nics || [], updated.networkid, draft.nics || []);
+          updated.nics = mapInventoryNics(vm.nics || [], draft.nics || []);
           next[name] = updated;
           changed = true;
         });
@@ -457,7 +454,7 @@ export default function App() {
           const current = next[name] || buildDraftForVm(vm);
           const updated = { ...current, vm_name: vm.name, vm_moref: vm.moref || current.vm_moref || "" };
           updated.disks = mapInventoryDisks(vm.disks || [], updated.boot_storageid, current.disks || []);
-          updated.nics = mapInventoryNics(vm.nics || [], updated.networkid, current.nics || []);
+          updated.nics = mapInventoryNics(vm.nics || [], current.nics || []);
           next[name] = updated;
         });
         return next;
@@ -553,9 +550,6 @@ export default function App() {
             disk.diskType === "os" ? { ...disk, storageid: value } : disk
           );
         }
-        if (field === "networkid") {
-          next.nics = (draft.nics || []).map((nic) => (nic.networkid ? nic : { ...nic, networkid: value }));
-        }
         return next;
       });
     },
@@ -644,7 +638,7 @@ export default function App() {
       vm_moref: draft.vm_moref,
       zoneid: draft.zoneid,
       clusterid: draft.clusterid,
-      networkid: draft.networkid,
+      networkid: "",
       serviceofferingid: draft.serviceofferingid,
       boot_storageid: draft.boot_storageid,
       disks,
@@ -737,7 +731,7 @@ export default function App() {
         const nicDetails = nics.map((nic, index) => ({
           id: nic.id || String(index),
           label: nic.source_label || `NIC ${index + 1}`,
-          networkName: resolveName(networks, nic.networkid || draft?.networkid || ""),
+          networkName: resolveName(networks, nic.networkid || ""),
         }));
         return {
           vmName,
@@ -802,7 +796,6 @@ export default function App() {
                   <label>VM MoRef<input value={activeDraft.vm_moref} onChange={(e) => updateField("vm_moref", e.target.value)} placeholder="vm-123" /></label>
                   <label>Zone<select value={activeDraft.zoneid} onChange={(e) => updateField("zoneid", e.target.value)}><option value="">Select zone</option>{zones.map((item) => <option key={item.id} value={item.id}>{optionLabel(item)}</option>)}</select></label>
                   <label>Cluster<select value={activeDraft.clusterid} onChange={(e) => updateField("clusterid", e.target.value)}><option value="">Select cluster</option>{clusters.map((item) => <option key={item.id} value={item.id}>{optionLabel(item)}</option>)}</select></label>
-                  <label>Fallback Network<select value={activeDraft.networkid} onChange={(e) => updateField("networkid", e.target.value)}><option value="">Select network</option>{networks.map((item) => <option key={item.id} value={item.id}>{optionLabel(item)}</option>)}</select></label>
                   <label>Service Offering<select value={activeDraft.serviceofferingid} onChange={(e) => updateField("serviceofferingid", e.target.value)}><option value="">Select service offering</option>{serviceOfferings.map((item) => <option key={item.id} value={item.id}>{optionLabel(item)}</option>)}</select></label>
                   <label>Boot Storage<select value={activeDraft.boot_storageid} onChange={(e) => updateField("boot_storageid", e.target.value)}><option value="">Select boot storage</option>{storagePools.map((item) => <option key={item.id} value={item.id}>{optionLabel(item)}</option>)}</select></label>
                   <label>Delta Interval (sec)<input type="number" min="1" value={activeDraft.migration.delta_interval} onChange={(e) => updateMigrationField("delta_interval", e.target.value)} /></label>
@@ -825,7 +818,6 @@ export default function App() {
               <NicTable
                 nics={activeDraft.nics || []}
                 networks={networks}
-                fallbackNetworkId={activeDraft.networkid}
                 onNicChange={updateNic}
                 validationByNic={activeValidation.nicErrors}
               />
