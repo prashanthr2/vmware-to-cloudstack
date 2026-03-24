@@ -1091,6 +1091,7 @@ type vmDisk struct {
 	Key      int32
 	Unit     int
 	Capacity int64
+	SourcePath string
 }
 
 type snapshotDiskMeta struct {
@@ -2173,9 +2174,10 @@ func listVMDisksAndBootUnit(ctx context.Context, client *govmomi.Client, vm *obj
 			capacity = int64(vd.CapacityInKB) * 1024
 		}
 		disks = append(disks, vmDisk{
-			Key:      vd.Key,
-			Unit:     unit,
-			Capacity: capacity,
+			Key:        vd.Key,
+			Unit:       unit,
+			Capacity:   capacity,
+			SourcePath: getBackingString(vd.Backing, "FileName"),
 		})
 		keyToUnit[vd.Key] = unit
 	}
@@ -3467,6 +3469,9 @@ func runVMWorkflow(ctx context.Context, cfg *appConfig, spec *runSpec, opts runO
 		ds.Key = d.Key
 		ds.Unit = d.Unit
 		ds.Capacity = d.Capacity
+		if strings.TrimSpace(ds.SourceDiskPath) == "" && strings.TrimSpace(d.SourcePath) != "" {
+			ds.SourceDiskPath = strings.TrimSpace(d.SourcePath)
+		}
 
 		storageID, err := resolveStorageID(spec, d.Unit, bootUnit)
 		if err != nil {
@@ -3557,8 +3562,8 @@ func runVMWorkflow(ctx context.Context, cfg *appConfig, spec *runSpec, opts runO
 				continue
 			}
 			meta, ok := baseMeta[d.Key]
-			if !ok || meta.Path == "" {
-				return fmt.Errorf("snapshot backing path not found for disk key=%d", d.Key)
+			if !ok {
+				return fmt.Errorf("snapshot metadata not found for disk key=%d", d.Key)
 			}
 
 			wg.Add(1)
@@ -3571,8 +3576,22 @@ func runVMWorkflow(ctx context.Context, cfg *appConfig, spec *runSpec, opts runO
 				}
 				defer func() { <-sem }()
 
+				sourcePath := strings.TrimSpace(d.SourcePath)
+				if sourcePath == "" {
+					sourcePath = strings.TrimSpace(meta.Path)
+				}
+				if sourcePath == "" {
+					errMu.Lock()
+					if firstErr == nil {
+						firstErr = fmt.Errorf("source disk path missing for unit=%d key=%d", d.Unit, d.Key)
+						baseCancel()
+					}
+					errMu.Unlock()
+					return
+				}
+
 				progress := makeProgressUpdater(stateMu, statePath, st, log, d.Unit, d.Capacity, stageBaseCopy)
-				log.Printf("[disk%d] base copy started source=%s target=%s", d.Unit, meta.Path, st.Disks[strconv.Itoa(d.Unit)].TargetQCOW2)
+				log.Printf("[disk%d] base copy started source=%s snapshot_path=%s target=%s", d.Unit, sourcePath, meta.Path, st.Disks[strconv.Itoa(d.Unit)].TargetQCOW2)
 				optsBase := baseCopyOptions{
 					VDDK: vddkConnCfg{
 						LibDir:        cfg.Migration.VDDKPath,
@@ -3583,7 +3602,7 @@ func runVMWorkflow(ctx context.Context, cfg *appConfig, spec *runSpec, opts runO
 						VMMoref:       vmMoref,
 						SnapshotMoref: st.ActiveSnapshot,
 					},
-					DiskPath:      meta.Path,
+					DiskPath:      sourcePath,
 					TargetQCOW2:   st.Disks[strconv.Itoa(d.Unit)].TargetQCOW2,
 					DiskSizeBytes: d.Capacity,
 					Readers:       readers,
@@ -3603,7 +3622,7 @@ func runVMWorkflow(ctx context.Context, cfg *appConfig, spec *runSpec, opts runO
 
 				stateMu.Lock()
 				ds := st.Disks[strconv.Itoa(d.Unit)]
-				ds.SourceDiskPath = meta.Path
+				ds.SourceDiskPath = sourcePath
 				ds.ChangeID = meta.ChangeID
 				ds.Stage = stageBaseCopy
 				ds.BaseCopied = true
@@ -3686,7 +3705,7 @@ func runVMWorkflow(ctx context.Context, cfg *appConfig, spec *runSpec, opts runO
 
 		for _, d := range disks {
 			meta, ok := newMeta[d.Key]
-			if !ok || meta.Path == "" {
+			if !ok {
 				return fmt.Errorf("missing delta snapshot metadata for key=%d", d.Key)
 			}
 			wg.Add(1)
@@ -3704,9 +3723,13 @@ func runVMWorkflow(ctx context.Context, cfg *appConfig, spec *runSpec, opts runO
 				ds := st.Disks[unitKey]
 				prevChangeID := ""
 				targetQCOW2 := ""
+				sourcePath := strings.TrimSpace(d.SourcePath)
 				if ds != nil {
 					prevChangeID = ds.ChangeID
 					targetQCOW2 = ds.TargetQCOW2
+					if strings.TrimSpace(ds.SourceDiskPath) != "" {
+						sourcePath = strings.TrimSpace(ds.SourceDiskPath)
+					}
 				}
 				stateMu.Unlock()
 				if ds == nil {
@@ -3722,6 +3745,18 @@ func runVMWorkflow(ctx context.Context, cfg *appConfig, spec *runSpec, opts runO
 					errMu.Lock()
 					if firstErr == nil {
 						firstErr = fmt.Errorf("missing previous changeID for unit=%d", d.Unit)
+						deltaCancel()
+					}
+					errMu.Unlock()
+					return
+				}
+				if sourcePath == "" {
+					sourcePath = strings.TrimSpace(meta.Path)
+				}
+				if sourcePath == "" {
+					errMu.Lock()
+					if firstErr == nil {
+						firstErr = fmt.Errorf("source disk path missing for delta unit=%d key=%d", d.Unit, d.Key)
 						deltaCancel()
 					}
 					errMu.Unlock()
@@ -3771,7 +3806,7 @@ func runVMWorkflow(ctx context.Context, cfg *appConfig, spec *runSpec, opts runO
 							VMMoref:       vmMoref,
 							SnapshotMoref: newSnap.Value,
 						},
-						DiskPath:    meta.Path,
+						DiskPath:    sourcePath,
 						TargetQCOW2: targetQCOW2,
 						RangesFile:  rangesPath,
 						Readers:     readers,
@@ -3792,7 +3827,7 @@ func runVMWorkflow(ctx context.Context, cfg *appConfig, spec *runSpec, opts runO
 				stateMu.Lock()
 				ds = st.Disks[unitKey]
 				ds.ChangeID = meta.ChangeID
-				ds.SourceDiskPath = meta.Path
+				ds.SourceDiskPath = sourcePath
 				ds.Stage = stageName
 				ds.Progress = 100
 				ds.EtaSeconds = 0
