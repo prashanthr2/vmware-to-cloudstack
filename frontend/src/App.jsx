@@ -45,6 +45,21 @@ function pickValidOrFirst(currentId, items) {
   return items.some((item) => item.id === currentId) ? currentId : items[0].id;
 }
 
+function itemZoneID(item) {
+  if (!item || typeof item !== "object") return "";
+  return String(item.zoneid || item.zoneId || item.zone_id || "").trim();
+}
+
+function filterByZone(items, zoneID) {
+  if (!Array.isArray(items) || items.length === 0) return [];
+  const zone = String(zoneID || "").trim();
+  if (!zone) return items;
+  const scoped = items.filter((item) => itemZoneID(item) === zone);
+  if (scoped.length > 0) return scoped;
+  const hasExplicitZone = items.some((item) => itemZoneID(item) !== "");
+  return hasExplicitZone ? scoped : items;
+}
+
 function normalizeMigration(input = {}) {
   return {
     delta_interval: input.delta_interval ?? DEFAULT_MIGRATION.delta_interval,
@@ -227,12 +242,15 @@ export default function App() {
   );
 
   const defaultSelections = useMemo(
-    () => ({
-      zoneid: zones[0]?.id || "",
-      clusterid: clusters[0]?.id || "",
-      serviceofferingid: serviceOfferings[0]?.id || "",
-      boot_storageid: storagePools[0]?.id || "",
-    }),
+    () => {
+      const zoneid = zones[0]?.id || "";
+      return {
+        zoneid,
+        clusterid: pickValidOrFirst("", filterByZone(clusters, zoneid)),
+        serviceofferingid: pickValidOrFirst("", filterByZone(serviceOfferings, zoneid)),
+        boot_storageid: pickValidOrFirst("", filterByZone(storagePools, zoneid)),
+      };
+    },
     [clusters, serviceOfferings, storagePools, zones]
   );
 
@@ -277,15 +295,23 @@ export default function App() {
       const base = template
         ? {
             zoneid: template.zoneid || defaultSelections.zoneid,
-            clusterid: template.clusterid || defaultSelections.clusterid,
+            clusterid: "",
             serviceofferingid: template.serviceofferingid || defaultSelections.serviceofferingid,
-            boot_storageid: template.boot_storageid || defaultSelections.boot_storageid,
+            boot_storageid: "",
             migration: normalizeMigration(template.migration),
           }
         : {
             ...defaultSelections,
             migration: normalizeMigration(),
           };
+      const zoneClusters = filterByZone(clusters, base.zoneid);
+      const zoneServiceOfferings = filterByZone(serviceOfferings, base.zoneid);
+      const zoneStorage = filterByZone(storagePools, base.zoneid);
+      const zoneNetworks = filterByZone(networks, base.zoneid);
+      const zoneDiskOfferings = filterByZone(diskOfferings, base.zoneid);
+      base.clusterid = pickValidOrFirst(template?.clusterid || base.clusterid, zoneClusters);
+      base.serviceofferingid = pickValidOrFirst(template?.serviceofferingid || base.serviceofferingid, zoneServiceOfferings);
+      base.boot_storageid = pickValidOrFirst(template?.boot_storageid || base.boot_storageid, zoneStorage);
       return {
         vm_name: vm.name,
         vm_moref: vm.moref || "",
@@ -294,11 +320,21 @@ export default function App() {
         serviceofferingid: base.serviceofferingid,
         boot_storageid: base.boot_storageid,
         migration: base.migration,
-        disks: mapInventoryDisks(vm.disks || [], base.boot_storageid, template?.disks || []),
-        nics: mapInventoryNics(vm.nics || [], template?.nics || []),
+        disks: mapInventoryDisks(vm.disks || [], base.boot_storageid, template?.disks || []).map((disk) => {
+          if (disk.diskType === "os") return disk;
+          return {
+            ...disk,
+            storageid: pickValidOrFirst(disk.storageid, zoneStorage),
+            diskofferingid: pickValidOrFirst(disk.diskofferingid, zoneDiskOfferings),
+          };
+        }),
+        nics: mapInventoryNics(vm.nics || [], template?.nics || []).map((nic) => ({
+          ...nic,
+          networkid: pickValidOrFirst(nic.networkid, zoneNetworks),
+        })),
       };
     },
-    [defaultSelections, mapInventoryDisks, mapInventoryNics]
+    [clusters, defaultSelections, diskOfferings, mapInventoryDisks, mapInventoryNics, networks, serviceOfferings, storagePools]
   );
 
   useEffect(() => {
@@ -341,6 +377,12 @@ export default function App() {
 
   const activeDraft = activeVmName ? vmSpecsByName[activeVmName] || null : null;
   const activeValidation = useMemo(() => validateDraft(activeDraft), [activeDraft]);
+  const activeZoneID = activeDraft?.zoneid || "";
+  const clustersForActiveZone = useMemo(() => filterByZone(clusters, activeZoneID), [clusters, activeZoneID]);
+  const storagePoolsForActiveZone = useMemo(() => filterByZone(storagePools, activeZoneID), [storagePools, activeZoneID]);
+  const networksForActiveZone = useMemo(() => filterByZone(networks, activeZoneID), [networks, activeZoneID]);
+  const serviceOfferingsForActiveZone = useMemo(() => filterByZone(serviceOfferings, activeZoneID), [serviceOfferings, activeZoneID]);
+  const diskOfferingsForActiveZone = useMemo(() => filterByZone(diskOfferings, activeZoneID), [diskOfferings, activeZoneID]);
 
   const canStartMigration = useMemo(() => {
     if (busy || selectedVmNames.length === 0) return false;
@@ -405,18 +447,34 @@ export default function App() {
           const draft = next[name];
           const vm = vmList.find((item) => item.name === name);
           if (!draft || !vm) return;
+          const zoneid = pickValidOrFirst(draft.zoneid, zoneList);
+          const zoneClusters = filterByZone(clusterList, zoneid);
+          const zoneStorage = filterByZone(storageList, zoneid);
+          const zoneNetworks = filterByZone(networkList, zoneid);
+          const zoneServiceOfferings = filterByZone(serviceList, zoneid);
+          const zoneDiskOfferings = filterByZone(diskOfferingList, zoneid);
           const updated = {
             ...draft,
             vm_name: vm.name,
             vm_moref: vm.moref || draft.vm_moref || "",
-            zoneid: pickValidOrFirst(draft.zoneid, zoneList),
-            clusterid: pickValidOrFirst(draft.clusterid, clusterList),
-            serviceofferingid: pickValidOrFirst(draft.serviceofferingid, serviceList),
-            boot_storageid: pickValidOrFirst(draft.boot_storageid, storageList),
+            zoneid,
+            clusterid: pickValidOrFirst(draft.clusterid, zoneClusters),
+            serviceofferingid: pickValidOrFirst(draft.serviceofferingid, zoneServiceOfferings),
+            boot_storageid: pickValidOrFirst(draft.boot_storageid, zoneStorage),
             migration: normalizeMigration(draft.migration),
           };
-          updated.disks = mapInventoryDisks(vm.disks || [], updated.boot_storageid, draft.disks || []);
-          updated.nics = mapInventoryNics(vm.nics || [], draft.nics || []);
+          updated.disks = mapInventoryDisks(vm.disks || [], updated.boot_storageid, draft.disks || []).map((disk) => {
+            if (disk.diskType === "os") return disk;
+            return {
+              ...disk,
+              storageid: pickValidOrFirst(disk.storageid, zoneStorage),
+              diskofferingid: pickValidOrFirst(disk.diskofferingid, zoneDiskOfferings),
+            };
+          });
+          updated.nics = mapInventoryNics(vm.nics || [], draft.nics || []).map((nic) => ({
+            ...nic,
+            networkid: pickValidOrFirst(nic.networkid, zoneNetworks),
+          }));
           next[name] = updated;
           changed = true;
         });
@@ -452,9 +510,22 @@ export default function App() {
             return;
           }
           const current = next[name] || buildDraftForVm(vm);
+          const zoneStorage = filterByZone(storagePools, current.zoneid);
+          const zoneNetworks = filterByZone(networks, current.zoneid);
+          const zoneDiskOfferings = filterByZone(diskOfferings, current.zoneid);
           const updated = { ...current, vm_name: vm.name, vm_moref: vm.moref || current.vm_moref || "" };
-          updated.disks = mapInventoryDisks(vm.disks || [], updated.boot_storageid, current.disks || []);
-          updated.nics = mapInventoryNics(vm.nics || [], current.nics || []);
+          updated.disks = mapInventoryDisks(vm.disks || [], updated.boot_storageid, current.disks || []).map((disk) => {
+            if (disk.diskType === "os") return disk;
+            return {
+              ...disk,
+              storageid: pickValidOrFirst(disk.storageid, zoneStorage),
+              diskofferingid: pickValidOrFirst(disk.diskofferingid, zoneDiskOfferings),
+            };
+          });
+          updated.nics = mapInventoryNics(vm.nics || [], current.nics || []).map((nic) => ({
+            ...nic,
+            networkid: pickValidOrFirst(nic.networkid, zoneNetworks),
+          }));
           next[name] = updated;
         });
         return next;
@@ -465,7 +536,7 @@ export default function App() {
     } finally {
       setVmDisksLoading(false);
     }
-  }, [buildDraftForVm, mapInventoryDisks, mapInventoryNics, pushToast, selectedVmNames, vmwareHeaders]);
+  }, [buildDraftForVm, diskOfferings, mapInventoryDisks, mapInventoryNics, networks, pushToast, selectedVmNames, storagePools, vmwareHeaders]);
 
   const refreshJobs = useCallback(async () => {
     try {
@@ -545,6 +616,30 @@ export default function App() {
     (field, value) => {
       updateActiveDraft((draft) => {
         const next = { ...draft, [field]: value };
+        if (field === "zoneid") {
+          const zoneClusters = filterByZone(clusters, value);
+          const zoneStorage = filterByZone(storagePools, value);
+          const zoneNetworks = filterByZone(networks, value);
+          const zoneServiceOfferings = filterByZone(serviceOfferings, value);
+          const zoneDiskOfferings = filterByZone(diskOfferings, value);
+          next.clusterid = pickValidOrFirst(draft.clusterid, zoneClusters);
+          next.serviceofferingid = pickValidOrFirst(draft.serviceofferingid, zoneServiceOfferings);
+          next.boot_storageid = pickValidOrFirst(draft.boot_storageid, zoneStorage);
+          next.disks = (draft.disks || []).map((disk) => {
+            if (disk.diskType === "os") {
+              return { ...disk, storageid: next.boot_storageid };
+            }
+            return {
+              ...disk,
+              storageid: pickValidOrFirst(disk.storageid, zoneStorage),
+              diskofferingid: pickValidOrFirst(disk.diskofferingid, zoneDiskOfferings),
+            };
+          });
+          next.nics = (draft.nics || []).map((nic) => ({
+            ...nic,
+            networkid: pickValidOrFirst(nic.networkid, zoneNetworks),
+          }));
+        }
         if (field === "boot_storageid") {
           next.disks = (draft.disks || []).map((disk) =>
             disk.diskType === "os" ? { ...disk, storageid: value } : disk
@@ -553,7 +648,7 @@ export default function App() {
         return next;
       });
     },
-    [updateActiveDraft]
+    [clusters, diskOfferings, networks, serviceOfferings, storagePools, updateActiveDraft]
   );
 
   const updateMigrationField = useCallback(
@@ -795,9 +890,9 @@ export default function App() {
                 <div className="form-grid">
                   <label>VM MoRef<input value={activeDraft.vm_moref} onChange={(e) => updateField("vm_moref", e.target.value)} placeholder="vm-123" /></label>
                   <label>Zone<select value={activeDraft.zoneid} onChange={(e) => updateField("zoneid", e.target.value)}><option value="">Select zone</option>{zones.map((item) => <option key={item.id} value={item.id}>{optionLabel(item)}</option>)}</select></label>
-                  <label>Cluster<select value={activeDraft.clusterid} onChange={(e) => updateField("clusterid", e.target.value)}><option value="">Select cluster</option>{clusters.map((item) => <option key={item.id} value={item.id}>{optionLabel(item)}</option>)}</select></label>
-                  <label>Service Offering<select value={activeDraft.serviceofferingid} onChange={(e) => updateField("serviceofferingid", e.target.value)}><option value="">Select service offering</option>{serviceOfferings.map((item) => <option key={item.id} value={item.id}>{optionLabel(item)}</option>)}</select></label>
-                  <label>Boot Storage<select value={activeDraft.boot_storageid} onChange={(e) => updateField("boot_storageid", e.target.value)}><option value="">Select boot storage</option>{storagePools.map((item) => <option key={item.id} value={item.id}>{optionLabel(item)}</option>)}</select></label>
+                  <label>Cluster<select value={activeDraft.clusterid} onChange={(e) => updateField("clusterid", e.target.value)}><option value="">Select cluster</option>{clustersForActiveZone.map((item) => <option key={item.id} value={item.id}>{optionLabel(item)}</option>)}</select></label>
+                  <label>Service Offering<select value={activeDraft.serviceofferingid} onChange={(e) => updateField("serviceofferingid", e.target.value)}><option value="">Select service offering</option>{serviceOfferingsForActiveZone.map((item) => <option key={item.id} value={item.id}>{optionLabel(item)}</option>)}</select></label>
+                  <label>Boot Storage<select value={activeDraft.boot_storageid} onChange={(e) => updateField("boot_storageid", e.target.value)}><option value="">Select boot storage</option>{storagePoolsForActiveZone.map((item) => <option key={item.id} value={item.id}>{optionLabel(item)}</option>)}</select></label>
                   <label>Delta Interval (sec)<input type="number" min="1" value={activeDraft.migration.delta_interval} onChange={(e) => updateMigrationField("delta_interval", e.target.value)} /></label>
                   <label>Finalize At (ISO)<input value={activeDraft.migration.finalize_at} onChange={(e) => updateMigrationField("finalize_at", e.target.value)} placeholder="2026-03-12T23:30:00+00:00" /></label>
                   <label>Finalize Delta Interval<input type="number" min="1" value={activeDraft.migration.finalize_delta_interval} onChange={(e) => updateMigrationField("finalize_delta_interval", e.target.value)} /></label>
@@ -809,15 +904,15 @@ export default function App() {
 
               <DiskTable
                 disks={activeDraft.disks || []}
-                storagePools={storagePools}
-                diskOfferings={diskOfferings}
+                storagePools={storagePoolsForActiveZone}
+                diskOfferings={diskOfferingsForActiveZone}
                 onDiskChange={updateDisk}
                 validationByUnit={activeValidation.diskErrors}
               />
 
               <NicTable
                 nics={activeDraft.nics || []}
-                networks={networks}
+                networks={networksForActiveZone}
                 onNicChange={updateNic}
                 validationByNic={activeValidation.nicErrors}
               />
