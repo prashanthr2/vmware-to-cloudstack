@@ -188,7 +188,8 @@ type vddkConnection struct {
 }
 
 type vddkHandle struct {
-	ptr C.VixDiskLibHandle
+	ptr     C.VixDiskLibHandle
+	release func()
 }
 
 type allocatedExtent struct {
@@ -199,7 +200,40 @@ type allocatedExtent struct {
 var (
 	vddkInitOnce sync.Once
 	vddkInitErr  error
+
+	vddkOpenLimiterOnce sync.Once
+	vddkOpenLimiter     chan struct{}
 )
+
+func vddkMaxOpenHandles() int {
+	if raw := strings.TrimSpace(os.Getenv("V2C_VDDK_MAX_OPEN")); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil && n > 0 {
+			if n > 256 {
+				n = 256
+			}
+			return n
+		}
+	}
+	return 8
+}
+
+func getVDDKOpenLimiter() chan struct{} {
+	vddkOpenLimiterOnce.Do(func() {
+		vddkOpenLimiter = make(chan struct{}, vddkMaxOpenHandles())
+	})
+	return vddkOpenLimiter
+}
+
+func acquireVDDKOpenSlot() func() {
+	limiter := getVDDKOpenLimiter()
+	limiter <- struct{}{}
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			<-limiter
+		})
+	}
+}
 
 func initVDDK(libdir string) error {
 	vddkInitOnce.Do(func() {
@@ -277,14 +311,16 @@ func (c *vddkConnection) close() {
 }
 
 func (c *vddkConnection) open(path string) (*vddkHandle, error) {
+	release := acquireVDDKOpenSlot()
 	cPath := C.CString(path)
 	defer C.free(unsafe.Pointer(cPath))
 	var h C.VixDiskLibHandle
 	err := C.v2c_vddk_open(c.ptr, cPath, &h)
 	if err != 0 {
+		release()
 		return nil, fmt.Errorf("VixDiskLib_Open failed: %s", vixErrorText(err))
 	}
-	return &vddkHandle{ptr: h}, nil
+	return &vddkHandle{ptr: h, release: release}, nil
 }
 
 func openVDDKWithRetry(conn *vddkConnection, path string, attempts int, baseDelay time.Duration) (*vddkHandle, error) {
@@ -309,11 +345,17 @@ func openVDDKWithRetry(conn *vddkConnection, path string, attempts int, baseDela
 }
 
 func (h *vddkHandle) close() {
-	if h == nil || h.ptr == nil {
+	if h == nil {
 		return
 	}
-	C.VixDiskLib_Close(h.ptr)
-	h.ptr = nil
+	if h.ptr != nil {
+		C.VixDiskLib_Close(h.ptr)
+		h.ptr = nil
+	}
+	if h.release != nil {
+		h.release()
+		h.release = nil
+	}
 }
 
 func (h *vddkHandle) readAt(offset int64, length int) ([]byte, error) {
@@ -1252,7 +1294,10 @@ func queryAllocatedExtents(cfg vddkConnCfg, diskPath string, diskSizeBytes int64
 		return nil, err
 	}
 	defer handle.close()
+	return queryAllocatedExtentsWithHandle(handle, diskSizeBytes, chunkBytes)
+}
 
+func queryAllocatedExtentsWithHandle(handle *vddkHandle, diskSizeBytes int64, chunkBytes int64) ([]allocatedExtent, error) {
 	totalSectors := uint64(diskSizeBytes / sectorSize)
 	if totalSectors == 0 {
 		return nil, nil
@@ -1292,6 +1337,86 @@ func queryAllocatedExtents(cfg vddkConnCfg, diskPath string, diskSizeBytes int64
 	return mergeAllocatedExtents(extents, diskSizeBytes), nil
 }
 
+func prepareBaseCopyMetadata(opts baseCopyOptions, allocChunkBytes int64) (int64, []allocatedExtent, error, error) {
+	const probeTimeout = 75 * time.Second
+	deadline := time.Now().Add(probeTimeout)
+	var lastErr error
+	attempt := 0
+
+	for {
+		attempt++
+		conn, err := connectVDDKWithRetry(opts.VDDK, 2, 750*time.Millisecond)
+		if err == nil {
+			handle, openErr := openVDDKWithRetry(conn, opts.DiskPath, 2, 750*time.Millisecond)
+			if openErr == nil {
+				sourceDiskBytes, capErr := handle.capacityBytes()
+				if capErr != nil {
+					if opts.DiskSizeBytes > 0 {
+						fmt.Fprintf(
+							os.Stderr,
+							"[base-copy] warning: failed to auto-detect source disk size (%v), using provided disk-size-bytes=%d\n",
+							capErr,
+							opts.DiskSizeBytes,
+						)
+						sourceDiskBytes = opts.DiskSizeBytes
+					} else {
+						lastErr = capErr
+					}
+				}
+				if sourceDiskBytes > 0 {
+					if opts.DiskSizeBytes > 0 && opts.DiskSizeBytes != sourceDiskBytes {
+						fmt.Fprintf(
+							os.Stderr,
+							"[base-copy] disk-size-bytes mismatch requested=%d detected=%d, using detected size\n",
+							opts.DiskSizeBytes,
+							sourceDiskBytes,
+						)
+					} else if opts.DiskSizeBytes <= 0 {
+						fmt.Fprintf(os.Stderr, "[base-copy] auto-detected source disk size=%d bytes\n", sourceDiskBytes)
+					}
+
+					extents, allocErr := queryAllocatedExtentsWithHandle(handle, sourceDiskBytes, allocChunkBytes)
+					handle.close()
+					conn.close()
+					return sourceDiskBytes, extents, allocErr, nil
+				}
+				handle.close()
+			} else {
+				lastErr = openErr
+			}
+			conn.close()
+		} else {
+			lastErr = err
+		}
+
+		if time.Now().After(deadline) {
+			break
+		}
+		sleepSec := attempt
+		if sleepSec > 5 {
+			sleepSec = 5
+		}
+		time.Sleep(time.Duration(sleepSec) * time.Second)
+	}
+
+	if opts.DiskSizeBytes > 0 {
+		if lastErr == nil {
+			lastErr = errors.New("source snapshot not yet readable")
+		}
+		fmt.Fprintf(
+			os.Stderr,
+			"[base-copy] warning: snapshot readability probe timed out (%v), continuing with provided disk-size-bytes=%d\n",
+			lastErr,
+			opts.DiskSizeBytes,
+		)
+		return opts.DiskSizeBytes, nil, fmt.Errorf("probe unavailable: %w", lastErr), nil
+	}
+	if lastErr == nil {
+		lastErr = errors.New("unknown VDDK open error")
+	}
+	return 0, nil, nil, fmt.Errorf("failed to prepare source metadata after probe timeout: %w", lastErr)
+}
+
 func (o *baseCopyOptions) normalize() {
 	if o.Readers <= 0 {
 		o.Readers = 4
@@ -1326,30 +1451,12 @@ func runBaseCopy(ctx context.Context, opts baseCopyOptions) (copyStats, error) {
 	opts.normalize()
 	start := time.Now()
 
-	sourceDiskBytes, err := detectSourceDiskSizeBytes(opts.VDDK, opts.DiskPath)
+	allocChunkBytes := int64(alignUp(opts.MinChunkMB*1024*1024, sectorSize))
+	sourceDiskBytes, allocatedExtents, allocErr, err := prepareBaseCopyMetadata(opts, allocChunkBytes)
 	if err != nil {
-		if opts.DiskSizeBytes > 0 {
-			fmt.Fprintf(
-				os.Stderr,
-				"[base-copy] warning: failed to auto-detect source disk size (%v), using provided disk-size-bytes=%d\n",
-				err,
-				opts.DiskSizeBytes,
-			)
-		} else {
-			return copyStats{}, fmt.Errorf("failed to detect source disk size: %w", err)
-		}
-	} else if opts.DiskSizeBytes <= 0 {
-		opts.DiskSizeBytes = sourceDiskBytes
-		fmt.Fprintf(os.Stderr, "[base-copy] auto-detected source disk size=%d bytes\n", opts.DiskSizeBytes)
-	} else if opts.DiskSizeBytes != sourceDiskBytes {
-		fmt.Fprintf(
-			os.Stderr,
-			"[base-copy] disk-size-bytes mismatch requested=%d detected=%d, using detected size\n",
-			opts.DiskSizeBytes,
-			sourceDiskBytes,
-		)
-		opts.DiskSizeBytes = sourceDiskBytes
+		return copyStats{}, err
 	}
+	opts.DiskSizeBytes = sourceDiskBytes
 
 	if err := createSparseQCOW2(opts.TargetQCOW2, opts.DiskSizeBytes); err != nil {
 		return copyStats{}, err
@@ -1390,8 +1497,6 @@ func runBaseCopy(ctx context.Context, opts baseCopyOptions) (copyStats, error) {
 		opts.FastMBps,
 		opts.SlowMBps,
 	)
-	allocChunkBytes := int64(alignUp(opts.MinChunkMB*1024*1024, sectorSize))
-	allocatedExtents, allocErr := queryAllocatedExtents(opts.VDDK, opts.DiskPath, opts.DiskSizeBytes, allocChunkBytes)
 	useAllocatedExtents := allocErr == nil
 	if allocErr != nil {
 		fmt.Fprintf(os.Stderr, "[base-copy] QueryAllocatedBlocks unavailable (%v), falling back to full read\n", allocErr)
@@ -1523,6 +1628,9 @@ func runBaseCopy(ctx context.Context, opts baseCopyOptions) (copyStats, error) {
 		workerWG.Add(1)
 		go func(id int) {
 			defer workerWG.Done()
+			if id > 1 {
+				time.Sleep(time.Duration(id-1) * 250 * time.Millisecond)
+			}
 			conn, err := connectVDDKWithRetry(opts.VDDK, 5, 1*time.Second)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "[base-copy] warning: reader %d connect failed, disabling this reader: %v\n", id, err)
@@ -1810,6 +1918,9 @@ func runDeltaSync(ctx context.Context, opts deltaSyncOptions) (copyStats, error)
 		workerWG.Add(1)
 		go func(id int) {
 			defer workerWG.Done()
+			if id > 1 {
+				time.Sleep(time.Duration(id-1) * 250 * time.Millisecond)
+			}
 			conn, err := connectVDDKWithRetry(opts.VDDK, 5, 1*time.Second)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "[delta-sync] warning: reader %d connect failed, disabling this reader: %v\n", id, err)
