@@ -710,21 +710,34 @@ export default function App() {
         const nics = draft?.nics || [];
         const disks = draft?.disks || [];
         const dataDisks = disks.filter((disk) => disk.diskType !== "os");
-        const mappedNICs = nics.filter((nic) => !!nic.networkid).length;
+        const resolveName = (items, id) => {
+          if (!id) return "-";
+          const item = items.find((entry) => entry.id === id);
+          return item ? optionLabel(item) : id;
+        };
+        const dataDiskDetails = dataDisks.map((disk) => ({
+          unit: disk.unit,
+          label: disk.label || `Disk ${disk.unit}`,
+          storageName: resolveName(storagePools, disk.storageid),
+        }));
+        const nicDetails = nics.map((nic, index) => ({
+          id: nic.id || String(index),
+          label: nic.source_label || `NIC ${index + 1}`,
+          networkName: resolveName(networks, nic.networkid || draft?.networkid || ""),
+        }));
         return {
           vmName,
-          zoneid: draft?.zoneid || "",
-          clusterid: draft?.clusterid || "",
-          serviceofferingid: draft?.serviceofferingid || "",
-          boot_storageid: draft?.boot_storageid || "",
+          zoneName: resolveName(zones, draft?.zoneid || ""),
+          clusterName: resolveName(clusters, draft?.clusterid || ""),
+          serviceOfferingName: resolveName(serviceOfferings, draft?.serviceofferingid || ""),
+          bootStorageName: resolveName(storagePools, draft?.boot_storageid || ""),
           delta_interval: draft?.migration?.delta_interval || "",
           finalize_at: draft?.migration?.finalize_at || "",
-          dataDiskCount: dataDisks.length,
-          mappedNICs,
-          nicCount: nics.length,
+          dataDiskDetails,
+          nicDetails,
         };
       }),
-    [selectedVmNames, vmSpecsByName]
+    [clusters, networks, selectedVmNames, serviceOfferings, storagePools, vmSpecsByName, zones]
   );
 
   return (
@@ -817,8 +830,8 @@ export default function App() {
                         <th>Boot Storage</th>
                         <th>Delta (sec)</th>
                         <th>Finalize At</th>
-                        <th>Data Disks</th>
-                        <th>NIC Mapped</th>
+                        <th>Data Disk Mapping</th>
+                        <th>NIC Mapping</th>
                       </tr>
                     </thead>
                     <tbody>
@@ -830,14 +843,30 @@ export default function App() {
                         selectedSettingsRows.map((row) => (
                           <tr key={row.vmName} className={row.vmName === activeVmName ? "selected-row" : ""}>
                             <td>{row.vmName}</td>
-                            <td><code>{row.zoneid || "-"}</code></td>
-                            <td><code>{row.clusterid || "-"}</code></td>
-                            <td><code>{row.serviceofferingid || "-"}</code></td>
-                            <td><code>{row.boot_storageid || "-"}</code></td>
+                            <td>{row.zoneName || "-"}</td>
+                            <td>{row.clusterName || "-"}</td>
+                            <td>{row.serviceOfferingName || "-"}</td>
+                            <td>{row.bootStorageName || "-"}</td>
                             <td>{row.delta_interval || "-"}</td>
                             <td>{row.finalize_at || "-"}</td>
-                            <td>{row.dataDiskCount}</td>
-                            <td>{row.mappedNICs}/{row.nicCount}</td>
+                            <td>
+                              {row.dataDiskDetails.length ? (
+                                row.dataDiskDetails.map((disk) => (
+                                  <div key={`${row.vmName}-disk-${disk.unit}`} className="hint small">{disk.label} -> {disk.storageName}</div>
+                                ))
+                              ) : (
+                                <span className="hint small">No data disks</span>
+                              )}
+                            </td>
+                            <td>
+                              {row.nicDetails.length ? (
+                                row.nicDetails.map((nic) => (
+                                  <div key={`${row.vmName}-nic-${nic.id}`} className="hint small">{nic.label} -> {nic.networkName}</div>
+                                ))
+                              ) : (
+                                <span className="hint small">No NICs</span>
+                              )}
+                            </td>
                           </tr>
                         ))
                       )}
