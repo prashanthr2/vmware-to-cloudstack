@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 
 import DiskTable from "./components/DiskTable";
 import EnvironmentManager from "./components/EnvironmentManager";
@@ -54,13 +54,6 @@ function normalizeMigration(input = {}) {
     shutdown_mode: input.shutdown_mode ?? DEFAULT_MIGRATION.shutdown_mode,
     snapshot_quiesce: input.snapshot_quiesce ?? DEFAULT_MIGRATION.snapshot_quiesce,
   };
-}
-
-function formatTimestamp(value) {
-  if (!value) return "";
-  const dt = new Date(value);
-  if (Number.isNaN(dt.getTime())) return value;
-  return dt.toLocaleString();
 }
 
 function validateDraft(draft) {
@@ -149,9 +142,6 @@ export default function App() {
   const [selectedVmNames, setSelectedVmNames] = useState([]);
   const [activeVmName, setActiveVmName] = useState("");
   const [vmSpecsByName, setVmSpecsByName] = useState({});
-  const [settingsBusy, setSettingsBusy] = useState(false);
-  const [savedSettingsByVm, setSavedSettingsByVm] = useState({});
-  const attemptedSettingsLoadRef = useRef(new Set());
 
   const [lastSpecFile, setLastSpecFile] = useState("");
   const [jobs, setJobs] = useState([]);
@@ -299,69 +289,6 @@ export default function App() {
     [defaultSelections, mapInventoryDisks, mapInventoryNics]
   );
 
-  const mergeSavedSettingsDraft = useCallback(
-    (vm, currentDraft, savedPayload) => {
-      if (!vm || !currentDraft || !savedPayload) return currentDraft;
-      const nonEmpty = (value, fallback) => {
-        if (value === null || value === undefined) return fallback;
-        const asString = String(value).trim();
-        return asString === "" ? fallback : asString;
-      };
-      const zoneid = nonEmpty(savedPayload.zoneid, currentDraft.zoneid || defaultSelections.zoneid);
-      const clusterid = nonEmpty(savedPayload.clusterid, currentDraft.clusterid || defaultSelections.clusterid);
-      const networkid = nonEmpty(savedPayload.networkid, currentDraft.networkid || defaultSelections.networkid);
-      const serviceofferingid = nonEmpty(
-        savedPayload.serviceofferingid,
-        currentDraft.serviceofferingid || defaultSelections.serviceofferingid
-      );
-      const bootStorage = nonEmpty(savedPayload.boot_storageid, currentDraft.boot_storageid || defaultSelections.boot_storageid);
-
-      const savedDisks = savedPayload.disks || {};
-      const mergedDisks = mapInventoryDisks(vm.disks || [], bootStorage, currentDraft.disks || []).map((disk) => {
-        if (disk.diskType === "os") {
-          return { ...disk, storageid: bootStorage };
-        }
-        const savedDisk = savedDisks[disk.unit];
-        if (!savedDisk) return disk;
-        return {
-          ...disk,
-          storageid: nonEmpty(savedDisk.storageid, disk.storageid),
-          diskofferingid: nonEmpty(savedDisk.diskofferingid, disk.diskofferingid),
-        };
-      });
-
-      const savedNicMappings = savedPayload.nic_mappings || {};
-      const mergedNics = mapInventoryNics(vm.nics || [], networkid, currentDraft.nics || []).map((nic) => {
-        const savedNic = savedNicMappings[nic.id];
-        if (!savedNic) return nic;
-        return {
-          ...nic,
-          source_label: nonEmpty(savedNic.source_label, nic.source_label),
-          source_network: nonEmpty(savedNic.source_network, nic.source_network),
-          source_mac: nonEmpty(savedNic.source_mac, nic.source_mac),
-          source_device_key: savedNic.source_device_key ?? nic.source_device_key,
-          source_index: savedNic.source_index ?? nic.source_index,
-          networkid: nonEmpty(savedNic.networkid, nic.networkid || networkid),
-        };
-      });
-
-      return {
-        ...currentDraft,
-        vm_name: vm.name,
-        vm_moref: nonEmpty(savedPayload.vm_moref, vm.moref || currentDraft.vm_moref || ""),
-        zoneid,
-        clusterid,
-        networkid,
-        serviceofferingid,
-        boot_storageid: bootStorage,
-        migration: normalizeMigration(savedPayload.migration || currentDraft.migration || {}),
-        disks: mergedDisks,
-        nics: mergedNics,
-      };
-    },
-    [defaultSelections, mapInventoryDisks, mapInventoryNics]
-  );
-
   useEffect(() => {
     const vmNames = new Set(vmwareVms.map((vm) => vm.name));
     setSelectedVmNames((prev) => {
@@ -404,9 +331,9 @@ export default function App() {
   const activeValidation = useMemo(() => validateDraft(activeDraft), [activeDraft]);
 
   const canStartMigration = useMemo(() => {
-    if (busy || settingsBusy || selectedVmNames.length === 0) return false;
+    if (busy || selectedVmNames.length === 0) return false;
     return selectedVmNames.every((vmName) => validateDraft(vmSpecsByName[vmName]).valid);
-  }, [busy, selectedVmNames, settingsBusy, vmSpecsByName]);
+  }, [busy, selectedVmNames, vmSpecsByName]);
 
   const updateActiveDraft = useCallback(
     (updater) => {
@@ -712,117 +639,6 @@ export default function App() {
     };
   }, []);
 
-  const saveSettings = useCallback(
-    async (vmNames, { silent = false } = {}) => {
-      if (!vmNames.length) {
-        if (!silent) pushToast("error", "Select at least one VM.");
-        return false;
-      }
-      setSettingsBusy(true);
-      try {
-        let count = 0;
-        const updates = {};
-        for (const vmName of vmNames) {
-          const draft = vmSpecsByName[vmName];
-          if (!draft) continue;
-          const response = await apiRequest("/migration/settings", {
-            method: "POST",
-            headers: { ...vmwareHeaders, ...cloudstackHeaders },
-            body: JSON.stringify(buildSpecPayload(draft)),
-          });
-          updates[vmName] = {
-            saved_at: response?.saved_at || new Date().toISOString(),
-            settings_file: response?.settings_file || "",
-          };
-          attemptedSettingsLoadRef.current.add(vmName);
-          count++;
-        }
-        if (count > 0) {
-          setSavedSettingsByVm((prev) => ({ ...prev, ...updates }));
-          if (!silent) pushToast("success", `Saved settings for ${count} VM(s).`);
-          return true;
-        }
-        if (!silent) pushToast("error", "No VM draft available to save.");
-        return false;
-      } catch (err) {
-        if (!silent) pushToast("error", err.message || "Failed to save settings.");
-        return false;
-      } finally {
-        setSettingsBusy(false);
-      }
-    },
-    [buildSpecPayload, cloudstackHeaders, pushToast, vmSpecsByName, vmwareHeaders]
-  );
-
-  const loadSavedSettings = useCallback(
-    async (vmNames, { silent = false, force = false } = {}) => {
-      if (!vmNames.length) return;
-      setSettingsBusy(true);
-      try {
-        const updates = {};
-        const meta = {};
-        let loaded = 0;
-        let missing = 0;
-        for (const vmName of vmNames) {
-          if (!force && attemptedSettingsLoadRef.current.has(vmName)) continue;
-          attemptedSettingsLoadRef.current.add(vmName);
-          const vm = vmwareVms.find((item) => item.name === vmName);
-          const draft = vmSpecsByName[vmName];
-          const vmMoref = draft?.vm_moref || vm?.moref || "";
-          try {
-            const response = await apiRequest(
-              `/migration/settings?vm_name=${encodeURIComponent(vmName)}&vm_moref=${encodeURIComponent(vmMoref)}`,
-              { headers: vmwareHeaders }
-            );
-            if (!response?.settings) continue;
-            updates[vmName] = response.settings;
-            meta[vmName] = {
-              saved_at: response.saved_at || "",
-              settings_file: response.settings_file || "",
-            };
-            loaded++;
-          } catch (err) {
-            const msg = (err?.message || "").toLowerCase();
-            if (msg.includes("no saved settings found") || msg.includes("not found")) {
-              missing++;
-              continue;
-            }
-            if (!silent) pushToast("error", `${vmName}: ${err?.message || "failed to load settings"}`);
-          }
-        }
-
-        if (Object.keys(updates).length > 0) {
-          setVmSpecsByName((prev) => {
-            const next = { ...prev };
-            Object.keys(updates).forEach((vmName) => {
-              const vm = vmwareVms.find((item) => item.name === vmName);
-              const current = next[vmName];
-              if (!vm || !current) return;
-              next[vmName] = mergeSavedSettingsDraft(vm, current, updates[vmName]);
-            });
-            return next;
-          });
-          setSavedSettingsByVm((prev) => ({ ...prev, ...meta }));
-          if (!silent) pushToast("success", `Loaded saved settings for ${loaded} VM(s).`);
-          return;
-        }
-
-        if (!silent && missing > 0) {
-          pushToast("error", "No saved settings found for selected VM(s).");
-        }
-      } finally {
-        setSettingsBusy(false);
-      }
-    },
-    [mergeSavedSettingsDraft, pushToast, vmSpecsByName, vmwareHeaders, vmwareVms]
-  );
-
-  useEffect(() => {
-    const pending = selectedVmNames.filter((name) => !attemptedSettingsLoadRef.current.has(name));
-    if (pending.length === 0) return;
-    loadSavedSettings(pending, { silent: true, force: false });
-  }, [loadSavedSettings, selectedVmNames]);
-
   const createSpec = useCallback(
     async (startAfter) => {
       if (selectedVmNames.length === 0) {
@@ -840,8 +656,6 @@ export default function App() {
 
       setBusy(true);
       try {
-        const saved = await saveSettings(selectedVmNames, { silent: true });
-        if (!saved) throw new Error("Failed to save VM settings before spec generation.");
         const specFiles = [];
         const startedJobs = [];
         for (const vmName of selectedVmNames) {
@@ -873,7 +687,7 @@ export default function App() {
         setBusy(false);
       }
     },
-    [buildSpecPayload, cloudstackHeaders, pushToast, refreshJobs, saveSettings, selectedVmNames, vmSpecsByName, vmwareHeaders]
+    [buildSpecPayload, cloudstackHeaders, pushToast, refreshJobs, selectedVmNames, vmSpecsByName, vmwareHeaders]
   );
 
   const finalizeVm = useCallback(
@@ -894,8 +708,9 @@ export default function App() {
       selectedVmNames.map((vmName) => {
         const draft = vmSpecsByName[vmName];
         const nics = draft?.nics || [];
+        const disks = draft?.disks || [];
+        const dataDisks = disks.filter((disk) => disk.diskType !== "os");
         const mappedNICs = nics.filter((nic) => !!nic.networkid).length;
-        const saved = savedSettingsByVm[vmName];
         return {
           vmName,
           zoneid: draft?.zoneid || "",
@@ -903,12 +718,13 @@ export default function App() {
           serviceofferingid: draft?.serviceofferingid || "",
           boot_storageid: draft?.boot_storageid || "",
           delta_interval: draft?.migration?.delta_interval || "",
+          finalize_at: draft?.migration?.finalize_at || "",
+          dataDiskCount: dataDisks.length,
           mappedNICs,
           nicCount: nics.length,
-          savedAt: saved?.saved_at || "",
         };
       }),
-    [savedSettingsByVm, selectedVmNames, vmSpecsByName]
+    [selectedVmNames, vmSpecsByName]
   );
 
   return (
@@ -951,32 +767,9 @@ export default function App() {
               <section className="panel">
                 <div className="subsection-title-row">
                   <h2>Target and Strategy ({activeDraft.vm_name})</h2>
-                  <div className="actions compact">
-                    <button className="secondary" onClick={loadInventory} disabled={inventoryBusy || settingsBusy}>
-                      {inventoryBusy ? "Loading..." : "Reload Inventory"}
-                    </button>
-                    <button
-                      className="secondary"
-                      onClick={() => loadSavedSettings([activeDraft.vm_name], { silent: false, force: true })}
-                      disabled={settingsBusy}
-                    >
-                      {settingsBusy ? "Working..." : "Load Saved (Active VM)"}
-                    </button>
-                    <button
-                      className="secondary"
-                      onClick={() => saveSettings([activeDraft.vm_name], { silent: false })}
-                      disabled={settingsBusy}
-                    >
-                      {settingsBusy ? "Working..." : "Save Settings (Active VM)"}
-                    </button>
-                    <button
-                      className="secondary"
-                      onClick={() => saveSettings(selectedVmNames, { silent: false })}
-                      disabled={settingsBusy || selectedVmNames.length === 0}
-                    >
-                      {settingsBusy ? "Working..." : `Save Settings (Selected ${selectedVmNames.length})`}
-                    </button>
-                  </div>
+                  <button className="secondary" onClick={loadInventory} disabled={inventoryBusy}>
+                    {inventoryBusy ? "Loading..." : "Reload Inventory"}
+                  </button>
                 </div>
                 <div className="form-grid">
                   <label>VM MoRef<input value={activeDraft.vm_moref} onChange={(e) => updateField("vm_moref", e.target.value)} placeholder="vm-123" /></label>
@@ -991,51 +784,6 @@ export default function App() {
                   <label>Finalize Window<input type="number" min="1" value={activeDraft.migration.finalize_window} onChange={(e) => updateMigrationField("finalize_window", e.target.value)} /></label>
                   <label>Shutdown Mode<input value={activeDraft.migration.shutdown_mode} onChange={(e) => updateMigrationField("shutdown_mode", e.target.value)} placeholder="auto" /></label>
                   <label>Snapshot Quiesce<input value={activeDraft.migration.snapshot_quiesce} onChange={(e) => updateMigrationField("snapshot_quiesce", e.target.value)} placeholder="auto" /></label>
-                </div>
-                <p className="hint small">
-                  {savedSettingsByVm[activeDraft.vm_name]?.saved_at
-                    ? `Saved settings: ${formatTimestamp(savedSettingsByVm[activeDraft.vm_name].saved_at)}`
-                    : "Saved settings: not saved yet for this VM"}
-                </p>
-              </section>
-
-              <section className="panel">
-                <h3>Selected VM Settings Summary</h3>
-                <div className="table-wrap">
-                  <table>
-                    <thead>
-                      <tr>
-                        <th>VM</th>
-                        <th>Zone</th>
-                        <th>Cluster</th>
-                        <th>Service Offering</th>
-                        <th>Boot Storage</th>
-                        <th>Delta (sec)</th>
-                        <th>NIC Mapped</th>
-                        <th>Saved</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {selectedSettingsRows.length === 0 ? (
-                        <tr>
-                          <td colSpan={8}>No VM selected.</td>
-                        </tr>
-                      ) : (
-                        selectedSettingsRows.map((row) => (
-                          <tr key={row.vmName} className={row.vmName === activeVmName ? "selected-row" : ""}>
-                            <td>{row.vmName}</td>
-                            <td><code>{row.zoneid || "-"}</code></td>
-                            <td><code>{row.clusterid || "-"}</code></td>
-                            <td><code>{row.serviceofferingid || "-"}</code></td>
-                            <td><code>{row.boot_storageid || "-"}</code></td>
-                            <td>{row.delta_interval || "-"}</td>
-                            <td>{row.mappedNICs}/{row.nicCount}</td>
-                            <td>{row.savedAt ? formatTimestamp(row.savedAt) : "Not saved"}</td>
-                          </tr>
-                        ))
-                      )}
-                    </tbody>
-                  </table>
                 </div>
               </section>
 
@@ -1056,8 +804,51 @@ export default function App() {
               />
 
               <section className="panel">
+                <h3>Selected VM Settings Summary</h3>
+                <p className="hint">Review these values before generating spec or starting migration.</p>
+                <div className="table-wrap">
+                  <table>
+                    <thead>
+                      <tr>
+                        <th>VM</th>
+                        <th>Zone</th>
+                        <th>Cluster</th>
+                        <th>Service Offering</th>
+                        <th>Boot Storage</th>
+                        <th>Delta (sec)</th>
+                        <th>Finalize At</th>
+                        <th>Data Disks</th>
+                        <th>NIC Mapped</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {selectedSettingsRows.length === 0 ? (
+                        <tr>
+                          <td colSpan={9}>No VM selected.</td>
+                        </tr>
+                      ) : (
+                        selectedSettingsRows.map((row) => (
+                          <tr key={row.vmName} className={row.vmName === activeVmName ? "selected-row" : ""}>
+                            <td>{row.vmName}</td>
+                            <td><code>{row.zoneid || "-"}</code></td>
+                            <td><code>{row.clusterid || "-"}</code></td>
+                            <td><code>{row.serviceofferingid || "-"}</code></td>
+                            <td><code>{row.boot_storageid || "-"}</code></td>
+                            <td>{row.delta_interval || "-"}</td>
+                            <td>{row.finalize_at || "-"}</td>
+                            <td>{row.dataDiskCount}</td>
+                            <td>{row.mappedNICs}/{row.nicCount}</td>
+                          </tr>
+                        ))
+                      )}
+                    </tbody>
+                  </table>
+                </div>
+              </section>
+
+              <section className="panel">
                 <div className="actions">
-                  <button disabled={busy || settingsBusy || selectedVmNames.length === 0} onClick={() => createSpec(false)}>Generate Spec ({selectedVmNames.length})</button>
+                  <button disabled={busy || selectedVmNames.length === 0} onClick={() => createSpec(false)}>Generate Spec ({selectedVmNames.length})</button>
                   <button disabled={!canStartMigration} onClick={() => createSpec(true)}>Start Migration ({selectedVmNames.length})</button>
                 </div>
                 {!activeValidation.valid ? <p className="field-error">{activeValidation.message}</p> : null}
