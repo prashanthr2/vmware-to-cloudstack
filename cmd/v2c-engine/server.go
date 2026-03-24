@@ -128,6 +128,12 @@ type migrationSpecRequest struct {
 	Migration         migrationOptionsInput      `json:"migration"`
 }
 
+type migrationSettingsFile struct {
+	Version int                  `json:"version"`
+	SavedAt time.Time            `json:"saved_at"`
+	Payload migrationSpecRequest `json:"payload"`
+}
+
 type migrationStartRequest struct {
 	VMName   string `json:"vm_name"`
 	SpecFile string `json:"spec_file"`
@@ -239,6 +245,7 @@ func (s *apiServer) serve(listenAddr string) error {
 	mux.HandleFunc("/cloudstack/networks", s.handleCloudStackNetworks)
 	mux.HandleFunc("/cloudstack/diskofferings", s.handleCloudStackDiskOfferings)
 	mux.HandleFunc("/cloudstack/serviceofferings", s.handleCloudStackServiceOfferings)
+	mux.HandleFunc("/migration/settings", s.handleMigrationSettings)
 	mux.HandleFunc("/migration/spec", s.handleMigrationSpec)
 	mux.HandleFunc("/migration/start", s.handleMigrationStart)
 	mux.HandleFunc("/migration/jobs", s.handleMigrationJobs)
@@ -376,6 +383,94 @@ func (s *apiServer) handleCloudStackList(w http.ResponseWriter, r *http.Request,
 		return
 	}
 	writeJSON(w, http.StatusOK, items)
+}
+
+func (s *apiServer) handleMigrationSettings(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		s.handleMigrationSettingsGet(w, r)
+	case http.MethodPost:
+		s.handleMigrationSettingsSave(w, r)
+	default:
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+	}
+}
+
+func (s *apiServer) handleMigrationSettingsGet(w http.ResponseWriter, r *http.Request) {
+	vmName := strings.TrimSpace(r.URL.Query().Get("vm_name"))
+	vmMoref := strings.TrimSpace(r.URL.Query().Get("vm_moref"))
+	if vmName == "" {
+		writeError(w, http.StatusBadRequest, "vm_name is required")
+		return
+	}
+	settingsPath := s.settingsPathForVM(vmName, vmMoref)
+	if settingsPath == "" {
+		writeError(w, http.StatusNotFound, fmt.Sprintf("No saved settings found for VM '%s'.", vmName))
+		return
+	}
+	payload, savedAt, err := loadMigrationSettingsFile(settingsPath)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("failed to read saved settings: %v", err))
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"vm_name":       payload.VMName,
+		"vm_moref":      payload.VMMoref,
+		"settings":      payload,
+		"settings_file": settingsPath,
+		"saved_at":      savedAt,
+	})
+}
+
+func (s *apiServer) handleMigrationSettingsSave(w http.ResponseWriter, r *http.Request) {
+	var req migrationSpecRequest
+	if err := decodeJSONBody(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	req.VMName = strings.TrimSpace(req.VMName)
+	req.VMMoref = strings.TrimSpace(req.VMMoref)
+	if req.VMName == "" {
+		writeError(w, http.StatusBadRequest, "vm_name is required")
+		return
+	}
+
+	controlDirName, err := s.resolveControlDirName(r, req)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			writeError(w, http.StatusNotFound, fmt.Sprintf("VM '%s' not found in VMware.", req.VMName))
+			return
+		}
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	vmDir := filepath.Join(s.controlDir, controlDirName)
+	if err := os.MkdirAll(vmDir, 0o755); err != nil {
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("failed to create control dir: %v", err))
+		return
+	}
+
+	settings := migrationSettingsFile{
+		Version: 1,
+		SavedAt: time.Now().UTC(),
+		Payload: req,
+	}
+	raw, err := json.MarshalIndent(settings, "", "  ")
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("failed to marshal settings: %v", err))
+		return
+	}
+	settingsPath := filepath.Join(vmDir, "ui_settings.json")
+	if err := os.WriteFile(settingsPath, raw, 0o644); err != nil {
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("failed to write settings: %v", err))
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"vm_name":       req.VMName,
+		"vm_moref":      req.VMMoref,
+		"settings_file": settingsPath,
+		"saved_at":      settings.SavedAt,
+	})
 }
 
 func (s *apiServer) handleMigrationSpec(w http.ResponseWriter, r *http.Request) {
@@ -1211,6 +1306,44 @@ func (s *apiServer) candidateVMDirs(vmName string) []string {
 		return ai.ModTime().After(aj.ModTime())
 	})
 	return out
+}
+
+func (s *apiServer) settingsPathForVM(vmName string, vmMoref string) string {
+	vmName = strings.TrimSpace(vmName)
+	vmMoref = strings.TrimSpace(vmMoref)
+	if vmName == "" {
+		return ""
+	}
+	if vmMoref != "" {
+		candidate := filepath.Join(s.controlDir, fmt.Sprintf("%s_%s", safeVMName(vmName), vmMoref), "ui_settings.json")
+		if st, err := os.Stat(candidate); err == nil && !st.IsDir() {
+			return candidate
+		}
+	}
+	for _, dir := range s.candidateVMDirs(vmName) {
+		p := filepath.Join(dir, "ui_settings.json")
+		if st, err := os.Stat(p); err == nil && !st.IsDir() {
+			return p
+		}
+	}
+	return ""
+}
+
+func loadMigrationSettingsFile(path string) (migrationSpecRequest, time.Time, error) {
+	var zero migrationSpecRequest
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return zero, time.Time{}, err
+	}
+	var wrapped migrationSettingsFile
+	if err := json.Unmarshal(raw, &wrapped); err == nil && strings.TrimSpace(wrapped.Payload.VMName) != "" {
+		return wrapped.Payload, wrapped.SavedAt, nil
+	}
+	var payload migrationSpecRequest
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return zero, time.Time{}, err
+	}
+	return payload, time.Time{}, nil
 }
 
 func (s *apiServer) latestSpecForVM(vmName string) (string, error) {
