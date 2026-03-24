@@ -247,6 +247,27 @@ func connectVDDK(cfg vddkConnCfg) (*vddkConnection, error) {
 	return &vddkConnection{ptr: conn}, nil
 }
 
+func connectVDDKWithRetry(cfg vddkConnCfg, attempts int, baseDelay time.Duration) (*vddkConnection, error) {
+	if attempts <= 0 {
+		attempts = 1
+	}
+	if baseDelay <= 0 {
+		baseDelay = 500 * time.Millisecond
+	}
+	var lastErr error
+	for i := 0; i < attempts; i++ {
+		conn, err := connectVDDK(cfg)
+		if err == nil {
+			return conn, nil
+		}
+		lastErr = err
+		if i < attempts-1 {
+			time.Sleep(baseDelay * time.Duration(i+1))
+		}
+	}
+	return nil, lastErr
+}
+
 func (c *vddkConnection) close() {
 	if c == nil || c.ptr == nil {
 		return
@@ -264,6 +285,27 @@ func (c *vddkConnection) open(path string) (*vddkHandle, error) {
 		return nil, fmt.Errorf("VixDiskLib_Open failed: %s", vixErrorText(err))
 	}
 	return &vddkHandle{ptr: h}, nil
+}
+
+func openVDDKWithRetry(conn *vddkConnection, path string, attempts int, baseDelay time.Duration) (*vddkHandle, error) {
+	if attempts <= 0 {
+		attempts = 1
+	}
+	if baseDelay <= 0 {
+		baseDelay = 500 * time.Millisecond
+	}
+	var lastErr error
+	for i := 0; i < attempts; i++ {
+		h, err := conn.open(path)
+		if err == nil {
+			return h, nil
+		}
+		lastErr = err
+		if i < attempts-1 {
+			time.Sleep(baseDelay * time.Duration(i+1))
+		}
+	}
+	return nil, lastErr
 }
 
 func (h *vddkHandle) close() {
@@ -1141,12 +1183,12 @@ func specToBaseCopyOptions(spec *engineSpec) baseCopyOptions {
 }
 
 func detectSourceDiskSizeBytes(cfg vddkConnCfg, diskPath string) (int64, error) {
-	conn, err := connectVDDK(cfg)
+	conn, err := connectVDDKWithRetry(cfg, 6, 1*time.Second)
 	if err != nil {
 		return 0, err
 	}
 	defer conn.close()
-	handle, err := conn.open(diskPath)
+	handle, err := openVDDKWithRetry(conn, diskPath, 8, 1*time.Second)
 	if err != nil {
 		return 0, err
 	}
@@ -1200,12 +1242,12 @@ func mergeAllocatedExtents(extents []allocatedExtent, diskSizeBytes int64) []all
 }
 
 func queryAllocatedExtents(cfg vddkConnCfg, diskPath string, diskSizeBytes int64, chunkBytes int64) ([]allocatedExtent, error) {
-	conn, err := connectVDDK(cfg)
+	conn, err := connectVDDKWithRetry(cfg, 4, 1*time.Second)
 	if err != nil {
 		return nil, err
 	}
 	defer conn.close()
-	handle, err := conn.open(diskPath)
+	handle, err := openVDDKWithRetry(conn, diskPath, 5, 1*time.Second)
 	if err != nil {
 		return nil, err
 	}
@@ -1286,9 +1328,17 @@ func runBaseCopy(ctx context.Context, opts baseCopyOptions) (copyStats, error) {
 
 	sourceDiskBytes, err := detectSourceDiskSizeBytes(opts.VDDK, opts.DiskPath)
 	if err != nil {
-		return copyStats{}, fmt.Errorf("failed to detect source disk size: %w", err)
-	}
-	if opts.DiskSizeBytes <= 0 {
+		if opts.DiskSizeBytes > 0 {
+			fmt.Fprintf(
+				os.Stderr,
+				"[base-copy] warning: failed to auto-detect source disk size (%v), using provided disk-size-bytes=%d\n",
+				err,
+				opts.DiskSizeBytes,
+			)
+		} else {
+			return copyStats{}, fmt.Errorf("failed to detect source disk size: %w", err)
+		}
+	} else if opts.DiskSizeBytes <= 0 {
 		opts.DiskSizeBytes = sourceDiskBytes
 		fmt.Fprintf(os.Stderr, "[base-copy] auto-detected source disk size=%d bytes\n", opts.DiskSizeBytes)
 	} else if opts.DiskSizeBytes != sourceDiskBytes {
@@ -1470,13 +1520,13 @@ func runBaseCopy(ctx context.Context, opts baseCopyOptions) (copyStats, error) {
 		workerWG.Add(1)
 		go func(id int) {
 			defer workerWG.Done()
-			conn, err := connectVDDK(opts.VDDK)
+			conn, err := connectVDDKWithRetry(opts.VDDK, 5, 1*time.Second)
 			if err != nil {
 				pushErr(fmt.Errorf("reader %d connect failed: %w", id, err))
 				return
 			}
 			defer conn.close()
-			handle, err := conn.open(opts.DiskPath)
+			handle, err := openVDDKWithRetry(conn, opts.DiskPath, 6, 1*time.Second)
 			if err != nil {
 				pushErr(fmt.Errorf("reader %d open failed: %w", id, err))
 				return
@@ -1744,13 +1794,13 @@ func runDeltaSync(ctx context.Context, opts deltaSyncOptions) (copyStats, error)
 		workerWG.Add(1)
 		go func(id int) {
 			defer workerWG.Done()
-			conn, err := connectVDDK(opts.VDDK)
+			conn, err := connectVDDKWithRetry(opts.VDDK, 5, 1*time.Second)
 			if err != nil {
 				pushErr(fmt.Errorf("delta reader %d connect failed: %w", id, err))
 				return
 			}
 			defer conn.close()
-			handle, err := conn.open(opts.DiskPath)
+			handle, err := openVDDKWithRetry(conn, opts.DiskPath, 6, 1*time.Second)
 			if err != nil {
 				pushErr(fmt.Errorf("delta reader %d open failed: %w", id, err))
 				return
