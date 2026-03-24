@@ -116,16 +116,16 @@ type nicMappingInput struct {
 }
 
 type migrationSpecRequest struct {
-	VMName            string                   `json:"vm_name"`
-	VMMoref           string                   `json:"vm_moref"`
-	ZoneID            string                   `json:"zoneid"`
-	ClusterID         string                   `json:"clusterid"`
-	NetworkID         string                   `json:"networkid"`
-	ServiceOfferingID string                   `json:"serviceofferingid"`
-	BootStorageID     string                   `json:"boot_storageid"`
-	Disks             map[string]diskSpecInput `json:"disks"`
+	VMName            string                     `json:"vm_name"`
+	VMMoref           string                     `json:"vm_moref"`
+	ZoneID            string                     `json:"zoneid"`
+	ClusterID         string                     `json:"clusterid"`
+	NetworkID         string                     `json:"networkid"`
+	ServiceOfferingID string                     `json:"serviceofferingid"`
+	BootStorageID     string                     `json:"boot_storageid"`
+	Disks             map[string]diskSpecInput   `json:"disks"`
 	NICMappings       map[string]nicMappingInput `json:"nic_mappings"`
-	Migration         migrationOptionsInput    `json:"migration"`
+	Migration         migrationOptionsInput      `json:"migration"`
 }
 
 type migrationStartRequest struct {
@@ -1393,21 +1393,21 @@ func (s *apiServer) buildStatusPayload(vmName string, st *runState, job *apiJob)
 		}
 
 		diskProgress = append(diskProgress, map[string]any{
-			"unit":             k,
-			"disk_name":        fmt.Sprintf("Disk %d", ds.Unit),
-			"provisioned_size": formatBytes(total),
+			"unit":              k,
+			"disk_name":         fmt.Sprintf("Disk %d", ds.Unit),
+			"provisioned_size":  formatBytes(total),
 			"provisioned_bytes": total,
-			"used_size":        formatBytes(copied),
-			"used_bytes":       copied,
-			"total_size":       formatBytes(total),
-			"copied_size":      formatBytes(copied),
-			"remaining_size":   formatBytes(remaining),
-			"total_bytes":      total,
-			"copied_bytes":     copied,
-			"remaining_bytes":  remaining,
-			"speed_mbps":       ds.SpeedMBps,
-			"eta_seconds":      ds.EtaSeconds,
-			"progress":         pct,
+			"used_size":         formatBytes(copied),
+			"used_bytes":        copied,
+			"total_size":        formatBytes(total),
+			"copied_size":       formatBytes(copied),
+			"remaining_size":    formatBytes(remaining),
+			"total_bytes":       total,
+			"copied_bytes":      copied,
+			"remaining_bytes":   remaining,
+			"speed_mbps":        ds.SpeedMBps,
+			"eta_seconds":       ds.EtaSeconds,
+			"progress":          pct,
 		})
 	}
 
