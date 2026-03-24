@@ -1516,22 +1516,29 @@ func runBaseCopy(ctx context.Context, opts baseCopyOptions) (copyStats, error) {
 	}()
 
 	var workerWG sync.WaitGroup
+	var openWG sync.WaitGroup
+	var activeReaders int32
+	openWG.Add(opts.Readers)
 	for i := 0; i < opts.Readers; i++ {
 		workerWG.Add(1)
 		go func(id int) {
 			defer workerWG.Done()
 			conn, err := connectVDDKWithRetry(opts.VDDK, 5, 1*time.Second)
 			if err != nil {
-				pushErr(fmt.Errorf("reader %d connect failed: %w", id, err))
+				fmt.Fprintf(os.Stderr, "[base-copy] warning: reader %d connect failed, disabling this reader: %v\n", id, err)
+				openWG.Done()
 				return
 			}
 			defer conn.close()
 			handle, err := openVDDKWithRetry(conn, opts.DiskPath, 6, 1*time.Second)
 			if err != nil {
-				pushErr(fmt.Errorf("reader %d open failed: %w", id, err))
+				fmt.Fprintf(os.Stderr, "[base-copy] warning: reader %d open failed, disabling this reader: %v\n", id, err)
+				openWG.Done()
 				return
 			}
 			defer handle.close()
+			atomic.AddInt32(&activeReaders, 1)
+			openWG.Done()
 
 			prevEnd := int64(-1)
 			for task := range readQ {
@@ -1566,6 +1573,12 @@ func runBaseCopy(ctx context.Context, opts baseCopyOptions) (copyStats, error) {
 			}
 		}(i + 1)
 	}
+	go func() {
+		openWG.Wait()
+		if atomic.LoadInt32(&activeReaders) == 0 {
+			pushErr(fmt.Errorf("no VDDK readers could open disk %s (server=%s vm=%s snapshot=%s)", opts.DiskPath, opts.VDDK.Server, opts.VDDK.VMMoref, opts.VDDK.SnapshotMoref))
+		}
+	}()
 
 	workerWG.Wait()
 	close(writeQ)
@@ -1790,22 +1803,29 @@ func runDeltaSync(ctx context.Context, opts deltaSyncOptions) (copyStats, error)
 	}()
 
 	var workerWG sync.WaitGroup
+	var openWG sync.WaitGroup
+	var activeReaders int32
+	openWG.Add(opts.Readers)
 	for i := 0; i < opts.Readers; i++ {
 		workerWG.Add(1)
 		go func(id int) {
 			defer workerWG.Done()
 			conn, err := connectVDDKWithRetry(opts.VDDK, 5, 1*time.Second)
 			if err != nil {
-				pushErr(fmt.Errorf("delta reader %d connect failed: %w", id, err))
+				fmt.Fprintf(os.Stderr, "[delta-sync] warning: reader %d connect failed, disabling this reader: %v\n", id, err)
+				openWG.Done()
 				return
 			}
 			defer conn.close()
 			handle, err := openVDDKWithRetry(conn, opts.DiskPath, 6, 1*time.Second)
 			if err != nil {
-				pushErr(fmt.Errorf("delta reader %d open failed: %w", id, err))
+				fmt.Fprintf(os.Stderr, "[delta-sync] warning: reader %d open failed, disabling this reader: %v\n", id, err)
+				openWG.Done()
 				return
 			}
 			defer handle.close()
+			atomic.AddInt32(&activeReaders, 1)
+			openWG.Done()
 
 			for task := range readQ {
 				select {
@@ -1829,6 +1849,12 @@ func runDeltaSync(ctx context.Context, opts deltaSyncOptions) (copyStats, error)
 			}
 		}(i + 1)
 	}
+	go func() {
+		openWG.Wait()
+		if atomic.LoadInt32(&activeReaders) == 0 {
+			pushErr(fmt.Errorf("no delta readers could open disk %s (server=%s vm=%s snapshot=%s)", opts.DiskPath, opts.VDDK.Server, opts.VDDK.VMMoref, opts.VDDK.SnapshotMoref))
+		}
+	}()
 
 	workerWG.Wait()
 	close(writeQ)
