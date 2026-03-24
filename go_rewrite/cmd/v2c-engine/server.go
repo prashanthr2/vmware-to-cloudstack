@@ -74,12 +74,21 @@ type vmwareDiskInfo struct {
 	DiskType  string  `json:"disk_type,omitempty"`
 }
 
+type vmwareNICInfo struct {
+	Label      string `json:"label"`
+	Network    string `json:"network"`
+	MACAddress string `json:"mac_address,omitempty"`
+	DeviceKey  int32  `json:"device_key,omitempty"`
+	Index      int    `json:"index"`
+}
+
 type vmwareVMInfo struct {
 	Name      string           `json:"name"`
 	Moref     string           `json:"moref"`
 	CPU       int              `json:"cpu"`
 	Memory    int              `json:"memory"`
 	Disks     []vmwareDiskInfo `json:"disks"`
+	NICs      []vmwareNICInfo  `json:"nics"`
 	Datastore []string         `json:"datastore"`
 }
 
@@ -97,6 +106,15 @@ type migrationOptionsInput struct {
 	SnapshotQuiesce       string `json:"snapshot_quiesce"`
 }
 
+type nicMappingInput struct {
+	SourceLabel     string `json:"source_label"`
+	SourceNetwork   string `json:"source_network"`
+	SourceMAC       string `json:"source_mac"`
+	SourceDeviceKey int32  `json:"source_device_key"`
+	SourceIndex     int    `json:"source_index"`
+	NetworkID       string `json:"networkid"`
+}
+
 type migrationSpecRequest struct {
 	VMName            string                   `json:"vm_name"`
 	VMMoref           string                   `json:"vm_moref"`
@@ -106,6 +124,7 @@ type migrationSpecRequest struct {
 	ServiceOfferingID string                   `json:"serviceofferingid"`
 	BootStorageID     string                   `json:"boot_storageid"`
 	Disks             map[string]diskSpecInput `json:"disks"`
+	NICMappings       map[string]nicMappingInput `json:"nic_mappings"`
 	Migration         migrationOptionsInput    `json:"migration"`
 }
 
@@ -373,10 +392,17 @@ func (s *apiServer) handleMigrationSpec(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusBadRequest, "vm_name is required")
 		return
 	}
+	hasMappedNIC := false
+	for _, nic := range req.NICMappings {
+		if strings.TrimSpace(nic.NetworkID) != "" {
+			hasMappedNIC = true
+			break
+		}
+	}
 	if strings.TrimSpace(req.ZoneID) == "" || strings.TrimSpace(req.ClusterID) == "" ||
-		strings.TrimSpace(req.NetworkID) == "" || strings.TrimSpace(req.ServiceOfferingID) == "" ||
+		(strings.TrimSpace(req.NetworkID) == "" && !hasMappedNIC) || strings.TrimSpace(req.ServiceOfferingID) == "" ||
 		strings.TrimSpace(req.BootStorageID) == "" {
-		writeError(w, http.StatusBadRequest, "zoneid, clusterid, networkid, serviceofferingid and boot_storageid are required")
+		writeError(w, http.StatusBadRequest, "zoneid, clusterid, serviceofferingid, boot_storageid and at least one network mapping are required")
 		return
 	}
 
@@ -428,6 +454,29 @@ func (s *apiServer) handleMigrationSpec(w http.ResponseWriter, r *http.Request) 
 				"storageid":         req.BootStorageID,
 			},
 		},
+	}
+
+	if len(req.NICMappings) > 0 {
+		nicMappings := map[string]map[string]any{}
+		for k, v := range req.NICMappings {
+			networkID := strings.TrimSpace(v.NetworkID)
+			if networkID == "" {
+				continue
+			}
+			nicMappings[k] = map[string]any{
+				"source_label":      strings.TrimSpace(v.SourceLabel),
+				"source_network":    strings.TrimSpace(v.SourceNetwork),
+				"source_mac":        strings.TrimSpace(v.SourceMAC),
+				"source_device_key": v.SourceDeviceKey,
+				"source_index":      v.SourceIndex,
+				"networkid":         networkID,
+			}
+		}
+		if len(nicMappings) > 0 {
+			target, _ := spec["target"].(map[string]any)
+			cloud, _ := target["cloudstack"].(map[string]any)
+			cloud["nic_mappings"] = nicMappings
+		}
 	}
 
 	disks := map[string]map[string]string{}
@@ -843,42 +892,64 @@ func listVMwareInventory(ctx context.Context, client *govmomi.Client) ([]vmwareV
 		bootUnit := detectBootDiskUnit(vm.Config)
 
 		disks := make([]vmwareDiskInfo, 0)
+		nics := make([]vmwareNICInfo, 0)
 		dsSet := map[string]struct{}{}
+		nicIdx := 0
 		for _, dev := range vm.Config.Hardware.Device {
 			vd, ok := dev.(*types.VirtualDisk)
+			if ok {
+				if vd.UnitNumber == nil {
+					continue
+				}
+				unit := int(*vd.UnitNumber)
+				capacity := int64(vd.CapacityInBytes)
+				if capacity <= 0 && vd.CapacityInKB > 0 {
+					capacity = int64(vd.CapacityInKB) * 1024
+				}
+				sizeGB := math.Round((float64(capacity)/1024.0/1024.0/1024.0)*100) / 100
+
+				dsName := datastoreFromBacking(vd.Backing)
+				if dsName != "" {
+					dsSet[dsName] = struct{}{}
+				}
+				diskType := "data"
+				if bootUnit != nil && unit == *bootUnit {
+					diskType = "os"
+				}
+				label := "Virtual Disk"
+				if vd.DeviceInfo != nil {
+					label = vd.DeviceInfo.GetDescription().Label
+				}
+				u := unit
+				disks = append(disks, vmwareDiskInfo{
+					Label:     label,
+					SizeGB:    sizeGB,
+					Datastore: dsName,
+					Unit:      &u,
+					DiskType:  diskType,
+				})
+			}
+
+			nic, ok := dev.(types.BaseVirtualEthernetCard)
 			if !ok {
 				continue
 			}
-			if vd.UnitNumber == nil {
+			card := nic.GetVirtualEthernetCard()
+			if card == nil {
 				continue
 			}
-			unit := int(*vd.UnitNumber)
-			capacity := int64(vd.CapacityInBytes)
-			if capacity <= 0 && vd.CapacityInKB > 0 {
-				capacity = int64(vd.CapacityInKB) * 1024
+			label := fmt.Sprintf("Network adapter %d", nicIdx+1)
+			if card.DeviceInfo != nil {
+				label = card.DeviceInfo.GetDescription().Label
 			}
-			sizeGB := math.Round((float64(capacity)/1024.0/1024.0/1024.0)*100) / 100
-
-			dsName := datastoreFromBacking(vd.Backing)
-			if dsName != "" {
-				dsSet[dsName] = struct{}{}
-			}
-			diskType := "data"
-			if bootUnit != nil && unit == *bootUnit {
-				diskType = "os"
-			}
-			label := "Virtual Disk"
-			if vd.DeviceInfo != nil {
-				label = vd.DeviceInfo.GetDescription().Label
-			}
-			u := unit
-			disks = append(disks, vmwareDiskInfo{
-				Label:     label,
-				SizeGB:    sizeGB,
-				Datastore: dsName,
-				Unit:      &u,
-				DiskType:  diskType,
+			nics = append(nics, vmwareNICInfo{
+				Label:      label,
+				Network:    networkFromNICBacking(card.Backing),
+				MACAddress: card.MacAddress,
+				DeviceKey:  card.Key,
+				Index:      nicIdx,
 			})
+			nicIdx++
 		}
 		sort.Slice(disks, func(i, j int) bool {
 			li, lj := 1<<30, 1<<30
@@ -910,6 +981,7 @@ func listVMwareInventory(ctx context.Context, client *govmomi.Client) ([]vmwareV
 			CPU:       cpu,
 			Memory:    mem,
 			Disks:     disks,
+			NICs:      nics,
 			Datastore: dsList,
 		})
 	}
@@ -1039,6 +1111,23 @@ func datastoreFromFileName(file string) string {
 		return ""
 	}
 	return strings.TrimSpace(file[1:end])
+}
+
+func networkFromNICBacking(backing types.BaseVirtualDeviceBackingInfo) string {
+	switch b := backing.(type) {
+	case *types.VirtualEthernetCardNetworkBackingInfo:
+		return strings.TrimSpace(b.DeviceName)
+	case *types.VirtualEthernetCardDistributedVirtualPortBackingInfo:
+		if strings.TrimSpace(b.Port.PortgroupKey) != "" {
+			return strings.TrimSpace(b.Port.PortgroupKey)
+		}
+		if strings.TrimSpace(b.Port.SwitchUuid) != "" {
+			return strings.TrimSpace(b.Port.SwitchUuid)
+		}
+	case *types.VirtualEthernetCardOpaqueNetworkBackingInfo:
+		return strings.TrimSpace(b.OpaqueNetworkId)
+	}
+	return ""
 }
 
 func (s *apiServer) resolveControlDirName(r *http.Request, req migrationSpecRequest) (string, error) {
