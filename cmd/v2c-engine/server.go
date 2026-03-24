@@ -422,6 +422,24 @@ func (s *apiServer) handleMigrationSettingsGet(w http.ResponseWriter, r *http.Re
 	})
 }
 
+func validateUniqueNICNetworkMappings(nicMappings map[string]nicMappingInput) error {
+	if len(nicMappings) == 0 {
+		return nil
+	}
+	seen := map[string]string{}
+	for nicID, nic := range nicMappings {
+		networkID := strings.TrimSpace(nic.NetworkID)
+		if networkID == "" {
+			continue
+		}
+		if prevNIC, ok := seen[networkID]; ok {
+			return fmt.Errorf("duplicate NIC network mapping: network %s is selected for NICs %s and %s", networkID, prevNIC, nicID)
+		}
+		seen[networkID] = nicID
+	}
+	return nil
+}
+
 func (s *apiServer) handleMigrationSettingsSave(w http.ResponseWriter, r *http.Request) {
 	var req migrationSpecRequest
 	if err := decodeJSONBody(r, &req); err != nil {
@@ -432,6 +450,10 @@ func (s *apiServer) handleMigrationSettingsSave(w http.ResponseWriter, r *http.R
 	req.VMMoref = strings.TrimSpace(req.VMMoref)
 	if req.VMName == "" {
 		writeError(w, http.StatusBadRequest, "vm_name is required")
+		return
+	}
+	if err := validateUniqueNICNetworkMappings(req.NICMappings); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -485,6 +507,10 @@ func (s *apiServer) handleMigrationSpec(w http.ResponseWriter, r *http.Request) 
 	}
 	if strings.TrimSpace(req.VMName) == "" {
 		writeError(w, http.StatusBadRequest, "vm_name is required")
+		return
+	}
+	if err := validateUniqueNICNetworkMappings(req.NICMappings); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	hasMappedNIC := false

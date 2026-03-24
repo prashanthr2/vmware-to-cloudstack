@@ -81,8 +81,22 @@ function validateDraft(draft) {
   const nicErrors = {};
   const nics = draft.nics || [];
   if (nics.length > 0) {
+    const nicByNetwork = {};
     nics.forEach((nic) => {
-      if (!nic.networkid) nicErrors[nic.id] = "CloudStack network is required for each NIC.";
+      const networkID = (nic.networkid || "").trim();
+      if (!networkID) {
+        nicErrors[nic.id] = "CloudStack network is required for each NIC.";
+        return;
+      }
+      const prevNicID = nicByNetwork[networkID];
+      if (prevNicID) {
+        nicErrors[nic.id] = "Each NIC must use a different CloudStack network.";
+        if (!nicErrors[prevNicID]) {
+          nicErrors[prevNicID] = "Each NIC must use a different CloudStack network.";
+        }
+        return;
+      }
+      nicByNetwork[networkID] = nic.id;
     });
   } else if (!draft.networkid) {
     core.push("networkid");
@@ -93,7 +107,7 @@ function validateDraft(draft) {
   if (!valid) {
     if (core.length > 0) message = `Missing required fields: ${core.join(", ")}`;
     else if (Object.keys(diskErrors).length > 0) message = "Complete storage and disk offering for all data disks.";
-    else message = "Please map all VM NICs to CloudStack networks.";
+    else message = "Please map all VM NICs to unique CloudStack networks.";
   }
   return { valid, message, diskErrors, nicErrors };
 }

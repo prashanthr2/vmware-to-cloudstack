@@ -24,6 +24,12 @@ export default function NicTable({ nics, networks, fallbackNetworkId, onNicChang
             ) : (
               nics.map((nic) => {
                 const error = validationByNic[nic.id] || "";
+                const usedByOtherNICs = new Set(
+                  nics
+                    .filter((item) => item.id !== nic.id)
+                    .map((item) => (item.networkid || "").trim())
+                    .filter((id) => id !== "")
+                );
                 return (
                   <tr key={nic.id}>
                     <td>
@@ -35,9 +41,20 @@ export default function NicTable({ nics, networks, fallbackNetworkId, onNicChang
                     <td>
                       <select value={nic.networkid || ""} onChange={(e) => onNicChange(nic.id, "networkid", e.target.value)}>
                         <option value="">Select network</option>
-                        {fallbackNetworkId ? <option value={fallbackNetworkId}>Use fallback network</option> : null}
+                        {fallbackNetworkId ? (
+                          <option
+                            value={fallbackNetworkId}
+                            disabled={usedByOtherNICs.has(fallbackNetworkId) && (nic.networkid || "") !== fallbackNetworkId}
+                          >
+                            Use fallback network
+                          </option>
+                        ) : null}
                         {networks.map((item) => (
-                          <option key={item.id} value={item.id}>
+                          <option
+                            key={item.id}
+                            value={item.id}
+                            disabled={usedByOtherNICs.has(item.id) && (nic.networkid || "") !== item.id}
+                          >
                             {optionLabel(item)}
                           </option>
                         ))}
