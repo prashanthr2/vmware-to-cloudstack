@@ -66,7 +66,7 @@ After bootstrap:
 Config note:
 - `run`/`serve` use vCenter credentials only from `vcenter` in config (plus `VC_PASSWORD` fallback).
 - You do not need a second `vddk` credential block in `config.yaml`.
-- `thumbprint` is needed only for direct `base-copy` / `delta-sync` engine commands (flags or `spec.engine.example.yaml`).
+- For direct `base-copy` / `delta-sync` commands, `thumbprint` is optional; engine auto-detects it from `--server` when not provided.
 
 ## Clean uninstall / reset
 

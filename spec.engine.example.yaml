@@ -4,6 +4,7 @@ vddk:
   user: administrator@vsphere.local
   # Optional if VC_PASSWORD env var is set at runtime.
   password: ""
+  # Optional: if empty, engine auto-detects thumbprint from `server`.
   thumbprint: "43:1A:51:F0:55:B8:BB:62:93:88:04:89:0E:6D:EE:32:AF:CA:FA:D1"
   vm_moref: vm-3312
 

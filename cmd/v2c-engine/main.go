@@ -2137,6 +2137,46 @@ func getServerThumbprint(host string) (string, error) {
 	return strings.Join(parts, ":"), nil
 }
 
+func hostForThumbprintLookup(server string) string {
+	value := strings.TrimSpace(server)
+	value = strings.TrimPrefix(value, "https://")
+	value = strings.TrimPrefix(value, "http://")
+	if idx := strings.Index(value, "/"); idx >= 0 {
+		value = value[:idx]
+	}
+	if strings.HasPrefix(value, "[") {
+		if end := strings.Index(value, "]"); end > 0 {
+			return value[1:end]
+		}
+	}
+	if strings.Count(value, ":") == 1 {
+		if host, _, err := net.SplitHostPort(value); err == nil {
+			return host
+		}
+		if idx := strings.LastIndex(value, ":"); idx > 0 {
+			return value[:idx]
+		}
+	}
+	return value
+}
+
+func ensureVDDKThumbprint(cfg *vddkConnCfg) error {
+	if strings.TrimSpace(cfg.Thumbprint) != "" {
+		return nil
+	}
+	host := hostForThumbprintLookup(cfg.Server)
+	if host == "" {
+		return errors.New("cannot auto-detect thumbprint: server is empty")
+	}
+	thumb, err := getServerThumbprint(host)
+	if err != nil {
+		return fmt.Errorf("auto-detect thumbprint failed for server %q: %w (provide --thumbprint to override)", cfg.Server, err)
+	}
+	cfg.Thumbprint = thumb
+	fmt.Fprintf(os.Stderr, "[vddk] auto-detected SSL thumbprint: %s\n", thumb)
+	return nil
+}
+
 func connectVCenter(ctx context.Context, cfg *appConfig) (*govmomi.Client, error) {
 	u, err := neturl.Parse("https://" + cfg.VCenter.Host + "/sdk")
 	if err != nil {
@@ -4408,7 +4448,7 @@ func cmdBaseCopy(args []string) error {
 	fs.StringVar(&o.VDDK.Server, "server", o.VDDK.Server, "vCenter/ESXi hostname")
 	fs.StringVar(&o.VDDK.User, "user", o.VDDK.User, "vCenter username")
 	fs.StringVar(&o.VDDK.Password, "password", o.VDDK.Password, "vCenter password")
-	fs.StringVar(&o.VDDK.Thumbprint, "thumbprint", o.VDDK.Thumbprint, "SSL thumbprint")
+	fs.StringVar(&o.VDDK.Thumbprint, "thumbprint", o.VDDK.Thumbprint, "SSL thumbprint (optional; auto-detected if empty)")
 	fs.StringVar(&o.VDDK.VMMoref, "vm-moref", o.VDDK.VMMoref, "VM MoRef (vm-XXX)")
 	fs.StringVar(&o.VDDK.SnapshotMoref, "snapshot-moref", o.VDDK.SnapshotMoref, "Snapshot MoRef")
 	fs.StringVar(&o.DiskPath, "disk-path", o.DiskPath, "Snapshot disk backing path")
@@ -4434,6 +4474,9 @@ func cmdBaseCopy(args []string) error {
 
 	if o.VDDK.Password == "" {
 		o.VDDK.Password = os.Getenv("VC_PASSWORD")
+	}
+	if err := ensureVDDKThumbprint(&o.VDDK); err != nil {
+		return err
 	}
 
 	if err := validateBaseCopy(o); err != nil {
@@ -4463,7 +4506,7 @@ func cmdDeltaSync(args []string) error {
 	fs.StringVar(&o.VDDK.Server, "server", o.VDDK.Server, "vCenter/ESXi hostname")
 	fs.StringVar(&o.VDDK.User, "user", o.VDDK.User, "vCenter username")
 	fs.StringVar(&o.VDDK.Password, "password", o.VDDK.Password, "vCenter password")
-	fs.StringVar(&o.VDDK.Thumbprint, "thumbprint", o.VDDK.Thumbprint, "SSL thumbprint")
+	fs.StringVar(&o.VDDK.Thumbprint, "thumbprint", o.VDDK.Thumbprint, "SSL thumbprint (optional; auto-detected if empty)")
 	fs.StringVar(&o.VDDK.VMMoref, "vm-moref", o.VDDK.VMMoref, "VM MoRef (vm-XXX)")
 	fs.StringVar(&o.VDDK.SnapshotMoref, "snapshot-moref", o.VDDK.SnapshotMoref, "Snapshot MoRef")
 	fs.StringVar(&o.DiskPath, "disk-path", o.DiskPath, "Snapshot disk backing path")
@@ -4478,6 +4521,9 @@ func cmdDeltaSync(args []string) error {
 	if o.VDDK.Password == "" {
 		o.VDDK.Password = os.Getenv("VC_PASSWORD")
 	}
+	if err := ensureVDDKThumbprint(&o.VDDK); err != nil {
+		return err
+	}
 	if err := validateDeltaSync(o); err != nil {
 		return err
 	}
@@ -4489,7 +4535,7 @@ func cmdDeltaSync(args []string) error {
 }
 
 func validateBaseCopy(o baseCopyOptions) error {
-	if o.VDDK.LibDir == "" || o.VDDK.Server == "" || o.VDDK.User == "" || o.VDDK.Thumbprint == "" ||
+	if o.VDDK.LibDir == "" || o.VDDK.Server == "" || o.VDDK.User == "" ||
 		o.VDDK.VMMoref == "" || o.VDDK.SnapshotMoref == "" || o.DiskPath == "" || o.TargetQCOW2 == "" {
 		return errors.New("missing required base-copy flags")
 	}
@@ -4503,7 +4549,7 @@ func validateBaseCopy(o baseCopyOptions) error {
 }
 
 func validateDeltaSync(o deltaSyncOptions) error {
-	if o.VDDK.LibDir == "" || o.VDDK.Server == "" || o.VDDK.User == "" || o.VDDK.Thumbprint == "" ||
+	if o.VDDK.LibDir == "" || o.VDDK.Server == "" || o.VDDK.User == "" ||
 		o.VDDK.VMMoref == "" || o.VDDK.SnapshotMoref == "" || o.DiskPath == "" || o.TargetQCOW2 == "" || o.RangesFile == "" {
 		return errors.New("missing required delta-sync flags")
 	}
