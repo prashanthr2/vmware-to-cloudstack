@@ -44,7 +44,7 @@ export default function DiskProgress({ status }) {
               <th>Provisioned Size</th>
               <th>Used Size (Estimated)</th>
               <th>Copied</th>
-              <th>Remaining</th>
+              <th>Remaining Read</th>
               <th>Speed</th>
               <th>ETA</th>
               <th>Disk Read Progress</th>
