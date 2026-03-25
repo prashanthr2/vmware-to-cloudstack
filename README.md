@@ -234,3 +234,6 @@ Optional `serve` flags:
   --workdir /opt/vmware-to-cloudstack \
   --max-workers 3
 ```
+
+Troubleshooting:
+- If API job start fails with `chdir ... no such file or directory`, set a valid `migration.workdir` in config or start serve with `--workdir /var/lib/vm-migrator`.

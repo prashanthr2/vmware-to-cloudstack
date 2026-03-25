@@ -206,6 +206,32 @@ func cmdServe(args []string) error {
 	if workDir == "" {
 		workDir = filepath.Dir(engineBin)
 	}
+	if st, err := os.Stat(workDir); err == nil && !st.IsDir() {
+		fmt.Fprintf(os.Stderr, "[serve] warning: configured workdir %q is not a directory, falling back to %q\n", workDir, controlDir)
+		workDir = controlDir
+	}
+	if err := os.MkdirAll(workDir, 0o755); err != nil {
+		fallbackWorkDir := controlDir
+		if fallbackWorkDir == "" {
+			fallbackWorkDir = filepath.Dir(engineBin)
+		}
+		if fallbackWorkDir != workDir {
+			if mkErr := os.MkdirAll(fallbackWorkDir, 0o755); mkErr == nil {
+				fmt.Fprintf(
+					os.Stderr,
+					"[serve] warning: configured workdir %q is unavailable (%v), falling back to %q\n",
+					workDir,
+					err,
+					fallbackWorkDir,
+				)
+				workDir = fallbackWorkDir
+			} else {
+				return fmt.Errorf("failed to create workdir %q (%v) and fallback %q (%v)", workDir, err, fallbackWorkDir, mkErr)
+			}
+		} else {
+			return fmt.Errorf("failed to create workdir %q: %w", workDir, err)
+		}
+	}
 
 	maxWorkers := opts.MaxWorkers
 	if maxWorkers <= 0 {
