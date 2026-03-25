@@ -1,242 +1,146 @@
 # Go Engine: VMware -> CloudStack
 
-This repository is now Go-first and contains the migration copy/sync engine with direct VDDK reads and direct QCOW2 writes.
+This repository is Go-first and provides a production migration engine + API/UI services for VMware to CloudStack migrations.
 
-## What it does
+## Prerequisites (Top Priority)
 
-- `run` is the primary migration command for end users.
-- Internally, `run` performs base copy and delta sync:
-  - Opens multiple independent VDDK handles (`VixDiskLib_Open`) in parallel readers.
-  - Uses a shared dynamic work queue.
-  - Uses adaptive chunk sizing (1 MB to 4 MB) based on read performance.
-  - Detects all-zero blocks and skips writes to preserve sparse QCOW2 behavior.
-  - Auto-detects source disk capacity from VDDK.
-  - Writes directly to QCOW2 via `qemu-nbd` (no RAW intermediary).
-  - Uses CBT changed ranges for delta rounds.
-  - Runs `virt-v2v-in-place` in the `converting` stage (after final sync), when enabled.
-- `base-copy` and `delta-sync` remain available as expert/internal commands only.
+- Linux host
+- VMware VDDK installed (must include `include/vixDiskLib.h` and `lib64/libvixDiskLib.so*`)
+- Root/sudo access (required for service install and NFS mount operations)
+- CloudStack API access
+- vCenter credentials
 
-## Build prerequisites
+The bootstrap script installs required OS packages (Go, qemu tools, virt-v2v, guestfs, and optional node/npm for UI).
 
-- Linux host with:
-  - VMware VDDK headers and shared libraries (`vixDiskLib.h`, `libvixDiskLib.so`)
-  - `qemu-img`
-  - `qemu-nbd`
-  - `virt-v2v-in-place` (or adjust command in code)
-- Go toolchain 1.22+
-- `CGO_ENABLED=1`
+## Bootstrap Script Options (Top Priority)
 
-CloudStack endpoint input is flexible:
-- `10.0.35.146`
-- `10.0.35.146:8080`
-- `http://10.0.35.146:8080/client/api`
-- `https://cloudstack.example.com`
-
-If a port is required in your environment, specify it explicitly (for example `host:8080`).
-
-## One-command bootstrap (recommended)
-
-For operators, use the bootstrap script to install packages, setup VDDK env, build binary, and optionally create systemd service units:
+Use `scripts/bootstrap.sh` to install dependencies, build the engine, and install services.
 
 ```bash
 chmod +x ./scripts/bootstrap.sh
 sudo ./scripts/bootstrap.sh --vddk-dir /opt/vmware-vddk/vmware-vix-disklib-distrib --install-service --with-ui
 ```
 
-If you have a VDDK tarball instead of extracted directory:
+If you have a VDDK tarball:
 
 ```bash
-./scripts/bootstrap.sh --vddk-tar /tmp/VMware-vix-disklib-*.tar.gz --install-service --with-ui
+sudo ./scripts/bootstrap.sh --vddk-tar /tmp/VMware-vix-disklib-*.tar.gz --install-service --with-ui
 ```
 
-The bootstrap service install places:
-- executable at `/usr/local/bin/v2c-engine`
-- active service config at `/etc/v2c-engine/config.yaml`
-- UI env config (when `--with-ui`) at `/etc/v2c-ui/.env.local`
+Supported bootstrap options:
 
-This keeps systemd runtime independent from where the repo is cloned (`/root`, `/home`, etc.).
+- `--vddk-dir <path>`
+- `--vddk-tar <path>`
+- `--config <path>`
+- `--bin-path <path>`
+- `--listen <addr>` (API service listen, default `:8000`)
+- `--ui-listen <addr>` (UI service listen, default `0.0.0.0:5173`)
+- `--install-service` (installs `v2c-engine` and, with `--with-ui`, `v2c-ui`)
+- `--with-ui` (installs frontend dependencies and UI service unit)
+- `--start-services` (optional immediate start after setup)
+- `--skip-build`
 
-After bootstrap:
-- edit `/etc/v2c-engine/config.yaml` with vCenter + CloudStack details
-- if UI is installed, edit `/etc/v2c-ui/.env.local` (set `VITE_API_BASE`)
-- start services only after config is reviewed:
-  - `sudo systemctl enable --now v2c-engine`
-  - `sudo systemctl enable --now v2c-ui` (if `--with-ui`)
-  - `systemctl status v2c-engine v2c-ui`
-  - `journalctl -u v2c-engine -f`
+## Enable API and UI Services (Top Priority)
 
-Optional: add `--start-services` to bootstrap if you want immediate start.
-
-Config note:
-- `run`/`serve` use vCenter credentials only from `vcenter` in config (plus `VC_PASSWORD` fallback).
-- You do not need a second `vddk` credential block in `config.yaml`.
-- For expert `base-copy` / `delta-sync` commands, `thumbprint` is optional; engine auto-detects it from `--server` when not provided.
-
-## Clean uninstall / reset
-
-To remove bootstrap-installed service/binary/config and reinstall from scratch:
+Bootstrap installs service units by default without auto-start (unless `--start-services` is passed).  
+Configure first, then enable/start:
 
 ```bash
-chmod +x ./scripts/uninstall.sh
-sudo ./scripts/uninstall.sh --purge-state
-sudo ./scripts/bootstrap.sh --vddk-dir /opt/vmware-vddk/vmware-vix-disklib-distrib --install-service --with-ui
+sudo vi /etc/v2c-engine/config.yaml
+sudo vi /etc/v2c-ui/.env.local
+sudo systemctl enable --now v2c-engine v2c-ui
+systemctl status v2c-engine v2c-ui
+journalctl -u v2c-engine -f
 ```
 
-`uninstall.sh` does not remove OS packages automatically.  
-To view the bootstrap package list for manual review/removal:
+Installed paths:
+
+- Engine binary: `/usr/local/bin/v2c-engine`
+- Engine config: `/etc/v2c-engine/config.yaml`
+- UI env config: `/etc/v2c-ui/.env.local`
+- Runtime state/log root: `/var/lib/vm-migrator`
+
+Config notes:
+
+- `run`/`serve` use vCenter credentials from `vcenter` block in config (`VC_PASSWORD` env fallback).
+- You do not need a second vCenter credential block under `vddk`.
+- CloudStack endpoint input is flexible:
+  - `10.0.35.146`
+  - `10.0.35.146:8080`
+  - `http://10.0.35.146:8080/client/api`
+  - `https://cloudstack.example.com`
+
+## What The Engine Does
+
+- `run` is the primary user command.
+- Internal base copy and delta sync are handled automatically inside `run`.
+- Base copy and delta write directly into QCOW2 (no RAW intermediate).
+- Delta sync uses VMware CBT (`QueryChangedDiskAreas` path).
+- Conversion (`virt-v2v-in-place`) runs in `converting` stage after final sync (when enabled).
+- Stateful/resumable workflow persists state and logs per VM under `/var/lib/vm-migrator/<vm>_<moref>/`.
+- Finalize is supported via:
+  - marker file (`FINALIZE`) internally
+  - CLI command `v2c-engine finalize` for operators
+  - API/UI finalize action
+
+Storage behavior:
+
+- Destination path pattern: `/mnt/<storageid>/<vm>_<vmMoref>_disk<unit>.qcow2`
+- Selected CloudStack primary storage is validated as NFS.
+- Engine ensures `/mnt/<storageid>` exists and is mounted before copy.
+- If not mounted, engine attempts NFS mount using CloudStack storage pool details (`listStoragePools`).
+
+## Primary Commands
 
 ```bash
-./scripts/uninstall.sh --list-packages
-```
-
-## Example files
-
-Use the example pack in [examples/README.md](./examples/README.md).
-
-Recommended starting points:
-
-- Full operator config with comments:
-  - [examples/config.full.example.yaml](./examples/config.full.example.yaml)
-- Single VM, single disk, single NIC:
-  - [examples/spec.run.single-vm.single-disk.single-nic.yaml](./examples/spec.run.single-vm.single-disk.single-nic.yaml)
-- Single VM, multiple disks, multiple NICs:
-  - [examples/spec.run.single-vm.multi-disk.multi-nic.yaml](./examples/spec.run.single-vm.multi-disk.multi-nic.yaml)
-- Single VM using config defaults:
-  - [examples/spec.run.single-vm.defaults-only.yaml](./examples/spec.run.single-vm.defaults-only.yaml)
-- Multiple VMs, single disk, single NIC:
-  - [examples/spec.run.multi-vm.single-disk.single-nic.yaml](./examples/spec.run.multi-vm.single-disk.single-nic.yaml)
-- Multiple VMs, multiple disks, multiple NICs:
-  - [examples/spec.run.multi-vm.multi-disk.multi-nic.yaml](./examples/spec.run.multi-vm.multi-disk.multi-nic.yaml)
-- Multiple VMs using config defaults:
-  - [examples/spec.run.multi-vm.defaults-only.yaml](./examples/spec.run.multi-vm.defaults-only.yaml)
-
-## Build
-
-```bash
-go build -o v2c-engine ./cmd/v2c-engine
-```
-
-If headers/libs are in non-default locations, set:
-
-```bash
-export CGO_CFLAGS="-I/opt/vmware-vddk/include"
-export CGO_LDFLAGS="-L/opt/vmware-vddk/lib64 -lvixDiskLib -ldl -lpthread"
-```
-
-## Spec-file mode (UI-friendly)
-
-`v2c-engine` can read a YAML spec directly:
-
-```bash
+# Run one or more VM migrations
 ./v2c-engine run --spec ./spec.run.example.yaml --config ./config.yaml
 ./v2c-engine run --spec ./spec.run.example.yaml --spec ./another-vm.yaml --config ./config.yaml
 ./v2c-engine run --spec ./spec.run.multi.example.yaml --parallel-vms 3 --config ./config.yaml
+
+# Check status (includes current stage, next stage, finalize_requested)
 ./v2c-engine status --spec ./spec.run.multi.example.yaml --config ./config.yaml
+./v2c-engine status --spec ./spec.run.multi.example.yaml --vm Centos7 --json --config ./config.yaml
+
+# Request finalize for selected VM(s) from a batch spec
 ./v2c-engine finalize --spec ./spec.run.multi.example.yaml --vm Centos7 --config ./config.yaml
+./v2c-engine finalize --spec ./spec.run.multi.example.yaml --vm Centos7 --vm-id vm-3312 --config ./config.yaml
+
+# API service
 ./v2c-engine serve --config ./config.yaml --listen :8000
 ```
 
-`run` mode follows the established migration workflow for base copy and delta loop scheduling:
-- Uses a resumable JSON state machine per VM at `/var/lib/vm-migrator/<vm>_<moref>/state.json`.
-- Legacy `state.engine.json` is auto-read for resume, then new updates continue in `state.json`.
-- Writes migration logs with timestamps to `/var/lib/vm-migrator/<vm>_<moref>/migration.log` (also mirrored to stderr).
-- Stage order is: `init -> base_copy -> delta/final_sync -> converting -> import_root_disk -> import_data_disk -> done`.
-- The first snapshot is always created as `Migrate_Base_<vm>` during `init`; delta snapshots are only created in delta stages.
-- Snapshot policy: `snapshot_quiesce=auto` tries quiesced snapshots only when VMware Tools is healthy, then falls back to non-quiesced.
-- CBT policy: if CBT is not enabled, the engine enables CBT before base/delta work.
-- Persists per-disk progress fields (progress %, bytes read/written, speed, ETA) and overall VM progress.
-- `FINALIZE` file behavior is supported: if `/var/lib/vm-migrator/<vm>_<moref>/FINALIZE` exists, the engine runs one final delta round (`final_sync`) and proceeds to import.
-- Before `final_sync`, source VM shutdown is enforced using `shutdown_mode` (`auto|force|manual`) from spec/config.
-- Reads VM and migration strategy from spec (`delta_interval`, `finalize_at`, etc.).
-- Resolves destination disk path from CloudStack storage selection:
-  - boot disk -> `target.cloudstack.storageid`
-  - data disk -> `disks.<unit>.storageid`
-  - output path format -> `/mnt/<storageid>/<vm>_<vmMoref>_disk<unit>.qcow2`
-- Validates selected CloudStack primary storage is NFS and ensures `/mnt/<storageid>` is mounted before copy (auto-creates mount dir and attempts mount using storage pool NFS details when needed).
-- Imports root VM and data disks into CloudStack and attaches imported data volumes.
-- Uses CloudStack target fields from spec:
-  - `target.cloudstack.zoneid`
-  - `target.cloudstack.clusterid`
-  - `target.cloudstack.networkid`
-  - `target.cloudstack.serviceofferingid`
-  - `target.cloudstack.storageid`
-- Merges defaults from `config.yaml -> cloudstack_defaults` when these fields are omitted in spec.
-- For data disks, `diskofferingid` resolves with fallback order:
-  - `disks.<unit>.diskofferingid`
-  - `target.cloudstack.diskofferingid`
-  - `config.yaml cloudstack_defaults.diskofferingid`
-- Uses `migration.readers` and `migration.run_virt_v2v` from spec.
-- Supports parallel disk migration within the same VM via `migration.parallel_disks` (or `--parallel-disks`).
-- Supports parallel VM migrations by passing multiple `--spec` values and setting `--parallel-vms` (or config `migration.parallel_vms`).
-- Also accepts spec files with top-level `vms:` list.
-- `run_virt_v2v` default comes from `config.yaml -> virt.run_virt_v2v`, and can be overridden per-VM via `spec.migration.run_virt_v2v`.
-- If `virt-v2v-in-place` does not support `--inject-virtio-win`, the engine retries conversion without that flag for compatibility.
+`finalize` is idempotent:
 
-You can still override any value from spec with CLI flags:
+- If finalize already requested, command returns success and reports it.
+- If VM is already done, command returns success and reports completion.
 
-```bash
-./v2c-engine run --spec ./spec.run.example.yaml --readers 8 --override-run-virt-v2v --run-virt-v2v=true
-./v2c-engine run --spec ./specs.yaml --parallel-vms 3 --parallel-disks 4
-```
+## Run Workflow Stages
 
-Use [spec.run.example.yaml](./spec.run.example.yaml) as the template for full run-mode specs.
-Use [spec.run.multi.example.yaml](./spec.run.multi.example.yaml) for top-level `vms:` batch format.
+Stage order:
 
-Finalize/status notes:
-- `status` prints current stage and next stage per VM. If finalize marker is present during delta stage, next stage is shown as `Finalize`.
-- `finalize` works per VM from batch specs using `--vm` and optional `--vm-id` (MoRef) to disambiguate.
+- `init`
+- `base_copy`
+- `delta` / `final_sync`
+- `converting`
+- `import_root_disk`
+- `import_data_disk`
+- `done`
 
-Expert mode note:
-- `base-copy` and `delta-sync` are hidden from normal CLI usage.
-- To enable them for troubleshooting, set `V2C_ENABLE_EXPERT_COMMANDS=1`.
+Highlights:
 
-## GUI integration (pure Go)
+- Snapshot quiesce policy: `auto` tries quiesced snapshots when VMware Tools are healthy, else fallback non-quiesced.
+- CBT auto-enable if not already enabled.
+- Parallel VM and parallel disk support.
+- CloudStack import of root + data disks; data disk attach handled in workflow.
+- Additional NIC mappings are attached after import VM creation.
 
-The React UI can run directly against `v2c-engine serve` (no Python backend required):
+## UI/API
 
-```bash
-./v2c-engine serve --config ./config.yaml --listen :8000
-```
+UI runs as a service (`v2c-ui`) and talks to `v2c-engine serve`.
 
-UI as systemd service (installed by bootstrap with `--install-service --with-ui`):
+API endpoints:
 
-```bash
-# 1) configure backend and UI endpoint
-sudo vi /etc/v2c-engine/config.yaml
-sudo vi /etc/v2c-ui/.env.local
-
-# 2) start services
-sudo systemctl enable --now v2c-engine v2c-ui
-systemctl status v2c-engine v2c-ui
-```
-
-Start the UI (development mode):
-
-```bash
-cd frontend
-cp -n .env.example .env.local
-# for local engine API:
-echo "VITE_API_BASE=http://127.0.0.1:8000" > .env.local
-npm install
-npm run dev -- --host 0.0.0.0 --port 5173
-```
-
-Then open:
-- `http://127.0.0.1:5173` (same host)
-- `http://<server-ip>:5173` (remote browser)
-
-Quick start (manual, no systemd):
-
-```bash
-# terminal 1
-./v2c-engine serve --config ./config.yaml --listen :8000
-
-# terminal 2
-cd frontend
-npm run dev -- --host 0.0.0.0 --port 5173
-```
-
-`serve` implements the same API shape used by the UI:
 - `GET /vmware/vms`
 - `GET /cloudstack/{zones|clusters|storage|networks|diskofferings|serviceofferings}`
 - `POST /migration/spec`
@@ -247,17 +151,64 @@ npm run dev -- --host 0.0.0.0 --port 5173
 - `GET /migration/logs/{vm}`
 - `GET /health`
 
-Optional `serve` flags:
+Status payload includes:
+
+- `stage`
+- `next_stage`
+- `finalize_requested`
+- `overall_progress`
+- `transfer_speed_mbps`
+- `disk_progress`
+
+## Example Files
+
+Use [examples/README.md](./examples/README.md).
+
+Common templates:
+
+- [examples/config.full.example.yaml](./examples/config.full.example.yaml)
+- [examples/spec.run.single-vm.single-disk.single-nic.yaml](./examples/spec.run.single-vm.single-disk.single-nic.yaml)
+- [examples/spec.run.single-vm.multi-disk.multi-nic.yaml](./examples/spec.run.single-vm.multi-disk.multi-nic.yaml)
+- [examples/spec.run.single-vm.defaults-only.yaml](./examples/spec.run.single-vm.defaults-only.yaml)
+- [examples/spec.run.multi-vm.single-disk.single-nic.yaml](./examples/spec.run.multi-vm.single-disk.single-nic.yaml)
+- [examples/spec.run.multi-vm.multi-disk.multi-nic.yaml](./examples/spec.run.multi-vm.multi-disk.multi-nic.yaml)
+- [examples/spec.run.multi-vm.defaults-only.yaml](./examples/spec.run.multi-vm.defaults-only.yaml)
+
+## Build (Manual)
 
 ```bash
-./v2c-engine serve \
-  --config ./config.yaml \
-  --listen :8000 \
-  --control-dir /var/lib/vm-migrator \
-  --specs-dir /var/lib/vm-migrator \
-  --workdir /var/lib/vm-migrator \
-  --max-workers 3
+go build -o v2c-engine ./cmd/v2c-engine
 ```
 
-Troubleshooting:
-- If API job start fails with `chdir ... no such file or directory`, set a valid `migration.workdir` in config or start serve with `--workdir /var/lib/vm-migrator`.
+If VDDK is in non-default path:
+
+```bash
+export CGO_CFLAGS="-I/opt/vmware-vddk/include"
+export CGO_LDFLAGS="-L/opt/vmware-vddk/lib64 -lvixDiskLib -ldl -lpthread"
+```
+
+## Uninstall / Reset
+
+```bash
+chmod +x ./scripts/uninstall.sh
+sudo ./scripts/uninstall.sh --purge-state
+```
+
+`uninstall.sh` removes service/files/config artifacts created by bootstrap.  
+It does not auto-remove OS packages.
+
+To print the bootstrap package list for manual review/removal:
+
+```bash
+./scripts/uninstall.sh --list-packages
+```
+
+## Expert-Only Commands
+
+`base-copy` and `delta-sync` are hidden by default.
+
+To enable direct expert usage:
+
+```bash
+export V2C_ENABLE_EXPERT_COMMANDS=1
+```
