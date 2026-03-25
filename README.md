@@ -29,6 +29,26 @@ This repository is now Go-first and contains the migration copy/sync engine with
 - Go toolchain 1.22+
 - `CGO_ENABLED=1`
 
+## One-command bootstrap (recommended)
+
+For operators, use the bootstrap script to install packages, setup VDDK env, build binary, and optionally create a systemd service:
+
+```bash
+chmod +x ./scripts/bootstrap.sh
+sudo ./scripts/bootstrap.sh --vddk-dir /opt/vmware-vddk/vmware-vix-disklib-distrib --install-service --with-ui
+```
+
+If you have a VDDK tarball instead of extracted directory:
+
+```bash
+./scripts/bootstrap.sh --vddk-tar /tmp/VMware-vix-disklib-*.tar.gz --install-service --with-ui
+```
+
+After bootstrap:
+- edit `config.yaml` with vCenter + CloudStack details
+- `systemctl status v2c-engine`
+- `journalctl -u v2c-engine -f`
+
 ## Build
 
 ```bash
