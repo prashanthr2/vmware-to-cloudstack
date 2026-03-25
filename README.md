@@ -44,10 +44,14 @@ If you have a VDDK tarball instead of extracted directory:
 ./scripts/bootstrap.sh --vddk-tar /tmp/VMware-vix-disklib-*.tar.gz --install-service --with-ui
 ```
 
-The bootstrap service install places the executable at `/usr/local/bin/v2c-engine` so it is safe for systemd even if the repo is under `/root` or `/home`.
+The bootstrap service install places:
+- executable at `/usr/local/bin/v2c-engine`
+- active service config at `/etc/v2c-engine/config.yaml`
+
+This keeps systemd runtime independent from where the repo is cloned (`/root`, `/home`, etc.).
 
 After bootstrap:
-- edit `config.yaml` with vCenter + CloudStack details
+- edit `/etc/v2c-engine/config.yaml` with vCenter + CloudStack details
 - `systemctl status v2c-engine`
 - `journalctl -u v2c-engine -f`
 

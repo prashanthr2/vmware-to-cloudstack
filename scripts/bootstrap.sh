@@ -12,6 +12,7 @@ LISTEN_ADDR=":8000"
 INSTALL_SERVICE=0
 WITH_UI=0
 SKIP_BUILD=0
+SERVICE_CONFIG_PATH=""
 
 usage() {
   cat <<'EOF'
@@ -184,14 +185,11 @@ install_ui_deps() {
 install_systemd_service() {
   [[ "$INSTALL_SERVICE" -eq 1 ]] || return
   local unit="/etc/systemd/system/v2c-engine.service"
-  local service_config="$CONFIG_PATH"
-  if [[ "$service_config" == /root/* ]] || [[ "$service_config" == /home/* ]]; then
-    # Systemd services often cannot read files under home paths due host policy/SELinux.
-    run_root mkdir -p /etc/v2c-engine
-    run_root install -m 0640 "$service_config" /etc/v2c-engine/config.yaml
-    service_config="/etc/v2c-engine/config.yaml"
-    log "Copied config to service-safe path: $service_config"
-  fi
+  local service_config="/etc/v2c-engine/config.yaml"
+  run_root mkdir -p /etc/v2c-engine
+  run_root install -m 0640 "$CONFIG_PATH" "$service_config"
+  SERVICE_CONFIG_PATH="$service_config"
+  log "Copied service config: $CONFIG_PATH -> $service_config"
   run_root mkdir -p /var/lib/vm-migrator
   local tmp
   tmp="$(mktemp)"
@@ -234,19 +232,23 @@ EOF
 }
 
 print_summary() {
+  local display_config="$CONFIG_PATH"
+  if [[ "$INSTALL_SERVICE" -eq 1 ]] && [[ -n "$SERVICE_CONFIG_PATH" ]]; then
+    display_config="$SERVICE_CONFIG_PATH"
+  fi
   cat <<EOF
 
 Bootstrap complete.
 
 Repo:         $REPO_DIR
-Config:       $CONFIG_PATH
+Config:       $display_config
 VDDK:         $VDDK_DIR
 Binary:       $BIN_PATH
 Service:      $([[ "$INSTALL_SERVICE" -eq 1 ]] && echo "installed (v2c-engine)" || echo "not installed")
 Frontend deps:$([[ "$WITH_UI" -eq 1 ]] && echo "installed" || echo "not installed")
 
 Next:
-1) Edit config: $CONFIG_PATH
+1) Edit config: $display_config
 2) If service installed:
    systemctl status v2c-engine
    journalctl -u v2c-engine -f
