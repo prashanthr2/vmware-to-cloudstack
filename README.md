@@ -6,11 +6,13 @@ This repository is Go-first and provides a production migration engine + API/UI 
 
 - Linux host
 - VMware VDDK installed (must include `include/vixDiskLib.h` and `lib64/libvixDiskLib.so*`)
+  - Official download: [Broadcom VDDK](https://developer.broadcom.com/sdks/vmware-virtual-disk-development-kit-vddk/latest/)
 - Root/sudo access (required for service install and NFS mount operations)
 - CloudStack API access
 - vCenter credentials
 
 The bootstrap script installs required OS packages (Go, qemu tools, virt-v2v, guestfs, and optional node/npm for UI).
+This project does not redistribute VDDK. Users must obtain VDDK directly from Broadcom and accept Broadcom licensing terms separately.
 
 ## Bootstrap Script Options
 
