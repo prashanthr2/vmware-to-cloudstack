@@ -1,3 +1,7 @@
+# Minimal config example.
+# For the fully commented operator template with mandatory/optional notes and default behavior,
+# see: examples/config.full.example.yaml
+
 vcenter:
   host: 10.0.35.3
   user: administrator@vsphere.local

@@ -49,6 +49,27 @@ After bootstrap:
 - `systemctl status v2c-engine`
 - `journalctl -u v2c-engine -f`
 
+## Example files
+
+Use the example pack in [examples/README.md](./examples/README.md).
+
+Recommended starting points:
+
+- Full operator config with comments:
+  - [examples/config.full.example.yaml](./examples/config.full.example.yaml)
+- Single VM, single disk, single NIC:
+  - [examples/spec.run.single-vm.single-disk.single-nic.yaml](./examples/spec.run.single-vm.single-disk.single-nic.yaml)
+- Single VM, multiple disks, multiple NICs:
+  - [examples/spec.run.single-vm.multi-disk.multi-nic.yaml](./examples/spec.run.single-vm.multi-disk.multi-nic.yaml)
+- Single VM using config defaults:
+  - [examples/spec.run.single-vm.defaults-only.yaml](./examples/spec.run.single-vm.defaults-only.yaml)
+- Multiple VMs, single disk, single NIC:
+  - [examples/spec.run.multi-vm.single-disk.single-nic.yaml](./examples/spec.run.multi-vm.single-disk.single-nic.yaml)
+- Multiple VMs, multiple disks, multiple NICs:
+  - [examples/spec.run.multi-vm.multi-disk.multi-nic.yaml](./examples/spec.run.multi-vm.multi-disk.multi-nic.yaml)
+- Multiple VMs using config defaults:
+  - [examples/spec.run.multi-vm.defaults-only.yaml](./examples/spec.run.multi-vm.defaults-only.yaml)
+
 ## Build
 
 ```bash

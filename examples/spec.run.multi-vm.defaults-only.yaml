@@ -1,0 +1,33 @@
+# Example: multiple VMs with minimal spec content.
+# This relies on config.yaml defaults for CloudStack placement and migration behavior.
+
+vms:
+  - vm:
+      name: BatchVM01
+
+  - vm:
+      name: BatchVM02
+
+  - vm:
+      name: BatchVM03
+
+# Defaults pulled from config.yaml:
+# - cloudstack_defaults.zoneid
+# - cloudstack_defaults.clusterid
+# - cloudstack_defaults.storageid
+# - cloudstack_defaults.networkid
+# - cloudstack_defaults.serviceofferingid
+# - cloudstack_defaults.diskofferingid
+#
+# Additional run defaults pulled from config.yaml:
+# - migration.shutdown_mode
+# - migration.parallel_disks
+# - migration.parallel_vms
+# - virt.run_virt_v2v
+#
+# Code-level defaults still apply if not present in config:
+# - migration.delta_interval: 300
+# - migration.finalize_delta_interval: 30
+# - migration.finalize_window: 600
+# - readers: 4
+

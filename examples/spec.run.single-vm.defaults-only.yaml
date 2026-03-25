@@ -1,0 +1,26 @@
+# Example: single VM with almost no per-VM settings.
+# This works only if config.yaml has cloudstack_defaults populated.
+
+vm:
+  name: MinimalLinux01
+
+migration:
+  # Optional here. If omitted, engine still uses default 300.
+  delta_interval: 300
+
+# No target block:
+# - zoneid comes from config.yaml -> cloudstack_defaults.zoneid
+# - clusterid comes from config.yaml -> cloudstack_defaults.clusterid
+# - storageid comes from config.yaml -> cloudstack_defaults.storageid
+# - networkid comes from config.yaml -> cloudstack_defaults.networkid
+# - serviceofferingid comes from config.yaml -> cloudstack_defaults.serviceofferingid
+# - diskofferingid comes from config.yaml -> cloudstack_defaults.diskofferingid
+#
+# No disks block:
+# - boot disk uses default storageid
+# - if the VM has data disks, they use default storageid and default diskofferingid
+#
+# No nic_mappings:
+# - engine falls back to target.cloudstack.networkid after defaults are applied
+# - so this is best suited for simple VMs with a single effective network target
+

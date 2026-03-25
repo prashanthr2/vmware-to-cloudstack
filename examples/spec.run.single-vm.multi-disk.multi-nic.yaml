@@ -1,0 +1,57 @@
+# Example: single VM, multiple disks, multiple NICs.
+
+vm:
+  name: AppServer01
+
+migration:
+  delta_interval: 300
+  shutdown_mode: auto
+  finalize_delta_interval: 30
+  finalize_window: 600
+  readers: 4
+  parallel_disks: 3
+  run_virt_v2v: true
+  snapshot_quiesce: auto
+
+target:
+  cloudstack:
+    zoneid: 4cbe6127-d225-4312-9465-81198791221b
+    clusterid: 51e9e14a-0d06-4db5-a73a-2431eb0643e0
+    storageid: 68f38850-a051-3ff1-9865-6a24a2ba2864
+    serviceofferingid: 4c636c18-3cd6-4b24-b0ef-e0347198b46c
+    diskofferingid: 93e1314f-3d5f-44f0-9e63-315553e50ec6
+    nic_mappings:
+      # This NIC is used for importVm because it is Network adapter 1 / index 0.
+      "4000":
+        source_label: "Network adapter 1"
+        source_network: "Prod-FrontEnd"
+        source_mac: "00:50:56:aa:bb:10"
+        source_device_key: 4000
+        source_index: 0
+        networkid: 3da6b73b-b55b-4d0d-9dcf-2c40fe8bb6aa
+      # Additional NICs are attached after importVm completes.
+      "4001":
+        source_label: "Network adapter 2"
+        source_network: "Prod-BackEnd"
+        source_mac: "00:50:56:aa:bb:11"
+        source_device_key: 4001
+        source_index: 1
+        networkid: 9f9b73b1-b55b-4d0d-9dcf-2c40fe8bb6ab
+      "4002":
+        source_label: "Network adapter 3"
+        source_network: "Prod-Storage"
+        source_mac: "00:50:56:aa:bb:12"
+        source_device_key: 4002
+        source_index: 2
+        networkid: a1ab73b2-b55b-4d0d-9dcf-2c40fe8bb6ac
+
+disks:
+  # Unit 1 = first data disk
+  "1":
+    storageid: 68f38850-a051-3ff1-9865-6a24a2ba2864
+    diskofferingid: 93e1314f-3d5f-44f0-9e63-315553e50ec6
+  # Unit 2 = second data disk
+  "2":
+    storageid: 817b4c0b-1a95-3166-ac89-065f18f8b2ab
+    diskofferingid: c3e1314f-3d5f-44f0-9e63-315553e50ed0
+

@@ -1,0 +1,124 @@
+# Full sample config for VMware -> CloudStack migration.
+# Copy this to config.yaml and replace example values.
+
+vcenter:
+  # MANDATORY: vCenter or ESXi hostname / IP used by run mode and UI backend.
+  host: 10.0.35.3
+  # MANDATORY: vCenter / ESXi username.
+  user: administrator@vsphere.local
+  # OPTIONAL:
+  # - If set here, engine uses this password.
+  # - If empty, engine uses VC_PASSWORD environment variable.
+  # - If both are empty, run/serve startup fails.
+  password: ""
+
+migration:
+  # MANDATORY for run mode:
+  # Path to extracted VMware VDDK root.
+  # Must contain include/vixDiskLib.h and lib64/libvixDiskLib.so*
+  vddk_path: /opt/vmware-vddk/vmware-vix-disklib-distrib
+
+  # OPTIONAL:
+  # Default snapshot policy for run mode.
+  # Allowed: auto | true | false
+  # Default behavior in code if omitted/empty: auto
+  snapshot_quiesce: auto
+
+  # OPTIONAL:
+  # Default source VM shutdown policy before final sync.
+  # Allowed: auto | force | manual
+  # Default behavior in code if omitted/empty: auto
+  shutdown_mode: auto
+
+  # OPTIONAL:
+  # Default max disks processed in parallel within one VM.
+  # Default behavior in code if omitted/0: 4
+  parallel_disks: 4
+
+  # OPTIONAL:
+  # Default max VMs processed in parallel when multiple specs are supplied.
+  # Default behavior in code if omitted/0: 3
+  parallel_vms: 3
+
+  # OPTIONAL:
+  # Per-VM state, logs, FINALIZE marker, and persisted spec files are written here.
+  # Default behavior in code if omitted/empty: /var/lib/vm-migrator
+  control_dir: /var/lib/vm-migrator
+
+  # OPTIONAL:
+  # Directory used by API mode for generated spec files.
+  # Default behavior if omitted/empty: <control_dir>/specs
+  specs_dir: /var/lib/vm-migrator/specs
+
+  # OPTIONAL:
+  # Working directory for API-launched subprocess jobs.
+  # Default behavior if omitted/empty: current repo directory or serve working directory
+  workdir: /opt/vmware-to-cloudstack
+
+cloudstack:
+  # MANDATORY: CloudStack API endpoint.
+  endpoint: "http://cloudstack.example.com:8080/client/api"
+  # MANDATORY: CloudStack API key.
+  api_key: "replace-me"
+  # MANDATORY: CloudStack secret key.
+  secret_key: "replace-me"
+
+cloudstack_defaults:
+  # OPTIONAL BUT STRONGLY RECOMMENDED:
+  # These defaults are injected into run specs when missing.
+  # They are especially useful for "defaults-only" spec files.
+  zoneid: "4cbe6127-d225-4312-9465-81198791221b"
+  clusterid: "51e9e14a-0d06-4db5-a73a-2431eb0643e0"
+  storageid: "68f38850-a051-3ff1-9865-6a24a2ba2864"
+  networkid: "3da6b73b-b55b-4d0d-9dcf-2c40fe8bb6aa"
+  serviceofferingid: "4c636c18-3cd6-4b24-b0ef-e0347198b46c"
+  diskofferingid: "93e1314f-3d5f-44f0-9e63-315553e50ec6"
+
+vddk:
+  # OPTIONAL for direct base-copy / delta-sync engine commands.
+  # Not required for run mode if migration.vddk_path + vcenter config are present.
+  libdir: /opt/vmware-vddk/vmware-vix-disklib-distrib
+  server: 10.0.35.3
+  user: administrator@vsphere.local
+  # OPTIONAL:
+  # If empty, base-copy / delta-sync commands fall back to VC_PASSWORD env var.
+  password: ""
+  # MANDATORY for direct engine commands unless your environment accepts otherwise.
+  thumbprint: "AA:BB:CC:DD:EE:FF:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE"
+
+engine:
+  # OPTIONAL:
+  # Global engine defaults mainly used for direct engine spec mode.
+  # Run mode uses migration.readers per VM or CLI override.
+
+  # Default behavior in code if omitted/0: 4
+  readers: 4
+  # Default behavior in code if omitted/0: 64
+  queue_depth: 64
+  # Default behavior in code if omitted/0: 1
+  min_chunk_mb: 1
+  # Default behavior in code if omitted/0: 4
+  max_chunk_mb: 4
+  # Default behavior in code if omitted/0: 40
+  fast_latency_ms: 40
+  # Default behavior in code if omitted/0: 250
+  slow_latency_ms: 250
+  # Default behavior in code if omitted/0: 180
+  fast_mbps: 180
+  # Default behavior in code if omitted/0: 40
+  slow_mbps: 40
+  # Used by some engine workflows as delta read size hint.
+  # Default behavior if omitted: engine internal defaults
+  chunk_mb_delta: 4
+
+virt:
+  # OPTIONAL:
+  # Whether run mode should execute virt-v2v-in-place on the boot disk.
+  # Default behavior if omitted: false in Go zero-value, but set explicitly for clarity.
+  run_virt_v2v: true
+
+  # OPTIONAL:
+  # Path to virtio-win ISO used when virt-v2v supports virtio injection flags.
+  # Default behavior in code if omitted/empty: /usr/share/virtio-win/virtio-win.iso
+  virtio_iso: /usr/share/virtio-win/virtio-win.iso
+
