@@ -184,6 +184,32 @@ The React UI can run directly against `v2c-engine serve` (no Python backend requ
 ./v2c-engine serve --config ./config.yaml --listen :8000
 ```
 
+Start the UI (development mode):
+
+```bash
+cd frontend
+cp -n .env.example .env.local
+# for local engine API:
+echo "VITE_API_BASE=http://127.0.0.1:8000" > .env.local
+npm install
+npm run dev -- --host 0.0.0.0 --port 5173
+```
+
+Then open:
+- `http://127.0.0.1:5173` (same host)
+- `http://<server-ip>:5173` (remote browser)
+
+Quick start (manual, no systemd):
+
+```bash
+# terminal 1
+./v2c-engine serve --config ./config.yaml --listen :8000
+
+# terminal 2
+cd frontend
+npm run dev -- --host 0.0.0.0 --port 5173
+```
+
 `serve` implements the same API shape used by the UI:
 - `GET /vmware/vms`
 - `GET /cloudstack/{zones|clusters|storage|networks|diskofferings|serviceofferings}`
