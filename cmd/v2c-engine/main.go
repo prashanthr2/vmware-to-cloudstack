@@ -3295,38 +3295,41 @@ func sanitizeHostName(vmName string) string {
 	return out
 }
 
-type cloudStackDetailPair struct {
-	Key   string
-	Value string
-}
-
-func appendCloudStackDetails(params map[string]string, details []cloudStackDetailPair) {
-	for i, detail := range details {
-		key := strings.TrimSpace(detail.Key)
-		value := strings.TrimSpace(detail.Value)
+func appendCloudStackDetails(params map[string]string, detailSet map[string]string) {
+	if len(detailSet) == 0 {
+		return
+	}
+	// CloudStack expects details in this shape:
+	// details[0].deployvm=true&details[0].rootDiskController=virtio&details[0].nicAdapter=virtio
+	params["details[0].deployvm"] = "true"
+	keys := make([]string, 0, len(detailSet))
+	for key := range detailSet {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		value := strings.TrimSpace(detailSet[key])
 		if key == "" || value == "" {
 			continue
 		}
-		params[fmt.Sprintf("details[%d].key", i)] = key
-		params[fmt.Sprintf("details[%d].value", i)] = value
+		params[fmt.Sprintf("details[0].%s", key)] = value
 	}
 }
 
-func buildCloudStackVMDetailPairs(target cloudStackTargetSpec) []cloudStackDetailPair {
-	details := make([]cloudStackDetailPair, 0, 4)
-	if v := strings.TrimSpace(target.BootType); v != "" {
-		details = append(details, cloudStackDetailPair{Key: "bootType", Value: v})
-	}
-	if strings.EqualFold(strings.TrimSpace(target.BootType), "UEFI") {
-		if v := strings.TrimSpace(target.BootMode); v != "" {
-			details = append(details, cloudStackDetailPair{Key: "bootMode", Value: v})
-		}
-	}
+func buildCloudStackVMDetails(target cloudStackTargetSpec) map[string]string {
+	details := map[string]string{}
 	if v := strings.TrimSpace(target.RootDiskController); v != "" {
-		details = append(details, cloudStackDetailPair{Key: "rootDiskController", Value: v})
+		details["rootDiskController"] = v
 	}
 	if v := strings.TrimSpace(target.NICAdapter); v != "" {
-		details = append(details, cloudStackDetailPair{Key: "nicAdapter", Value: v})
+		details["nicAdapter"] = v
+	}
+	if strings.EqualFold(strings.TrimSpace(target.BootType), "UEFI") {
+		mode := strings.ToUpper(strings.TrimSpace(target.BootMode))
+		if mode == "" {
+			mode = "LEGACY"
+		}
+		details["UEFI"] = mode
 	}
 	return details
 }
@@ -3347,7 +3350,7 @@ func updateCloudStackVMSettings(cs *cloudStackClient, vmID string, target cloudS
 	if v := strings.TrimSpace(target.OSTypeID); v != "" {
 		params["ostypeid"] = v
 	}
-	appendCloudStackDetails(params, buildCloudStackVMDetailPairs(target))
+	appendCloudStackDetails(params, buildCloudStackVMDetails(target))
 	if len(params) == 1 {
 		return nil
 	}
@@ -4883,13 +4886,12 @@ func runVMWorkflow(ctx context.Context, cfg *appConfig, spec *runSpec, opts runO
 			if err := updateCloudStackVMSettings(csClient, st.CloudStackVMID, spec.Target.CloudStack); err != nil {
 				return fmt.Errorf("apply imported VM settings failed: %w", err)
 			}
-			if settings := buildCloudStackVMDetailPairs(spec.Target.CloudStack); len(settings) > 0 || strings.TrimSpace(spec.Target.CloudStack.OSTypeID) != "" {
+			if settings := buildCloudStackVMDetails(spec.Target.CloudStack); len(settings) > 0 || strings.TrimSpace(spec.Target.CloudStack.OSTypeID) != "" {
 				log.Printf(
-					"Applied CloudStack VM settings vm_id=%s ostypeid=%s boottype=%s bootmode=%s rootdiskcontroller=%s nicadapter=%s",
+					"Applied CloudStack VM settings vm_id=%s ostypeid=%s uefi=%s rootdiskcontroller=%s nicadapter=%s",
 					st.CloudStackVMID,
 					strings.TrimSpace(spec.Target.CloudStack.OSTypeID),
-					strings.TrimSpace(spec.Target.CloudStack.BootType),
-					strings.TrimSpace(spec.Target.CloudStack.BootMode),
+					settings["UEFI"],
 					strings.TrimSpace(spec.Target.CloudStack.RootDiskController),
 					strings.TrimSpace(spec.Target.CloudStack.NICAdapter),
 				)
