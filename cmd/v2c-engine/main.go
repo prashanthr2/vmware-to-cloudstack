@@ -3300,8 +3300,7 @@ func appendCloudStackDetails(params map[string]string, detailSet map[string]stri
 		return
 	}
 	// CloudStack expects details in this shape:
-	// details[0].deployvm=true&details[0].rootDiskController=virtio&details[0].nicAdapter=virtio
-	params["details[0].deployvm"] = "true"
+	// details[0].rootDiskController=virtio&details[0].nicAdapter=virtio
 	keys := make([]string, 0, len(detailSet))
 	for key := range detailSet {
 		keys = append(keys, key)
