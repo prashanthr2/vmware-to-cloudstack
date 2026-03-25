@@ -4526,11 +4526,14 @@ func runVMWorkflow(ctx context.Context, cfg *appConfig, spec *runSpec, opts runO
 				ds := st.Disks[unitKey]
 				prevChangeID := ""
 				targetQCOW2 := ""
-				sourcePath := strings.TrimSpace(d.SourcePath)
+				// Delta data must be read from the current snapshot's backing path.
+				// Using an older persisted path can read stale blocks even when CBT
+				// correctly reports changed ranges.
+				sourcePath := strings.TrimSpace(meta.Path)
 				if ds != nil {
 					prevChangeID = ds.ChangeID
 					targetQCOW2 = ds.TargetQCOW2
-					if strings.TrimSpace(ds.SourceDiskPath) != "" {
+					if sourcePath == "" && strings.TrimSpace(ds.SourceDiskPath) != "" {
 						sourcePath = strings.TrimSpace(ds.SourceDiskPath)
 					}
 				}
@@ -4554,7 +4557,7 @@ func runVMWorkflow(ctx context.Context, cfg *appConfig, spec *runSpec, opts runO
 					return
 				}
 				if sourcePath == "" {
-					sourcePath = strings.TrimSpace(meta.Path)
+					sourcePath = strings.TrimSpace(d.SourcePath)
 				}
 				if sourcePath == "" {
 					errMu.Lock()
@@ -4583,6 +4586,14 @@ func runVMWorkflow(ctx context.Context, cfg *appConfig, spec *runSpec, opts runO
 					errMu.Unlock()
 					return
 				}
+				log.Printf(
+					"[disk%d] %s cbt ranges=%d changed_bytes=%d source=%s",
+					d.Unit,
+					stageName,
+					len(ranges),
+					changedBytes(ranges),
+					sourcePath,
+				)
 				if len(ranges) > 0 {
 					rangesPath, err := writeRangesTempFile(ranges, d.Unit)
 					if err != nil {
