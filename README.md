@@ -65,6 +65,7 @@ Installed paths:
 Config notes:
 
 - `run`/`serve` use vCenter credentials from `vcenter` block in config (`VC_PASSWORD` env fallback).
+- `migration.vddk_path` is required for `run` (path to extracted VDDK root, for example `/opt/vmware-vddk/vmware-vix-disklib-distrib`).
 - You do not need a second vCenter credential block under `vddk`.
 - CloudStack endpoint input is flexible:
   - `10.0.35.146`

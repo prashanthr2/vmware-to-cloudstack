@@ -31,6 +31,9 @@ cloudstack_defaults:
   nicadapter: ""
 
 migration:
+  # REQUIRED for run mode:
+  # Path to extracted VMware VDDK root containing include/vixDiskLib.h and lib64/libvixDiskLib.so*
+  vddk_path: /opt/vmware-vddk/vmware-vix-disklib-distrib
   # Optional orchestrator defaults for run mode.
   control_dir: /var/lib/vm-migrator
   # Optional lookup directory for API start-by-filename.
