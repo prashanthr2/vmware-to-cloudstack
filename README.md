@@ -36,6 +36,56 @@ This design keeps source VM downtime mostly to the final sync + import boundary,
 The bootstrap script installs required OS packages (Go, qemu tools, virt-v2v, guestfs, and optional node/npm for UI).
 This project does not redistribute VDDK. Users must obtain VDDK directly from Broadcom and accept Broadcom licensing terms separately.
 
+## Quick Start (Clone -> Bootstrap -> UI -> CLI)
+
+1. Clone and enter the repository:
+
+```bash
+git clone https://github.com/prashanthr2/vmware-to-cloudstack.git
+cd vmware-to-cloudstack
+```
+
+2. Bootstrap dependencies, build, and install services:
+
+```bash
+chmod +x ./scripts/bootstrap.sh
+sudo ./scripts/bootstrap.sh --vddk-dir /opt/vmware-vddk/vmware-vix-disklib-distrib --install-service --with-ui
+```
+
+3. Configure engine and UI endpoint:
+
+```bash
+sudo vi /etc/v2c-engine/config.yaml
+sudo vi /etc/v2c-ui/.env.local
+```
+
+4. Start services:
+
+```bash
+sudo systemctl enable --now v2c-engine v2c-ui
+systemctl status v2c-engine v2c-ui
+```
+
+5. Access the UI:
+
+- URL: `http://<migration-host-ip>:5173`
+- API health check: `curl -s http://<migration-host-ip>:8000/health`
+
+6. Use CLI (optional/advanced):
+
+```bash
+# check migration status for one or more specs
+/usr/local/bin/v2c-engine status --spec ./examples/spec.run.single-vm.single-disk.single-nic.yaml --config /etc/v2c-engine/config.yaml
+
+# request finalize (normal)
+/usr/local/bin/v2c-engine finalize --spec ./examples/spec.run.single-vm.single-disk.single-nic.yaml --vm Centos7 --config /etc/v2c-engine/config.yaml
+
+# request finalize-now (immediate delta wait interrupt)
+/usr/local/bin/v2c-engine finalize --spec ./examples/spec.run.single-vm.single-disk.single-nic.yaml --vm Centos7 --now --config /etc/v2c-engine/config.yaml
+```
+
+Note: use `--start-services` in bootstrap only when `/etc/v2c-engine/config.yaml` and `/etc/v2c-ui/.env.local` are already valid.
+
 ## Bootstrap Script Options
 
 Use `scripts/bootstrap.sh` to install dependencies, build the engine, and install services.
