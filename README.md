@@ -83,6 +83,7 @@ Config notes:
 - Stateful/resumable workflow persists state and logs per VM under `/var/lib/vm-migrator/<vm>_<moref>/`.
 - Finalize is supported via:
   - marker file (`FINALIZE`) internally
+  - immediate marker file (`FINALIZE_NOW`) internally
   - CLI command `v2c-engine finalize` for operators
   - API/UI finalize action
 
@@ -182,7 +183,7 @@ migration:
   finalize_window: 600
 ```
 
-### Manual Finalize
+### Manual Finalize and Finalize Now
 
 You can trigger finalize explicitly even if `finalize_at` is not set.
 
@@ -190,16 +191,21 @@ Supported methods:
 
 - CLI:
   - `./v2c-engine finalize --spec ./spec.run.multi.example.yaml --vm Centos7 --config ./config.yaml`
+  - `./v2c-engine finalize --spec ./spec.run.multi.example.yaml --vm Centos7 --now --config ./config.yaml`
 - API:
   - `POST /migration/finalize/{vm}`
+  - `POST /migration/finalize/{vm}?now=true`
 - UI:
-  - `Finalize` action from Progress tab
+  - `Finalize` and `Finalize Now` actions from Progress tab
 
 Behavior:
 
-- Finalize request is idempotent.
-- If finalize is already requested, the engine reports that state and does not duplicate work.
-- If the VM is already complete, finalize returns success with completion status.
+- `Finalize` creates a finalize request and the workflow picks it up in the delta loop.
+- `Finalize Now` requests immediate cutover from the delta loop wait:
+  - it interrupts delta sleep and moves to `final_sync` as soon as possible.
+  - if currently in `base_copy`, base copy still completes first, then workflow moves directly into finalization path.
+- Both requests are idempotent.
+- If VM is already complete, finalize calls return success with completion status.
 
 ## Workflow Diagram
 
@@ -281,12 +287,13 @@ Behavior:
 ./v2c-engine run --spec ./spec.run.example.yaml --spec ./another-vm.yaml --config ./config.yaml
 ./v2c-engine run --spec ./spec.run.multi.example.yaml --parallel-vms 3 --config ./config.yaml
 
-# Check status (includes current stage, next stage, finalize_requested)
+# Check status (includes current stage, next stage, finalize_requested, finalize_now_requested)
 ./v2c-engine status --spec ./spec.run.multi.example.yaml --config ./config.yaml
 ./v2c-engine status --spec ./spec.run.multi.example.yaml --vm Centos7 --json --config ./config.yaml
 
 # Request finalize for selected VM(s) from a batch spec
 ./v2c-engine finalize --spec ./spec.run.multi.example.yaml --vm Centos7 --config ./config.yaml
+./v2c-engine finalize --spec ./spec.run.multi.example.yaml --vm Centos7 --now --config ./config.yaml
 ./v2c-engine finalize --spec ./spec.run.multi.example.yaml --vm Centos7 --vm-id vm-3312 --config ./config.yaml
 
 # API service
@@ -296,6 +303,7 @@ Behavior:
 `finalize` is idempotent:
 
 - If finalize already requested, command returns success and reports it.
+- If finalize-now already requested (`--now`), command returns success and reports it.
 - If VM is already done, command returns success and reports completion.
 
 ## Run Workflow Stages
@@ -331,6 +339,7 @@ API endpoints:
 - `GET /migration/status/{vm}`
 - `GET /migration/jobs`
 - `POST /migration/finalize/{vm}`
+  - Optional query: `?now=true` for immediate finalize request
 - `GET /migration/logs/{vm}`
 - `GET /health`
 
@@ -339,6 +348,7 @@ Status payload includes:
 - `stage`
 - `next_stage`
 - `finalize_requested`
+- `finalize_now_requested`
 - `overall_progress`
 - `transfer_speed_mbps`
 - `disk_progress`
