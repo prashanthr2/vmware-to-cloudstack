@@ -75,7 +75,12 @@ sudo ./scripts/uninstall.sh --purge-state
 sudo ./scripts/bootstrap.sh --vddk-dir /opt/vmware-vddk/vmware-vix-disklib-distrib --install-service --with-ui
 ```
 
-If you also want to remove installed OS packages (aggressive), add `--remove-packages` to `uninstall.sh`.
+`uninstall.sh` does not remove OS packages automatically.  
+To view the bootstrap package list for manual review/removal:
+
+```bash
+./scripts/uninstall.sh --list-packages
+```
 
 ## Example files
 

@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REMOVE_PACKAGES=0
 PURGE_STATE=0
 YES=0
 
@@ -13,7 +12,7 @@ Removes v2c-engine bootstrap artifacts so you can reinstall cleanly.
 
 Options:
   --purge-state        Remove /var/lib/vm-migrator runtime state/logs/specs
-  --remove-packages    Also remove packages installed by bootstrap (aggressive)
+  --list-packages      Print bootstrap package list and exit
   --yes                Skip confirmation prompt
   -h, --help           Show this help
 EOF
@@ -42,7 +41,7 @@ This will remove:
 - service config: /etc/v2c-engine/config.yaml (and directory)
 - env files: /etc/default/v2c-engine and /etc/profile.d/v2c-engine.sh
 
-Optional flags also remove state and packages.
+Optional flag can also remove runtime state.
 EOF
   read -r -p "Continue? [y/N]: " ans
   case "${ans,,}" in
@@ -80,30 +79,33 @@ remove_state() {
   fi
 }
 
-remove_packages() {
-  [[ "$REMOVE_PACKAGES" -eq 1 ]] || return 0
-  if command -v dnf >/dev/null 2>&1; then
-    # Keep this list aligned with bootstrap package installation.
-    run_root dnf -y remove golang qemu-img qemu-kvm-core virt-v2v libguestfs-tools-c nodejs npm || true
-    run_root dnf -y autoremove || true
-    log "Attempted package removal via dnf."
-    return 0
-  fi
-  if command -v apt-get >/dev/null 2>&1; then
-    run_root apt-get -y remove golang-go qemu-utils qemu-system-x86 virt-v2v libguestfs-tools nodejs npm || true
-    run_root apt-get -y autoremove || true
-    log "Attempted package removal via apt-get."
-    return 0
-  fi
-  warn "No supported package manager detected for --remove-packages."
+print_bootstrap_package_list() {
+  cat <<'EOF'
+Bootstrap package list (reference only, not auto-removed):
+
+RHEL/Rocky/Alma/Fedora (dnf):
+  gcc make git tar curl ca-certificates golang
+  qemu-img qemu-kvm-core virt-v2v libguestfs-tools-c
+  nodejs npm (only when bootstrap used with --with-ui)
+
+Debian/Ubuntu (apt):
+  build-essential git tar curl ca-certificates golang-go
+  qemu-utils qemu-system-x86 virt-v2v libguestfs-tools
+  nodejs npm (only when bootstrap used with --with-ui)
+
+Suggested manual review commands:
+  dnf list --installed | egrep 'golang|qemu|virt-v2v|guestfs|nodejs|npm'
+  apt list --installed 2>/dev/null | egrep 'golang|qemu|virt-v2v|guestfs|nodejs|npm'
+EOF
 }
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --purge-state)
       PURGE_STATE=1; shift ;;
-    --remove-packages)
-      REMOVE_PACKAGES=1; shift ;;
+    --list-packages)
+      print_bootstrap_package_list
+      exit 0 ;;
     --yes)
       YES=1; shift ;;
     -h|--help)
@@ -117,14 +119,16 @@ confirm
 remove_service
 remove_files
 remove_state
-remove_packages
 
 cat <<'EOF'
 
 Uninstall complete.
 
+Note: OS packages are intentionally NOT removed automatically.
+Review/remove packages manually if needed:
+  ./scripts/uninstall.sh --list-packages
+
 Fresh reinstall (example):
   sudo ./scripts/bootstrap.sh --vddk-dir /opt/vmware-vddk/vmware-vix-disklib-distrib --install-service --with-ui
 
 EOF
-
