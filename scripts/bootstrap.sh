@@ -9,10 +9,13 @@ VDDK_TAR=""
 CONFIG_PATH="$REPO_DIR/config.yaml"
 BIN_PATH="/usr/local/bin/v2c-engine"
 LISTEN_ADDR=":8000"
+UI_LISTEN_ADDR="0.0.0.0:5173"
 INSTALL_SERVICE=0
 WITH_UI=0
 SKIP_BUILD=0
+START_SERVICES=0
 SERVICE_CONFIG_PATH=""
+UI_CONFIG_PATH="/etc/v2c-ui/.env.local"
 
 usage() {
   cat <<'EOF'
@@ -24,7 +27,9 @@ Options:
   --config <path>          Config file path for service (default: ./config.yaml)
   --bin-path <path>        Installed binary path for service (default: /usr/local/bin/v2c-engine)
   --listen <addr>          API listen address for service (default: :8000)
-  --install-service        Create and start systemd service: v2c-engine
+  --ui-listen <addr>       UI listen address for v2c-ui service (default: 0.0.0.0:5173)
+  --install-service        Create systemd service(s): v2c-engine (+ v2c-ui if --with-ui)
+  --start-services         Enable and start installed service(s) after setup
   --with-ui                Install frontend npm dependencies
   --skip-build             Skip Go build
   -h, --help               Show this help
@@ -176,15 +181,34 @@ install_ui_deps() {
   command_exists npm || die "npm not available; rerun with package install support for nodejs"
   (
     cd "$REPO_DIR/frontend"
-    [[ -f .env ]] || cp .env.example .env
+    [[ -f .env.local ]] || cp .env.example .env.local
     npm install
   )
   log "Installed frontend dependencies."
 }
 
+ensure_ui_config() {
+  [[ "$WITH_UI" -eq 1 ]] || return
+  run_root mkdir -p /etc/v2c-ui
+  local tmp
+  tmp="$(mktemp)"
+  cat >"$tmp" <<EOF
+# UI API endpoint (edit before starting v2c-ui service)
+# Example:
+# VITE_API_BASE=http://<engine-host>:8000
+VITE_API_BASE=http://127.0.0.1:8000
+EOF
+  if [[ ! -f "$UI_CONFIG_PATH" ]]; then
+    run_root install -m 0644 "$tmp" "$UI_CONFIG_PATH"
+    log "Created UI env file: $UI_CONFIG_PATH"
+  fi
+  rm -f "$tmp"
+}
+
 install_systemd_service() {
   [[ "$INSTALL_SERVICE" -eq 1 ]] || return
-  local unit="/etc/systemd/system/v2c-engine.service"
+  local engine_unit="/etc/systemd/system/v2c-engine.service"
+  local ui_unit="/etc/systemd/system/v2c-ui.service"
   local service_config="/etc/v2c-engine/config.yaml"
   run_root mkdir -p /etc/v2c-engine
   run_root install -m 0640 "$CONFIG_PATH" "$service_config"
@@ -214,7 +238,7 @@ LimitNOFILE=65535
 [Install]
 WantedBy=multi-user.target
 EOF
-  run_root install -m 0644 "$tmp" "$unit"
+  run_root install -m 0644 "$tmp" "$engine_unit"
   rm -f "$tmp"
   if [[ ! -f /etc/default/v2c-engine ]]; then
     local envtmp
@@ -226,9 +250,60 @@ EOF
     run_root install -m 0644 "$envtmp" /etc/default/v2c-engine
     rm -f "$envtmp"
   fi
+
+  if [[ "$WITH_UI" -eq 1 ]]; then
+    ensure_ui_config
+    local ui_host ui_port
+    if [[ "$UI_LISTEN_ADDR" == *:* ]]; then
+      ui_host="${UI_LISTEN_ADDR%:*}"
+      ui_port="${UI_LISTEN_ADDR##*:}"
+      [[ -n "$ui_host" ]] || ui_host="0.0.0.0"
+    else
+      ui_host="0.0.0.0"
+      ui_port="$UI_LISTEN_ADDR"
+    fi
+    tmp="$(mktemp)"
+    cat >"$tmp" <<EOF
+[Unit]
+Description=VMware to CloudStack Migrator UI (Vite Preview)
+After=network-online.target v2c-engine.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=$REPO_DIR/frontend
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
+ExecStart=/bin/bash -lc 'set -e; cp -f "$UI_CONFIG_PATH" "$REPO_DIR/frontend/.env.local"; npm run build; npm run preview -- --host $ui_host --port $ui_port'
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    run_root install -m 0644 "$tmp" "$ui_unit"
+    rm -f "$tmp"
+  fi
+
   run_root systemctl daemon-reload
-  run_root systemctl enable --now v2c-engine
-  log "Systemd service installed and started: v2c-engine"
+  if [[ "$START_SERVICES" -eq 1 ]]; then
+    run_root systemctl enable --now v2c-engine
+    if [[ "$WITH_UI" -eq 1 ]]; then
+      run_root systemctl enable --now v2c-ui
+      log "Systemd services installed and started: v2c-engine, v2c-ui"
+    else
+      log "Systemd service installed and started: v2c-engine"
+    fi
+  else
+    run_root systemctl disable --now v2c-engine 2>/dev/null || true
+    if [[ "$WITH_UI" -eq 1 ]]; then
+      run_root systemctl disable --now v2c-ui 2>/dev/null || true
+      log "Systemd services installed (not started): v2c-engine, v2c-ui"
+    else
+      log "Systemd service installed (not started): v2c-engine"
+    fi
+  fi
 }
 
 print_summary() {
@@ -246,13 +321,16 @@ VDDK:         $VDDK_DIR
 Binary:       $BIN_PATH
 Service:      $([[ "$INSTALL_SERVICE" -eq 1 ]] && echo "installed (v2c-engine)" || echo "not installed")
 Frontend deps:$([[ "$WITH_UI" -eq 1 ]] && echo "installed" || echo "not installed")
+UI env:       $([[ "$WITH_UI" -eq 1 ]] && echo "$UI_CONFIG_PATH" || echo "n/a")
 
 Next:
-1) Edit config: $display_config
-2) If service installed:
-   systemctl status v2c-engine
+1) Edit config (required before start): $display_config
+2) If UI installed, edit UI API endpoint: $UI_CONFIG_PATH
+3) If service installed:
+   sudo systemctl enable --now v2c-engine$([[ "$WITH_UI" -eq 1 ]] && echo " v2c-ui")
+   systemctl status v2c-engine$([[ "$WITH_UI" -eq 1 ]] && echo " v2c-ui")
    journalctl -u v2c-engine -f
-3) If service not installed:
+4) If service not installed:
    export VC_PASSWORD='your-vcenter-password'
    $BIN_PATH serve --config $CONFIG_PATH --listen $LISTEN_ADDR
 
@@ -271,8 +349,12 @@ while [[ $# -gt 0 ]]; do
       BIN_PATH="${2:-}"; shift 2 ;;
     --listen)
       LISTEN_ADDR="${2:-}"; shift 2 ;;
+    --ui-listen)
+      UI_LISTEN_ADDR="${2:-}"; shift 2 ;;
     --install-service)
       INSTALL_SERVICE=1; shift ;;
+    --start-services)
+      START_SERVICES=1; shift ;;
     --with-ui)
       WITH_UI=1; shift ;;
     --skip-build)
@@ -287,6 +369,9 @@ done
 [[ -d "$REPO_DIR/cmd/v2c-engine" ]] || die "Run this from inside the vmware-to-cloudstack repo"
 if [[ "$CONFIG_PATH" != /* ]]; then
   CONFIG_PATH="$REPO_DIR/$CONFIG_PATH"
+fi
+if [[ "$START_SERVICES" -eq 1 && "$INSTALL_SERVICE" -eq 0 ]]; then
+  die "--start-services requires --install-service"
 fi
 
 detect_and_install_packages

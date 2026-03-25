@@ -36,7 +36,7 @@ If a port is required in your environment, specify it explicitly (for example `h
 
 ## One-command bootstrap (recommended)
 
-For operators, use the bootstrap script to install packages, setup VDDK env, build binary, and optionally create a systemd service:
+For operators, use the bootstrap script to install packages, setup VDDK env, build binary, and optionally create systemd service units:
 
 ```bash
 chmod +x ./scripts/bootstrap.sh
@@ -52,13 +52,20 @@ If you have a VDDK tarball instead of extracted directory:
 The bootstrap service install places:
 - executable at `/usr/local/bin/v2c-engine`
 - active service config at `/etc/v2c-engine/config.yaml`
+- UI env config (when `--with-ui`) at `/etc/v2c-ui/.env.local`
 
 This keeps systemd runtime independent from where the repo is cloned (`/root`, `/home`, etc.).
 
 After bootstrap:
 - edit `/etc/v2c-engine/config.yaml` with vCenter + CloudStack details
-- `systemctl status v2c-engine`
-- `journalctl -u v2c-engine -f`
+- if UI is installed, edit `/etc/v2c-ui/.env.local` (set `VITE_API_BASE`)
+- start services only after config is reviewed:
+  - `sudo systemctl enable --now v2c-engine`
+  - `sudo systemctl enable --now v2c-ui` (if `--with-ui`)
+  - `systemctl status v2c-engine v2c-ui`
+  - `journalctl -u v2c-engine -f`
+
+Optional: add `--start-services` to bootstrap if you want immediate start.
 
 Config note:
 - `run`/`serve` use vCenter credentials only from `vcenter` in config (plus `VC_PASSWORD` fallback).
@@ -182,6 +189,18 @@ The React UI can run directly against `v2c-engine serve` (no Python backend requ
 
 ```bash
 ./v2c-engine serve --config ./config.yaml --listen :8000
+```
+
+UI as systemd service (installed by bootstrap with `--install-service --with-ui`):
+
+```bash
+# 1) configure backend and UI endpoint
+sudo vi /etc/v2c-engine/config.yaml
+sudo vi /etc/v2c-ui/.env.local
+
+# 2) start services
+sudo systemctl enable --now v2c-engine v2c-ui
+systemctl status v2c-engine v2c-ui
 ```
 
 Start the UI (development mode):

@@ -37,8 +37,10 @@ confirm() {
   cat <<'EOF'
 This will remove:
 - systemd unit: /etc/systemd/system/v2c-engine.service
+- systemd unit: /etc/systemd/system/v2c-ui.service (if present)
 - installed binary: /usr/local/bin/v2c-engine
 - service config: /etc/v2c-engine/config.yaml (and directory)
+- UI env config: /etc/v2c-ui/.env.local (and directory)
 - env files: /etc/default/v2c-engine and /etc/profile.d/v2c-engine.sh
 
 Optional flag can also remove runtime state.
@@ -56,11 +58,15 @@ remove_service() {
   else
     warn "v2c-engine.service not registered; skipping stop/disable."
   fi
+  if run_root systemctl list-unit-files | grep -q '^v2c-ui\.service'; then
+    run_root systemctl disable --now v2c-ui || true
+  fi
 
   run_root rm -f /etc/systemd/system/v2c-engine.service
+  run_root rm -f /etc/systemd/system/v2c-ui.service
   run_root systemctl daemon-reload
   run_root systemctl reset-failed || true
-  log "Removed systemd unit."
+  log "Removed systemd unit(s)."
 }
 
 remove_files() {
@@ -69,6 +75,8 @@ remove_files() {
   run_root rm -f /etc/profile.d/v2c-engine.sh
   run_root rm -f /etc/v2c-engine/config.yaml
   run_root rmdir /etc/v2c-engine 2>/dev/null || true
+  run_root rm -f /etc/v2c-ui/.env.local
+  run_root rmdir /etc/v2c-ui 2>/dev/null || true
   log "Removed installed binary and configuration files."
 }
 
