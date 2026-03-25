@@ -2768,17 +2768,103 @@ func validateCloudStackTarget(target cloudStackTargetSpec) error {
 	return nil
 }
 
-func ensureStorageMounted(storageID string) (string, error) {
-	mountPath := filepath.Join("/mnt", storageID)
-	if st, err := os.Stat(mountPath); err != nil || !st.IsDir() {
-		return "", fmt.Errorf("storage mount path not present: %s", mountPath)
-	}
+func decodeProcMountField(v string) string {
+	replacer := strings.NewReplacer(
+		`\\`, `\`,
+		`\040`, " ",
+		`\011`, "\t",
+		`\012`, "\n",
+	)
+	return replacer.Replace(v)
+}
+
+func findMountEntry(mountPath string) (source string, fsType string, mounted bool, err error) {
 	data, err := os.ReadFile("/proc/mounts")
+	if err != nil {
+		return "", "", false, err
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 3 {
+			continue
+		}
+		src := decodeProcMountField(fields[0])
+		dst := decodeProcMountField(fields[1])
+		fst := decodeProcMountField(fields[2])
+		if dst == mountPath {
+			return src, fst, true, nil
+		}
+	}
+	return "", "", false, nil
+}
+
+func isNFSFsType(fsType string) bool {
+	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(fsType)), "nfs")
+}
+
+func ensureStorageMounted(cs *cloudStackClient, storageID string) (string, error) {
+	storageID = strings.TrimSpace(storageID)
+	if storageID == "" {
+		return "", errors.New("storage id is empty")
+	}
+	mountPath := filepath.Join("/mnt", storageID)
+	if err := os.MkdirAll(mountPath, 0o755); err != nil {
+		return "", fmt.Errorf("failed to create storage mount path %s: %w", mountPath, err)
+	}
+
+	source, fsType, mounted, err := findMountEntry(mountPath)
 	if err != nil {
 		return "", err
 	}
-	if !strings.Contains(string(data), mountPath) {
-		return "", fmt.Errorf("%s exists but is not mounted", mountPath)
+	if mounted {
+		if !isNFSFsType(fsType) {
+			return "", fmt.Errorf("%s is mounted as %s (%s), expected NFS", mountPath, fsType, source)
+		}
+		return mountPath, nil
+	}
+
+	pool, err := cs.storagePoolByID(storageID)
+	if err != nil {
+		return "", fmt.Errorf("failed to lookup storage pool %s: %w", storageID, err)
+	}
+	if !isNFSStoragePool(*pool) {
+		return "", fmt.Errorf(
+			"storage pool %s (%s) is not NFS (type=%q, url=%q). only NFS storage is supported",
+			pool.ID, pool.Name, pool.PoolType, pool.URL,
+		)
+	}
+	nfsSource, err := nfsSourceFromPool(*pool)
+	if err != nil {
+		return "", err
+	}
+
+	cmd := exec.Command("mount", "-t", "nfs", nfsSource, mountPath)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf(
+			"failed to mount storage pool %s (%s) on %s using %s: %w (%s)",
+			pool.ID,
+			pool.Name,
+			mountPath,
+			nfsSource,
+			err,
+			strings.TrimSpace(string(out)),
+		)
+	}
+
+	source, fsType, mounted, err = findMountEntry(mountPath)
+	if err != nil {
+		return "", err
+	}
+	if !mounted {
+		return "", fmt.Errorf("mount command succeeded but %s is not listed in /proc/mounts", mountPath)
+	}
+	if !isNFSFsType(fsType) {
+		return "", fmt.Errorf("%s mounted as %s (%s), expected NFS", mountPath, fsType, source)
 	}
 	return mountPath, nil
 }
@@ -2979,6 +3065,130 @@ func mapGetInt(m map[string]any, key string) int {
 	default:
 		return 0
 	}
+}
+
+func mapGetArray(m map[string]any, key string) []any {
+	if m == nil {
+		return nil
+	}
+	v, ok := m[key]
+	if !ok || v == nil {
+		return nil
+	}
+	arr, ok := v.([]any)
+	if !ok {
+		return nil
+	}
+	return arr
+}
+
+type cloudStackStoragePoolInfo struct {
+	ID        string
+	Name      string
+	PoolType  string
+	IPAddress string
+	Path      string
+	URL       string
+}
+
+func firstNonEmptyString(vals ...string) string {
+	for _, v := range vals {
+		if strings.TrimSpace(v) != "" {
+			return strings.TrimSpace(v)
+		}
+	}
+	return ""
+}
+
+func storagePoolInfoFromMap(m map[string]any) cloudStackStoragePoolInfo {
+	return cloudStackStoragePoolInfo{
+		ID:        mapGetString(m, "id"),
+		Name:      mapGetString(m, "name"),
+		PoolType:  firstNonEmptyString(mapGetString(m, "type"), mapGetString(m, "pooltype"), mapGetString(m, "storagetype")),
+		IPAddress: firstNonEmptyString(mapGetString(m, "ipaddress"), mapGetString(m, "sourcehost"), mapGetString(m, "host")),
+		Path:      firstNonEmptyString(mapGetString(m, "path"), mapGetString(m, "sourcepath"), mapGetString(m, "mountpoint")),
+		URL:       mapGetString(m, "url"),
+	}
+}
+
+func isNFSStoragePool(pool cloudStackStoragePoolInfo) bool {
+	t := strings.ToLower(strings.TrimSpace(pool.PoolType))
+	if strings.Contains(t, "networkfilesystem") || strings.Contains(t, "nfs") {
+		return true
+	}
+	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(pool.URL)), "nfs://")
+}
+
+func nfsSourceFromPool(pool cloudStackStoragePoolInfo) (string, error) {
+	host := strings.TrimSpace(pool.IPAddress)
+	path := strings.TrimSpace(pool.Path)
+	if host != "" && path != "" {
+		if !strings.HasPrefix(path, "/") {
+			path = "/" + path
+		}
+		return fmt.Sprintf("%s:%s", host, path), nil
+	}
+
+	urlValue := strings.TrimSpace(pool.URL)
+	if strings.HasPrefix(strings.ToLower(urlValue), "nfs://") {
+		u, err := neturl.Parse(urlValue)
+		if err != nil {
+			return "", fmt.Errorf("invalid NFS url %q: %w", urlValue, err)
+		}
+		host = strings.TrimSpace(u.Host)
+		if h, p, err := net.SplitHostPort(host); err == nil {
+			if strings.TrimSpace(p) != "" {
+				host = h
+			}
+		}
+		path = strings.TrimSpace(u.Path)
+		if host != "" && path != "" {
+			return fmt.Sprintf("%s:%s", host, path), nil
+		}
+	}
+	return "", fmt.Errorf("storage pool %s (%s) missing NFS source details (ipaddress/path or nfs url)", pool.ID, pool.Name)
+}
+
+func (c *cloudStackClient) storagePoolByID(storageID string) (*cloudStackStoragePoolInfo, error) {
+	storageID = strings.TrimSpace(storageID)
+	if storageID == "" {
+		return nil, errors.New("storage id is empty")
+	}
+	res, err := c.request("listStoragePools", map[string]string{"id": storageID})
+	if err != nil {
+		return nil, err
+	}
+	root, ok := mapGetMap(res, "liststoragepoolsresponse")
+	if !ok {
+		return nil, fmt.Errorf("unexpected listStoragePools response: %v", res)
+	}
+
+	candidates := make([]cloudStackStoragePoolInfo, 0)
+	for _, raw := range mapGetArray(root, "storagepool") {
+		m, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		candidates = append(candidates, storagePoolInfoFromMap(m))
+	}
+	if len(candidates) == 0 {
+		if single, ok := mapGetMap(root, "storagepool"); ok {
+			candidates = append(candidates, storagePoolInfoFromMap(single))
+		}
+	}
+	if len(candidates) == 0 {
+		return nil, fmt.Errorf("storage pool not found: %s", storageID)
+	}
+
+	for _, p := range candidates {
+		if strings.TrimSpace(p.ID) == storageID {
+			pool := p
+			return &pool, nil
+		}
+	}
+
+	pool := candidates[0]
+	return &pool, nil
 }
 
 func (c *cloudStackClient) waitJob(jobID string, kind string) (map[string]any, error) {
@@ -3959,7 +4169,7 @@ func runVMWorkflow(ctx context.Context, cfg *appConfig, spec *runSpec, opts runO
 			return err
 		}
 		ds.StorageID = storageID
-		mountPath, err := ensureStorageMounted(storageID)
+		mountPath, err := ensureStorageMounted(csClient, storageID)
 		if err != nil {
 			return err
 		}

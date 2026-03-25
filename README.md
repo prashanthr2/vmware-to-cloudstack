@@ -152,6 +152,7 @@ export CGO_LDFLAGS="-L/opt/vmware-vddk/lib64 -lvixDiskLib -ldl -lpthread"
   - boot disk -> `target.cloudstack.storageid`
   - data disk -> `disks.<unit>.storageid`
   - output path format -> `/mnt/<storageid>/<vm>_<vmMoref>_disk<unit>.qcow2`
+- Validates selected CloudStack primary storage is NFS and ensures `/mnt/<storageid>` is mounted before copy (auto-creates mount dir and attempts mount using storage pool NFS details when needed).
 - Imports root VM and data disks into CloudStack and attaches imported data volumes.
 - Uses CloudStack target fields from spec:
   - `target.cloudstack.zoneid`
