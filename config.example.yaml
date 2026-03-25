@@ -24,6 +24,11 @@ cloudstack_defaults:
   networkid: ""
   serviceofferingid: ""
   diskofferingid: ""
+  ostypeid: ""
+  boottype: ""
+  bootmode: ""
+  rootdiskcontroller: ""
+  nicadapter: ""
 
 migration:
   # Optional orchestrator defaults for run mode.

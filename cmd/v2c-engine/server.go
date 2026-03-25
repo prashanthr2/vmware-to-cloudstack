@@ -104,6 +104,7 @@ type migrationOptionsInput struct {
 	FinalizeWindow        int    `json:"finalize_window"`
 	ShutdownMode          string `json:"shutdown_mode"`
 	SnapshotQuiesce       string `json:"snapshot_quiesce"`
+	StartVMAfterImport    bool   `json:"start_vm_after_import"`
 }
 
 type nicMappingInput struct {
@@ -123,6 +124,11 @@ type migrationSpecRequest struct {
 	NetworkID         string                     `json:"networkid"`
 	ServiceOfferingID string                     `json:"serviceofferingid"`
 	BootStorageID     string                     `json:"boot_storageid"`
+	OSTypeID          string                     `json:"ostypeid"`
+	BootType          string                     `json:"boottype"`
+	BootMode          string                     `json:"bootmode"`
+	RootDiskController string                    `json:"rootdiskcontroller"`
+	NICAdapter        string                     `json:"nicadapter"`
 	Disks             map[string]diskSpecInput   `json:"disks"`
 	NICMappings       map[string]nicMappingInput `json:"nic_mappings"`
 	Migration         migrationOptionsInput      `json:"migration"`
@@ -271,6 +277,7 @@ func (s *apiServer) serve(listenAddr string) error {
 	mux.HandleFunc("/cloudstack/networks", s.handleCloudStackNetworks)
 	mux.HandleFunc("/cloudstack/diskofferings", s.handleCloudStackDiskOfferings)
 	mux.HandleFunc("/cloudstack/serviceofferings", s.handleCloudStackServiceOfferings)
+	mux.HandleFunc("/cloudstack/ostypes", s.handleCloudStackOSTypes)
 	mux.HandleFunc("/migration/settings", s.handleMigrationSettings)
 	mux.HandleFunc("/migration/spec", s.handleMigrationSpec)
 	mux.HandleFunc("/migration/start", s.handleMigrationStart)
@@ -376,6 +383,10 @@ func (s *apiServer) handleCloudStackDiskOfferings(w http.ResponseWriter, r *http
 
 func (s *apiServer) handleCloudStackServiceOfferings(w http.ResponseWriter, r *http.Request) {
 	s.handleCloudStackList(w, r, "listServiceOfferings", "serviceoffering")
+}
+
+func (s *apiServer) handleCloudStackOSTypes(w http.ResponseWriter, r *http.Request) {
+	s.handleCloudStackList(w, r, "listOsTypes", "ostype")
 }
 
 func (s *apiServer) handleCloudStackList(w http.ResponseWriter, r *http.Request, command string, key string) {
@@ -586,6 +597,9 @@ func (s *apiServer) handleMigrationSpec(w http.ResponseWriter, r *http.Request) 
 	if strings.TrimSpace(req.Migration.SnapshotQuiesce) != "" {
 		migrationBlock["snapshot_quiesce"] = req.Migration.SnapshotQuiesce
 	}
+	if req.Migration.StartVMAfterImport {
+		migrationBlock["start_vm_after_import"] = true
+	}
 
 	spec := map[string]any{
 		"vm": map[string]any{
@@ -601,6 +615,23 @@ func (s *apiServer) handleMigrationSpec(w http.ResponseWriter, r *http.Request) 
 				"storageid":         req.BootStorageID,
 			},
 		},
+	}
+	target, _ := spec["target"].(map[string]any)
+	cloud, _ := target["cloudstack"].(map[string]any)
+	if strings.TrimSpace(req.OSTypeID) != "" {
+		cloud["ostypeid"] = strings.TrimSpace(req.OSTypeID)
+	}
+	if strings.TrimSpace(req.BootType) != "" {
+		cloud["boottype"] = strings.TrimSpace(req.BootType)
+	}
+	if strings.EqualFold(strings.TrimSpace(req.BootType), "UEFI") && strings.TrimSpace(req.BootMode) != "" {
+		cloud["bootmode"] = strings.TrimSpace(req.BootMode)
+	}
+	if strings.TrimSpace(req.RootDiskController) != "" {
+		cloud["rootdiskcontroller"] = strings.TrimSpace(req.RootDiskController)
+	}
+	if strings.TrimSpace(req.NICAdapter) != "" {
+		cloud["nicadapter"] = strings.TrimSpace(req.NICAdapter)
 	}
 
 	if len(req.NICMappings) > 0 {
@@ -620,8 +651,6 @@ func (s *apiServer) handleMigrationSpec(w http.ResponseWriter, r *http.Request) 
 			}
 		}
 		if len(nicMappings) > 0 {
-			target, _ := spec["target"].(map[string]any)
-			cloud, _ := target["cloudstack"].(map[string]any)
 			cloud["nic_mappings"] = nicMappings
 		}
 	}

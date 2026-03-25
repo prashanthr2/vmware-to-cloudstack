@@ -23,10 +23,39 @@ const DEFAULT_MIGRATION = {
   finalize_window: "",
   shutdown_mode: "",
   snapshot_quiesce: "",
+  start_vm_after_import: false,
 };
 
+const BOOT_TYPE_OPTIONS = [
+  { value: "", label: "Default (import-detected)" },
+  { value: "BIOS", label: "BIOS" },
+  { value: "UEFI", label: "UEFI" },
+];
+
+const UEFI_BOOT_MODE_OPTIONS = [
+  { value: "", label: "Default" },
+  { value: "Legacy", label: "Legacy" },
+  { value: "Secure", label: "Secure" },
+];
+
+const ROOT_DISK_CONTROLLER_OPTIONS = [
+  { value: "", label: "Default (CloudStack/import-detected)" },
+  { value: "virtio-scsi", label: "virtio-scsi" },
+  { value: "virtio", label: "virtio" },
+  { value: "sata", label: "sata" },
+  { value: "ide", label: "ide" },
+];
+
+const NIC_ADAPTER_OPTIONS = [
+  { value: "", label: "Default (CloudStack/import-detected)" },
+  { value: "virtio", label: "virtio" },
+  { value: "e1000", label: "e1000" },
+  { value: "rtl8139", label: "rtl8139" },
+  { value: "pcnet", label: "pcnet" },
+];
+
 function optionLabel(item) {
-  return item.name || item.displaytext || item.id || "Unknown";
+  return item.name || item.description || item.displaytext || item.id || "Unknown";
 }
 
 function uniqueByVm(jobs) {
@@ -68,6 +97,7 @@ function normalizeMigration(input = {}) {
     finalize_window: input.finalize_window ?? DEFAULT_MIGRATION.finalize_window,
     shutdown_mode: input.shutdown_mode ?? DEFAULT_MIGRATION.shutdown_mode,
     snapshot_quiesce: input.snapshot_quiesce ?? DEFAULT_MIGRATION.snapshot_quiesce,
+    start_vm_after_import: input.start_vm_after_import ?? DEFAULT_MIGRATION.start_vm_after_import,
   };
 }
 
@@ -168,6 +198,7 @@ export default function App() {
   const [networks, setNetworks] = useState([]);
   const [serviceOfferings, setServiceOfferings] = useState([]);
   const [diskOfferings, setDiskOfferings] = useState([]);
+  const [osTypes, setOsTypes] = useState([]);
 
   const [selectedVmNames, setSelectedVmNames] = useState([]);
   const [activeVmName, setActiveVmName] = useState("");
@@ -298,10 +329,20 @@ export default function App() {
             clusterid: "",
             serviceofferingid: template.serviceofferingid || defaultSelections.serviceofferingid,
             boot_storageid: "",
+            ostypeid: template.ostypeid || "",
+            boottype: template.boottype || "",
+            bootmode: template.bootmode || "",
+            rootdiskcontroller: template.rootdiskcontroller || "",
+            nicadapter: template.nicadapter || "",
             migration: normalizeMigration(template.migration),
           }
         : {
             ...defaultSelections,
+            ostypeid: "",
+            boottype: "",
+            bootmode: "",
+            rootdiskcontroller: "",
+            nicadapter: "",
             migration: normalizeMigration(),
           };
       const zoneClusters = filterByZone(clusters, base.zoneid);
@@ -319,6 +360,11 @@ export default function App() {
         clusterid: base.clusterid,
         serviceofferingid: base.serviceofferingid,
         boot_storageid: base.boot_storageid,
+        ostypeid: base.ostypeid,
+        boottype: base.boottype,
+        bootmode: base.boottype === "UEFI" ? base.bootmode : "",
+        rootdiskcontroller: base.rootdiskcontroller,
+        nicadapter: base.nicadapter,
         migration: base.migration,
         disks: mapInventoryDisks(vm.disks || [], base.boot_storageid, template?.disks || []).map((disk) => {
           if (disk.diskType === "os") return disk;
@@ -412,6 +458,7 @@ export default function App() {
         { key: "networks", label: "CloudStack networks", path: "/cloudstack/networks", headers: cloudstackHeaders },
         { key: "serviceOfferings", label: "CloudStack service offerings", path: "/cloudstack/serviceofferings", headers: cloudstackHeaders },
         { key: "diskOfferings", label: "CloudStack disk offerings", path: "/cloudstack/diskofferings", headers: cloudstackHeaders },
+        { key: "osTypes", label: "CloudStack guest OS types", path: "/cloudstack/ostypes", headers: cloudstackHeaders },
       ];
       const responses = await Promise.all(
         requests.map(async (req) => {
@@ -431,6 +478,7 @@ export default function App() {
       const networkList = byKey.networks?.data || [];
       const serviceList = byKey.serviceOfferings?.data || [];
       const diskOfferingList = byKey.diskOfferings?.data || [];
+      const osTypeList = byKey.osTypes?.data || [];
 
       setVmwareVms(vmList);
       setZones(zoneList);
@@ -439,6 +487,7 @@ export default function App() {
       setNetworks(networkList);
       setServiceOfferings(serviceList);
       setDiskOfferings(diskOfferingList);
+      setOsTypes(osTypeList);
 
       setVmSpecsByName((prev) => {
         const next = { ...prev };
@@ -645,6 +694,9 @@ export default function App() {
             disk.diskType === "os" ? { ...disk, storageid: value } : disk
           );
         }
+        if (field === "boottype" && value !== "UEFI") {
+          next.bootmode = "";
+        }
         return next;
       });
     },
@@ -727,6 +779,7 @@ export default function App() {
     if (draft.migration?.finalize_window) migration.finalize_window = Number(draft.migration.finalize_window);
     if (draft.migration?.shutdown_mode) migration.shutdown_mode = draft.migration.shutdown_mode;
     if (draft.migration?.snapshot_quiesce) migration.snapshot_quiesce = draft.migration.snapshot_quiesce;
+    if (draft.migration?.start_vm_after_import) migration.start_vm_after_import = true;
 
     return {
       vm_name: draft.vm_name,
@@ -736,6 +789,11 @@ export default function App() {
       networkid: "",
       serviceofferingid: draft.serviceofferingid,
       boot_storageid: draft.boot_storageid,
+      ostypeid: draft.ostypeid || "",
+      boottype: draft.boottype || "",
+      bootmode: draft.boottype === "UEFI" ? draft.bootmode || "" : "",
+      rootdiskcontroller: draft.rootdiskcontroller || "",
+      nicadapter: draft.nicadapter || "",
       disks,
       nic_mappings: nicMappings,
       migration,
@@ -842,13 +900,19 @@ export default function App() {
           clusterName: resolveName(clusters, draft?.clusterid || ""),
           serviceOfferingName: resolveName(serviceOfferings, draft?.serviceofferingid || ""),
           bootStorageName: resolveName(storagePools, draft?.boot_storageid || ""),
+          osTypeName: resolveName(osTypes, draft?.ostypeid || ""),
+          bootType: draft?.boottype || "",
+          bootMode: draft?.boottype === "UEFI" ? draft?.bootmode || "" : "",
+          rootDiskController: draft?.rootdiskcontroller || "",
+          nicAdapter: draft?.nicadapter || "",
+          startVmAfterImport: Boolean(draft?.migration?.start_vm_after_import),
           delta_interval: draft?.migration?.delta_interval || "",
           finalize_at: draft?.migration?.finalize_at || "",
           dataDiskDetails,
           nicDetails,
         };
       }),
-    [clusters, networks, selectedVmNames, serviceOfferings, storagePools, vmSpecsByName, zones]
+    [clusters, networks, osTypes, selectedVmNames, serviceOfferings, storagePools, vmSpecsByName, zones]
   );
 
   return (
@@ -901,12 +965,18 @@ export default function App() {
                   <label>Cluster<select value={activeDraft.clusterid} onChange={(e) => updateField("clusterid", e.target.value)}><option value="">Select cluster</option>{clustersForActiveZone.map((item) => <option key={item.id} value={item.id}>{optionLabel(item)}</option>)}</select></label>
                   <label>Service Offering<select value={activeDraft.serviceofferingid} onChange={(e) => updateField("serviceofferingid", e.target.value)}><option value="">Select service offering</option>{serviceOfferingsForActiveZone.map((item) => <option key={item.id} value={item.id}>{optionLabel(item)}</option>)}</select></label>
                   <label>Boot Storage<select value={activeDraft.boot_storageid} onChange={(e) => updateField("boot_storageid", e.target.value)}><option value="">Select boot storage</option>{storagePoolsForActiveZone.map((item) => <option key={item.id} value={item.id}>{optionLabel(item)}</option>)}</select></label>
+                  <label>Guest OS Mapping<select value={activeDraft.ostypeid} onChange={(e) => updateField("ostypeid", e.target.value)}><option value="">Default / leave unchanged</option>{osTypes.map((item) => <option key={item.id} value={item.id}>{item.description || item.name || item.id}</option>)}</select></label>
+                  <label>Firmware / Boot Type<select value={activeDraft.boottype} onChange={(e) => updateField("boottype", e.target.value)}>{BOOT_TYPE_OPTIONS.map((item) => <option key={item.value || "default"} value={item.value}>{item.label}</option>)}</select></label>
+                  <label>UEFI Boot Mode<select value={activeDraft.bootmode} onChange={(e) => updateField("bootmode", e.target.value)} disabled={activeDraft.boottype !== "UEFI"}>{UEFI_BOOT_MODE_OPTIONS.map((item) => <option key={item.value || "default"} value={item.value}>{item.label}</option>)}</select></label>
+                  <label>Root Disk Controller<select value={activeDraft.rootdiskcontroller} onChange={(e) => updateField("rootdiskcontroller", e.target.value)}>{ROOT_DISK_CONTROLLER_OPTIONS.map((item) => <option key={item.value || "default"} value={item.value}>{item.label}</option>)}</select></label>
+                  <label>NIC Adapter<select value={activeDraft.nicadapter} onChange={(e) => updateField("nicadapter", e.target.value)}>{NIC_ADAPTER_OPTIONS.map((item) => <option key={item.value || "default"} value={item.value}>{item.label}</option>)}</select></label>
                   <label>Delta Interval (sec)<input type="number" min="1" value={activeDraft.migration.delta_interval} onChange={(e) => updateMigrationField("delta_interval", e.target.value)} /></label>
                   <label>Finalize At (ISO)<input value={activeDraft.migration.finalize_at} onChange={(e) => updateMigrationField("finalize_at", e.target.value)} placeholder="2026-03-12T23:30:00+00:00" /></label>
                   <label>Finalize Delta Interval<input type="number" min="1" value={activeDraft.migration.finalize_delta_interval} onChange={(e) => updateMigrationField("finalize_delta_interval", e.target.value)} /></label>
                   <label>Finalize Window<input type="number" min="1" value={activeDraft.migration.finalize_window} onChange={(e) => updateMigrationField("finalize_window", e.target.value)} /></label>
                   <label>Shutdown Mode<input value={activeDraft.migration.shutdown_mode} onChange={(e) => updateMigrationField("shutdown_mode", e.target.value)} placeholder="auto" /></label>
                   <label>Snapshot Quiesce<input value={activeDraft.migration.snapshot_quiesce} onChange={(e) => updateMigrationField("snapshot_quiesce", e.target.value)} placeholder="auto" /></label>
+                  <label className="checkbox-field"><input type="checkbox" checked={Boolean(activeDraft.migration.start_vm_after_import)} onChange={(e) => updateMigrationField("start_vm_after_import", e.target.checked)} />Start imported VM after CloudStack import</label>
                 </div>
               </section>
 
@@ -937,6 +1007,7 @@ export default function App() {
                         <th>Cluster</th>
                         <th>Service Offering</th>
                         <th>Boot Storage</th>
+                        <th>Imported VM Settings</th>
                         <th>Delta (sec)</th>
                         <th>Finalize At</th>
                         <th>Data Disk Mapping</th>
@@ -946,7 +1017,7 @@ export default function App() {
                     <tbody>
                       {selectedSettingsRows.length === 0 ? (
                         <tr>
-                          <td colSpan={9}>No VM selected.</td>
+                          <td colSpan={10}>No VM selected.</td>
                         </tr>
                       ) : (
                         selectedSettingsRows.map((row) => (
@@ -956,6 +1027,14 @@ export default function App() {
                             <td>{row.clusterName || "-"}</td>
                             <td>{row.serviceOfferingName || "-"}</td>
                             <td>{row.bootStorageName || "-"}</td>
+                            <td>
+                              <div className="hint small">Guest OS -> {row.osTypeName || "Default / unchanged"}</div>
+                              <div className="hint small">Boot Type -> {row.bootType || "Default"}</div>
+                              {row.bootType === "UEFI" ? <div className="hint small">UEFI Mode -> {row.bootMode || "Default"}</div> : null}
+                              <div className="hint small">Root Disk Controller -> {row.rootDiskController || "Default"}</div>
+                              <div className="hint small">NIC Adapter -> {row.nicAdapter || "Default"}</div>
+                              <div className="hint small">Start VM -> {row.startVmAfterImport ? "Yes" : "No"}</div>
+                            </td>
                             <td>{row.delta_interval || "-"}</td>
                             <td>{row.finalize_at || "-"}</td>
                             <td>

@@ -1041,6 +1041,11 @@ type appConfig struct {
 		NetworkID         string `yaml:"networkid"`
 		ServiceOfferingID string `yaml:"serviceofferingid"`
 		DiskOfferingID    string `yaml:"diskofferingid"`
+		OSTypeID          string `yaml:"ostypeid"`
+		BootType          string `yaml:"boottype"`
+		BootMode          string `yaml:"bootmode"`
+		RootDiskController string `yaml:"rootdiskcontroller"`
+		NICAdapter        string `yaml:"nicadapter"`
 	} `yaml:"cloudstack_defaults"`
 	Virt struct {
 		RunVirtV2V bool   `yaml:"run_virt_v2v"`
@@ -1062,6 +1067,7 @@ type runSpec struct {
 		SnapshotQuiesce      string `yaml:"snapshot_quiesce"`
 		ShutdownMode         string `yaml:"shutdown_mode"`
 		ParallelDisks        int    `yaml:"parallel_disks"`
+		StartVMAfterImport   bool   `yaml:"start_vm_after_import"`
 	} `yaml:"migration"`
 	Target struct {
 		CloudStack cloudStackTargetSpec `yaml:"cloudstack"`
@@ -1085,6 +1091,11 @@ type cloudStackTargetSpec struct {
 	NetworkID         string `yaml:"networkid"`
 	ServiceOfferingID string `yaml:"serviceofferingid"`
 	DiskOfferingID    string `yaml:"diskofferingid"`
+	OSTypeID          string `yaml:"ostypeid"`
+	BootType          string `yaml:"boottype"`
+	BootMode          string `yaml:"bootmode"`
+	RootDiskController string `yaml:"rootdiskcontroller"`
+	NICAdapter        string `yaml:"nicadapter"`
 	NICMappings       map[string]nicMappingSpec `yaml:"nic_mappings"`
 }
 
@@ -1149,6 +1160,8 @@ type runState struct {
 	Disks           map[string]*runDiskState `json:"disks"`
 	CloudStackVMID  string                   `json:"cloudstack_vm_id,omitempty"`
 	AttachedNICs    map[string]string        `json:"attached_nics,omitempty"`
+	CloudStackConfigured bool                `json:"cloudstack_configured,omitempty"`
+	CloudStackStarted bool                   `json:"cloudstack_started,omitempty"`
 	VirtV2VDone     bool                     `json:"virt_v2v_done,omitempty"`
 	Progress        float64                  `json:"progress,omitempty"`
 	TransferSpeedMB float64                  `json:"transfer_speed_mbps,omitempty"`
@@ -2634,6 +2647,11 @@ func applyCloudStackDefaults(spec *runSpec, cfg *appConfig) {
 	tgt.NetworkID = firstNonEmpty(tgt.NetworkID, def.NetworkID)
 	tgt.ServiceOfferingID = firstNonEmpty(tgt.ServiceOfferingID, def.ServiceOfferingID)
 	tgt.DiskOfferingID = firstNonEmpty(tgt.DiskOfferingID, def.DiskOfferingID)
+	tgt.OSTypeID = firstNonEmpty(tgt.OSTypeID, def.OSTypeID)
+	tgt.BootType = firstNonEmpty(tgt.BootType, def.BootType)
+	tgt.BootMode = firstNonEmpty(tgt.BootMode, def.BootMode)
+	tgt.RootDiskController = firstNonEmpty(tgt.RootDiskController, def.RootDiskController)
+	tgt.NICAdapter = firstNonEmpty(tgt.NICAdapter, def.NICAdapter)
 
 	if spec.Disks == nil {
 		spec.Disks = map[string]diskTargetSpec{}
@@ -3275,6 +3293,96 @@ func sanitizeHostName(vmName string) string {
 		out = strings.TrimRight(out, "-")
 	}
 	return out
+}
+
+type cloudStackDetailPair struct {
+	Key   string
+	Value string
+}
+
+func appendCloudStackDetails(params map[string]string, details []cloudStackDetailPair) {
+	for i, detail := range details {
+		key := strings.TrimSpace(detail.Key)
+		value := strings.TrimSpace(detail.Value)
+		if key == "" || value == "" {
+			continue
+		}
+		params[fmt.Sprintf("details[%d].key", i)] = key
+		params[fmt.Sprintf("details[%d].value", i)] = value
+	}
+}
+
+func buildCloudStackVMDetailPairs(target cloudStackTargetSpec) []cloudStackDetailPair {
+	details := make([]cloudStackDetailPair, 0, 4)
+	if v := strings.TrimSpace(target.BootType); v != "" {
+		details = append(details, cloudStackDetailPair{Key: "bootType", Value: v})
+	}
+	if strings.EqualFold(strings.TrimSpace(target.BootType), "UEFI") {
+		if v := strings.TrimSpace(target.BootMode); v != "" {
+			details = append(details, cloudStackDetailPair{Key: "bootMode", Value: v})
+		}
+	}
+	if v := strings.TrimSpace(target.RootDiskController); v != "" {
+		details = append(details, cloudStackDetailPair{Key: "rootDiskController", Value: v})
+	}
+	if v := strings.TrimSpace(target.NICAdapter); v != "" {
+		details = append(details, cloudStackDetailPair{Key: "nicAdapter", Value: v})
+	}
+	return details
+}
+
+func waitCloudStackJobIfPresent(cs *cloudStackClient, root map[string]any, kind string) error {
+	jobID := mapGetString(root, "jobid")
+	if strings.TrimSpace(jobID) == "" {
+		return nil
+	}
+	_, err := cs.waitJob(jobID, kind)
+	return err
+}
+
+func updateCloudStackVMSettings(cs *cloudStackClient, vmID string, target cloudStackTargetSpec) error {
+	params := map[string]string{
+		"id": strings.TrimSpace(vmID),
+	}
+	if v := strings.TrimSpace(target.OSTypeID); v != "" {
+		params["ostypeid"] = v
+	}
+	appendCloudStackDetails(params, buildCloudStackVMDetailPairs(target))
+	if len(params) == 1 {
+		return nil
+	}
+	resp, err := cs.request("updateVirtualMachine", params)
+	if err != nil {
+		return err
+	}
+	root, ok := mapGetMap(resp, "updatevirtualmachineresponse")
+	if !ok {
+		return nil
+	}
+	return waitCloudStackJobIfPresent(cs, root, "updateVirtualMachine")
+}
+
+func startCloudStackVM(cs *cloudStackClient, vmID string) error {
+	resp, err := cs.request("startVirtualMachine", map[string]string{
+		"id": strings.TrimSpace(vmID),
+	})
+	if err != nil {
+		return err
+	}
+	root, ok := mapGetMap(resp, "startvirtualmachineresponse")
+	if !ok {
+		return nil
+	}
+	return waitCloudStackJobIfPresent(cs, root, "startVirtualMachine")
+}
+
+func isCloudStackVMAlreadyRunningError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "already running") ||
+		strings.Contains(msg, "state of the vm") && strings.Contains(msg, "running")
 }
 
 func importVMToCloudStack(cs *cloudStackClient, vmName string, targetCloud cloudStackTargetSpec, bootDiskPath string, importNetworkID string) (string, error) {
@@ -4766,6 +4874,41 @@ func runVMWorkflow(ctx context.Context, cfg *appConfig, spec *runSpec, opts runO
 			ds.AttachedToVMID = st.CloudStackVMID
 			ds.Stage = stageImportData
 			ds.Progress = 100
+			stateMu.Unlock()
+			if err := saveStateLocked(); err != nil {
+				return err
+			}
+		}
+		if !st.CloudStackConfigured {
+			if err := updateCloudStackVMSettings(csClient, st.CloudStackVMID, spec.Target.CloudStack); err != nil {
+				return fmt.Errorf("apply imported VM settings failed: %w", err)
+			}
+			if settings := buildCloudStackVMDetailPairs(spec.Target.CloudStack); len(settings) > 0 || strings.TrimSpace(spec.Target.CloudStack.OSTypeID) != "" {
+				log.Printf(
+					"Applied CloudStack VM settings vm_id=%s ostypeid=%s boottype=%s bootmode=%s rootdiskcontroller=%s nicadapter=%s",
+					st.CloudStackVMID,
+					strings.TrimSpace(spec.Target.CloudStack.OSTypeID),
+					strings.TrimSpace(spec.Target.CloudStack.BootType),
+					strings.TrimSpace(spec.Target.CloudStack.BootMode),
+					strings.TrimSpace(spec.Target.CloudStack.RootDiskController),
+					strings.TrimSpace(spec.Target.CloudStack.NICAdapter),
+				)
+			}
+			stateMu.Lock()
+			st.CloudStackConfigured = true
+			stateMu.Unlock()
+			if err := saveStateLocked(); err != nil {
+				return err
+			}
+		}
+		if spec.Migration.StartVMAfterImport && !st.CloudStackStarted {
+			log.Printf("Starting imported CloudStack VM vm_id=%s", st.CloudStackVMID)
+			if err := startCloudStackVM(csClient, st.CloudStackVMID); err != nil && !isCloudStackVMAlreadyRunningError(err) {
+				return fmt.Errorf("start imported VM failed: %w", err)
+			}
+			log.Printf("Started imported CloudStack VM vm_id=%s", st.CloudStackVMID)
+			stateMu.Lock()
+			st.CloudStackStarted = true
 			stateMu.Unlock()
 			if err := saveStateLocked(); err != nil {
 				return err

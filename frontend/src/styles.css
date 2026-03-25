@@ -120,6 +120,20 @@ label {
   color: #1f2f2b;
 }
 
+.checkbox-field {
+  flex-direction: row;
+  align-items: center;
+  gap: 10px;
+  min-height: 36px;
+}
+
+.checkbox-field input[type="checkbox"] {
+  min-height: auto;
+  width: 16px;
+  height: 16px;
+  margin: 0;
+}
+
 input,
 select {
   border: 1px solid #b8cbc5;

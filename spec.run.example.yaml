@@ -19,6 +19,8 @@ migration:
   run_virt_v2v: false
   # Optional override for snapshot mode: true|false|auto
   snapshot_quiesce: auto
+  # Optional: start the imported VM in CloudStack after post-import settings and disk/NIC attach.
+  start_vm_after_import: false
 
 target:
   cloudstack:
@@ -27,6 +29,12 @@ target:
     storageid: 68f38850-a051-3ff1-9865-6a24a2ba2864
     networkid: 3da6b73b-b55b-4d0d-9dcf-2c40fe8bb6aa
     serviceofferingid: 4c636c18-3cd6-4b24-b0ef-e0347198b46c
+    # Optional post-import VM settings in CloudStack.
+    # ostypeid: 123
+    # boottype: UEFI
+    # bootmode: Secure
+    # rootdiskcontroller: virtio-scsi
+    # nicadapter: virtio
     # Optional default for data disks (used when a disk entry omits diskofferingid).
     diskofferingid: 93e1314f-3d5f-44f0-9e63-315553e50ec6
 

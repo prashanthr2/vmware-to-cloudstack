@@ -9,6 +9,7 @@ vms:
       parallel_disks: 4
       run_virt_v2v: false
       snapshot_quiesce: auto
+      start_vm_after_import: false
     target:
       cloudstack:
         zoneid: 4cbe6127-d225-4312-9465-81198791221b
@@ -16,6 +17,11 @@ vms:
         storageid: 68f38850-a051-3ff1-9865-6a24a2ba2864
         networkid: 3da6b73b-b55b-4d0d-9dcf-2c40fe8bb6aa
         serviceofferingid: 4c636c18-3cd6-4b24-b0ef-e0347198b46c
+        # ostypeid: 123
+        # boottype: UEFI
+        # bootmode: Secure
+        # rootdiskcontroller: virtio-scsi
+        # nicadapter: virtio
         diskofferingid: 93e1314f-3d5f-44f0-9e63-315553e50ec6
     disks:
       "1":
@@ -29,6 +35,7 @@ vms:
       readers: 4
       parallel_disks: 4
       run_virt_v2v: false
+      start_vm_after_import: false
     target:
       cloudstack:
         zoneid: 4cbe6127-d225-4312-9465-81198791221b
