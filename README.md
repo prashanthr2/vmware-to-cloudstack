@@ -39,8 +39,23 @@ Supported bootstrap options:
 - `--ui-listen <addr>` (UI service listen, default `0.0.0.0:5173`)
 - `--install-service` (installs `v2c-engine` and, with `--with-ui`, `v2c-ui`)
 - `--with-ui` (installs frontend dependencies and UI service unit)
-- `--start-services` (optional immediate start after setup)
+- `--start-services` (optional immediate start after setup; only use when config files are already valid)
 - `--skip-build`
+
+Recommended bootstrap flow:
+
+1. Install/build/services without auto-start.
+2. Edit config files.
+3. Enable/start services.
+
+```bash
+sudo ./scripts/bootstrap.sh --vddk-dir /opt/vmware-vddk/vmware-vix-disklib-distrib --install-service --with-ui
+sudo vi /etc/v2c-engine/config.yaml
+sudo vi /etc/v2c-ui/.env.local
+sudo systemctl enable --now v2c-engine v2c-ui
+```
+
+Use `--start-services` only if `/etc/v2c-engine/config.yaml` and `/etc/v2c-ui/.env.local` are already populated with real values (not placeholders).
 
 ## Enable API and UI Services
 
@@ -72,6 +87,11 @@ Config notes:
   - `10.0.35.146:8080`
   - `http://10.0.35.146:8080/client/api`
   - `https://cloudstack.example.com`
+
+Sample references:
+
+- Engine config template with all fields: [examples/config.full.example.yaml](./examples/config.full.example.yaml)
+- UI env template: [frontend/.env.example](./frontend/.env.example)
 
 ## What The Engine Does
 
