@@ -2836,7 +2836,7 @@ func newCloudStackClient(cfg *appConfig) (*cloudStackClient, error) {
 		return nil, errors.New("cloudstack endpoint/api_key/secret_key are required in config.yaml")
 	}
 	return &cloudStackClient{
-		Endpoint:  cfg.CloudStack.Endpoint,
+		Endpoint:  normalizeCloudStackEndpoint(cfg.CloudStack.Endpoint),
 		APIKey:    cfg.CloudStack.APIKey,
 		SecretKey: cfg.CloudStack.SecretKey,
 		HTTP: &http.Client{

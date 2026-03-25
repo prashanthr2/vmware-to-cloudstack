@@ -29,6 +29,14 @@ This repository is now Go-first and contains the migration copy/sync engine with
 - Go toolchain 1.22+
 - `CGO_ENABLED=1`
 
+CloudStack endpoint input is flexible:
+- `10.0.35.146`
+- `10.0.35.146:8080`
+- `http://10.0.35.146:8080/client/api`
+- `https://cloudstack.example.com`
+
+If a port is required in your environment, specify it explicitly (for example `host:8080`).
+
 ## One-command bootstrap (recommended)
 
 For operators, use the bootstrap script to install packages, setup VDDK env, build binary, and optionally create a systemd service:

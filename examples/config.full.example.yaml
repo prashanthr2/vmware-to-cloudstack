@@ -57,7 +57,14 @@ migration:
 
 cloudstack:
   # MANDATORY: CloudStack API endpoint.
-  endpoint: "http://cloudstack.example.com:8080/client/api"
+  # Accepted forms:
+  # - "10.0.35.146"                  -> normalized to http://10.0.35.146/client/api
+  # - "10.0.35.146:8080"             -> normalized to http://10.0.35.146:8080/client/api
+  # - "http://10.0.35.146:8080/client/api" (used as-is)
+  # - "https://cloudstack.example.com"     -> normalized to https://cloudstack.example.com/client/api
+  #
+  # If your CloudStack uses a non-default port, include it explicitly (host:port).
+  endpoint: "cloudstack.example.com:8080"
   # MANDATORY: CloudStack API key.
   api_key: "replace-me"
   # MANDATORY: CloudStack secret key.
@@ -121,4 +128,3 @@ virt:
   # Path to virtio-win ISO used when virt-v2v supports virtio injection flags.
   # Default behavior in code if omitted/empty: /usr/share/virtio-win/virtio-win.iso
   virtio_iso: /usr/share/virtio-win/virtio-win.iso
-

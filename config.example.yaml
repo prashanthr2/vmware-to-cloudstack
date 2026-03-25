@@ -9,7 +9,11 @@ vcenter:
   password: ""
 
 cloudstack:
-  endpoint: "http://cloudstack.example.com:8080/client/api"
+  # Accepts any of:
+  # - hostname/IP only: "10.0.35.146" (defaults to http + /client/api)
+  # - hostname/IP with port: "10.0.35.146:8080"
+  # - full URL: "http://10.0.35.146:8080/client/api"
+  endpoint: "cloudstack.example.com:8080"
   api_key: "change-me"
   secret_key: "change-me"
 

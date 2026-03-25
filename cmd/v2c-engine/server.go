@@ -1177,18 +1177,44 @@ func (s *apiServer) cloudStackClientFromRequest(r *http.Request) (*cloudStackCli
 }
 
 func normalizeCloudStackEndpoint(endpoint string) string {
-	value := strings.TrimSpace(strings.TrimRight(endpoint, "/"))
-	lower := strings.ToLower(value)
-	switch {
-	case strings.HasSuffix(lower, "/client/api"):
+	value := strings.TrimSpace(endpoint)
+	if value == "" {
 		return value
-	case strings.HasSuffix(lower, "/client"):
-		return value + "/api"
-	case strings.HasSuffix(lower, "/api"):
-		return value
-	default:
-		return value + "/client/api"
 	}
+	if !strings.Contains(value, "://") {
+		value = "http://" + strings.TrimLeft(value, "/")
+	}
+	u, err := neturl.Parse(value)
+	if err != nil {
+		// Keep backward-compatible behavior if parse fails.
+		value = strings.TrimRight(value, "/")
+		lower := strings.ToLower(value)
+		switch {
+		case strings.HasSuffix(lower, "/client/api"):
+			return value
+		case strings.HasSuffix(lower, "/client"):
+			return value + "/api"
+		case strings.HasSuffix(lower, "/api"):
+			return value
+		default:
+			return value + "/client/api"
+		}
+	}
+
+	path := strings.Trim(strings.TrimSpace(u.Path), "/")
+	pathLower := strings.ToLower(path)
+	switch {
+	case pathLower == "" || pathLower == "client" || pathLower == "client/api":
+		u.Path = "/client/api"
+	case pathLower == "api":
+		u.Path = "/api"
+	default:
+		// If user provided a custom base path, keep it and append client/api.
+		u.Path = "/" + strings.TrimRight(path, "/") + "/client/api"
+	}
+	u.RawQuery = ""
+	u.Fragment = ""
+	return strings.TrimRight(u.String(), "/")
 }
 
 func detectBootDiskUnit(cfg *types.VirtualMachineConfigInfo) *int {
