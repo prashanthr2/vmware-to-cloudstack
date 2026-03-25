@@ -63,6 +63,11 @@ After bootstrap:
 - `systemctl status v2c-engine`
 - `journalctl -u v2c-engine -f`
 
+Config note:
+- `run`/`serve` use vCenter credentials only from `vcenter` in config (plus `VC_PASSWORD` fallback).
+- You do not need a second `vddk` credential block in `config.yaml`.
+- `thumbprint` is needed only for direct `base-copy` / `delta-sync` engine commands (flags or `spec.engine.example.yaml`).
+
 ## Clean uninstall / reset
 
 To remove bootstrap-installed service/binary/config and reinstall from scratch:
@@ -242,8 +247,8 @@ Optional `serve` flags:
   --config ./config.yaml \
   --listen :8000 \
   --control-dir /var/lib/vm-migrator \
-  --specs-dir /var/lib/vm-migrator/specs \
-  --workdir /opt/vmware-to-cloudstack \
+  --specs-dir /var/lib/vm-migrator \
+  --workdir /var/lib/vm-migrator \
   --max-workers 3
 ```
 

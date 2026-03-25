@@ -46,14 +46,17 @@ migration:
   control_dir: /var/lib/vm-migrator
 
   # OPTIONAL:
-  # Directory used by API mode for generated spec files.
+  # Directory used by API mode when resolving spec files by short filename.
+  # Specs are typically written per VM under <control_dir>/<vm>_<moref>/spec.yaml.
   # Default behavior if omitted/empty: <control_dir>/specs
-  specs_dir: /var/lib/vm-migrator/specs
+  # To avoid confusion, you can set this to control_dir directly.
+  specs_dir: /var/lib/vm-migrator
 
   # OPTIONAL:
   # Working directory for API-launched subprocess jobs.
+  # Must exist on host.
   # Default behavior if omitted/empty: current repo directory or serve working directory
-  workdir: /opt/vmware-to-cloudstack
+  workdir: /var/lib/vm-migrator
 
 cloudstack:
   # MANDATORY: CloudStack API endpoint.
@@ -80,43 +83,6 @@ cloudstack_defaults:
   networkid: "3da6b73b-b55b-4d0d-9dcf-2c40fe8bb6aa"
   serviceofferingid: "4c636c18-3cd6-4b24-b0ef-e0347198b46c"
   diskofferingid: "93e1314f-3d5f-44f0-9e63-315553e50ec6"
-
-vddk:
-  # OPTIONAL for direct base-copy / delta-sync engine commands.
-  # Not required for run mode if migration.vddk_path + vcenter config are present.
-  libdir: /opt/vmware-vddk/vmware-vix-disklib-distrib
-  server: 10.0.35.3
-  user: administrator@vsphere.local
-  # OPTIONAL:
-  # If empty, base-copy / delta-sync commands fall back to VC_PASSWORD env var.
-  password: ""
-  # MANDATORY for direct engine commands unless your environment accepts otherwise.
-  thumbprint: "AA:BB:CC:DD:EE:FF:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE"
-
-engine:
-  # OPTIONAL:
-  # Global engine defaults mainly used for direct engine spec mode.
-  # Run mode uses migration.readers per VM or CLI override.
-
-  # Default behavior in code if omitted/0: 4
-  readers: 4
-  # Default behavior in code if omitted/0: 64
-  queue_depth: 64
-  # Default behavior in code if omitted/0: 1
-  min_chunk_mb: 1
-  # Default behavior in code if omitted/0: 4
-  max_chunk_mb: 4
-  # Default behavior in code if omitted/0: 40
-  fast_latency_ms: 40
-  # Default behavior in code if omitted/0: 250
-  slow_latency_ms: 250
-  # Default behavior in code if omitted/0: 180
-  fast_mbps: 180
-  # Default behavior in code if omitted/0: 40
-  slow_mbps: 40
-  # Used by some engine workflows as delta read size hint.
-  # Default behavior if omitted: engine internal defaults
-  chunk_mb_delta: 4
 
 virt:
   # OPTIONAL:

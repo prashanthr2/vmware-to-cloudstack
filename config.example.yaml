@@ -25,30 +25,14 @@ cloudstack_defaults:
   serviceofferingid: ""
   diskofferingid: ""
 
-vddk:
-  libdir: /opt/vmware-vddk/vmware-vix-disklib-distrib
-  server: 10.0.35.3
-  user: administrator@vsphere.local
-  # Prefer passing password as env var VC_PASSWORD at runtime.
-  password: ""
-  thumbprint: "AA:BB:CC:DD:EE:FF:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE"
-
-engine:
-  readers: 4
-  queue_depth: 64
-  min_chunk_mb: 1
-  max_chunk_mb: 4
-  fast_latency_ms: 40
-  slow_latency_ms: 250
-  fast_mbps: 180
-  slow_mbps: 40
-  chunk_mb_delta: 4
-
 migration:
   # Optional orchestrator defaults for run mode.
   control_dir: /var/lib/vm-migrator
-  specs_dir: /var/lib/vm-migrator/specs
-  workdir: /opt/vmware-to-cloudstack
+  # Optional lookup directory for API start-by-filename.
+  # Keeping this same as control_dir avoids confusion when specs live per VM folder.
+  specs_dir: /var/lib/vm-migrator
+  # Working directory for API-launched run jobs. Must exist.
+  workdir: /var/lib/vm-migrator
   shutdown_mode: auto # auto | force | manual
   parallel_disks: 4
   parallel_vms: 3
