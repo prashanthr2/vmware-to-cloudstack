@@ -51,6 +51,18 @@ After bootstrap:
 - `systemctl status v2c-engine`
 - `journalctl -u v2c-engine -f`
 
+## Clean uninstall / reset
+
+To remove bootstrap-installed service/binary/config and reinstall from scratch:
+
+```bash
+chmod +x ./scripts/uninstall.sh
+sudo ./scripts/uninstall.sh --purge-state
+sudo ./scripts/bootstrap.sh --vddk-dir /opt/vmware-vddk/vmware-vix-disklib-distrib --install-service --with-ui
+```
+
+If you also want to remove installed OS packages (aggressive), add `--remove-packages` to `uninstall.sh`.
+
 ## Example files
 
 Use the example pack in [examples/README.md](./examples/README.md).
