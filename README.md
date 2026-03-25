@@ -2,6 +2,26 @@
 
 This repository is Go-first and provides a production migration engine + API/UI services for VMware to CloudStack migrations.
 
+## Project Purpose
+
+The goal of this project is to provide **near-live / warm migration** from VMware to CloudStack with minimal cutover downtime.
+
+How warm migration is achieved:
+
+- A base snapshot is taken and copied to QCOW2 on CloudStack primary storage.
+- Incremental delta rounds are continuously synced using VMware CBT (`QueryChangedDiskAreas`).
+- At cutover (`Finalize`/`Finalize Now`/`finalize_at`), the source VM is shut down, one final delta sync is applied, then import is completed.
+
+This design keeps source VM downtime mostly to the final sync + import boundary, not the full disk copy duration.
+
+## Engine Internals (Summary)
+
+- Disk copy path: VMware VDDK -> direct QCOW2 writes (no RAW intermediate).
+- Delta path: CBT ranges -> direct QCOW2 updates.
+- Conversion path: optional `virt-v2v-in-place` on boot disk after final sync.
+- State machine + resume: per-VM runtime state under `/var/lib/vm-migrator/<vm>_<moref>/`.
+- Control actions: `Finalize` and `Finalize Now` markers, plus CLI/API/UI triggers.
+
 ## Prerequisites
 
 - Linux host
@@ -10,6 +30,8 @@ This repository is Go-first and provides a production migration engine + API/UI 
 - Root/sudo access (required for service install and NFS mount operations)
 - CloudStack API access
 - vCenter credentials
+- CloudStack primary storage support in this release: **NFS only**
+- The migration host/appliance must have network and mount-level access to the NFS primary storage backends selected in CloudStack
 
 The bootstrap script installs required OS packages (Go, qemu tools, virt-v2v, guestfs, and optional node/npm for UI).
 This project does not redistribute VDDK. Users must obtain VDDK directly from Broadcom and accept Broadcom licensing terms separately.
