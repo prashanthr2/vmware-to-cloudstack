@@ -47,6 +47,15 @@ type apiJob struct {
 	FinishedAt *time.Time `json:"finished_at,omitempty"`
 	ReturnCode *int       `json:"return_code,omitempty"`
 	Error      string     `json:"error,omitempty"`
+	RuntimeDir string     `json:"runtime_dir,omitempty"`
+
+	StageSnapshot               string    `json:"-"`
+	NextStageSnapshot           string    `json:"-"`
+	ProgressSnapshot            float64   `json:"-"`
+	TransferSpeedSnapshot       float64   `json:"-"`
+	FinalizeRequestedSnapshot   bool      `json:"-"`
+	FinalizeNowRequestedSnapshot bool     `json:"-"`
+	UpdatedAtSnapshot           time.Time `json:"-"`
 }
 
 type apiServer struct {
@@ -722,13 +731,39 @@ func (s *apiServer) handleMigrationStatus(w http.ResponseWriter, r *http.Request
 		writeError(w, http.StatusBadRequest, "vm name is required")
 		return
 	}
-	st := s.loadState(vmName)
-	job := s.latestJobForVM(vmName)
+	jobID := strings.TrimSpace(r.URL.Query().Get("job_id"))
+	job := (*apiJob)(nil)
+	runDir := ""
+	st := (*runState)(nil)
+
+	if jobID != "" {
+		j := s.getJobByID(jobID)
+		if j == nil {
+			writeError(w, http.StatusNotFound, fmt.Sprintf("Job not found: %s", jobID))
+			return
+		}
+		if strings.TrimSpace(j.VMName) != vmName {
+			writeError(w, http.StatusBadRequest, "job_id does not belong to requested VM")
+			return
+		}
+		job = j
+		runDir = s.runtimeDirForJob(job)
+		st = s.loadStateFromDir(runDir)
+	} else {
+		st = s.loadState(vmName)
+		job = s.latestJobForVM(vmName)
+		if job != nil {
+			runDir = s.runtimeDirForJob(job)
+			if st == nil {
+				st = s.loadStateFromDir(runDir)
+			}
+		}
+	}
 	if st == nil && job == nil {
 		writeError(w, http.StatusNotFound, fmt.Sprintf("No migration state found for VM '%s'.", vmName))
 		return
 	}
-	writeJSON(w, http.StatusOK, s.buildStatusPayload(vmName, st, job))
+	writeJSON(w, http.StatusOK, s.buildStatusPayload(vmName, st, job, runDir))
 }
 
 func (s *apiServer) handleMigrationJobs(w http.ResponseWriter, r *http.Request) {
@@ -746,6 +781,7 @@ func (s *apiServer) handleMigrationJobs(w http.ResponseWriter, r *http.Request) 
 			limit = n
 		}
 	}
+	latestPerVM := parseBool(strings.TrimSpace(r.URL.Query().Get("latest_per_vm")), false)
 
 	s.mu.Lock()
 	jobs := make([]*apiJob, 0, len(s.jobs))
@@ -761,24 +797,38 @@ func (s *apiServer) handleMigrationJobs(w http.ResponseWriter, r *http.Request) 
 	sort.Slice(jobs, func(i, j int) bool {
 		return jobs[i].StartedAt.After(jobs[j].StartedAt)
 	})
+	if latestPerVM {
+		filtered := make([]*apiJob, 0, len(jobs))
+		seen := map[string]struct{}{}
+		for _, job := range jobs {
+			if _, ok := seen[job.VMName]; ok {
+				continue
+			}
+			seen[job.VMName] = struct{}{}
+			filtered = append(filtered, job)
+		}
+		jobs = filtered
+	}
 	if limit < len(jobs) {
 		jobs = jobs[:limit]
 	}
 
 	out := make([]map[string]any, 0, len(jobs))
 	for _, job := range jobs {
-		st := s.loadState(job.VMName)
-		status := s.buildStatusPayload(job.VMName, st, job)
+		runDir := s.runtimeDirForJob(job)
+		status := s.statusPayloadForJobListing(job, runDir)
 		out = append(out, map[string]any{
 			"job_id":      job.JobID,
 			"vm_name":     job.VMName,
 			"status":      job.Status,
 			"spec_file":   job.SpecFile,
+			"runtime_dir": emptyToNil(runDir),
 			"started_at":  job.StartedAt,
 			"finished_at": job.FinishedAt,
 			"return_code": job.ReturnCode,
 			"error":       emptyToNil(job.Error),
 			"stage":       status["stage"],
+			"next_stage":  status["next_stage"],
 			"progress":    status["overall_progress"],
 		})
 	}
@@ -801,7 +851,7 @@ func (s *apiServer) handleMigrationFinalize(w http.ResponseWriter, r *http.Reque
 
 	targetDir := ""
 	if job := s.latestJobForVM(vmName); job != nil {
-		targetDir = s.jobRuntimeDir(job.VMName, job.SpecFile)
+		targetDir = s.runtimeDirForJob(job)
 	}
 	if targetDir == "" {
 		dirs := s.candidateVMDirs(vmName)
@@ -895,12 +945,14 @@ func (s *apiServer) handleMigrationLogs(w http.ResponseWriter, r *http.Request) 
 
 func (s *apiServer) startJob(vmName string, specFile string) *apiJob {
 	id := fmt.Sprintf("%d-%06d", time.Now().UnixNano(), atomic.AddUint64(&s.jobSeq, 1))
+	runtimeDir := s.jobRuntimeDir(vmName, specFile)
 	job := &apiJob{
-		JobID:     id,
-		VMName:    vmName,
-		SpecFile:  specFile,
-		Status:    "queued",
-		StartedAt: time.Now().UTC(),
+		JobID:      id,
+		VMName:     vmName,
+		SpecFile:   specFile,
+		Status:     "queued",
+		StartedAt:  time.Now().UTC(),
+		RuntimeDir: runtimeDir,
 	}
 
 	s.mu.Lock()
@@ -922,7 +974,7 @@ func (s *apiServer) runJob(job *apiJob) {
 	}
 	s.mu.Unlock()
 
-	vmDir := s.jobRuntimeDir(job.VMName, job.SpecFile)
+	vmDir := s.runtimeDirForJob(job)
 	_ = os.MkdirAll(vmDir, 0o755)
 	stdoutPath := filepath.Join(vmDir, job.JobID+".stdout.log")
 	stderrPath := filepath.Join(vmDir, job.JobID+".stderr.log")
@@ -980,10 +1032,12 @@ func (s *apiServer) runJob(job *apiJob) {
 
 func (s *apiServer) finishJob(jobID string, exitCode int, errText string) {
 	now := time.Now().UTC()
+	var jobCopy *apiJob
+
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	job, ok := s.jobs[jobID]
 	if !ok {
+		s.mu.Unlock()
 		return
 	}
 	job.FinishedAt = &now
@@ -991,10 +1045,34 @@ func (s *apiServer) finishJob(jobID string, exitCode int, errText string) {
 	if exitCode == 0 {
 		job.Status = "completed"
 		job.Error = ""
+	} else {
+		job.Status = "failed"
+		job.Error = errText
+	}
+	copy := *job
+	jobCopy = &copy
+	s.mu.Unlock()
+
+	if jobCopy == nil {
 		return
 	}
-	job.Status = "failed"
-	job.Error = errText
+	runDir := s.runtimeDirForJob(jobCopy)
+	st := s.loadStateFromDir(runDir)
+	status := s.buildStatusPayload(jobCopy.VMName, st, jobCopy, runDir)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	job, ok = s.jobs[jobID]
+	if !ok {
+		return
+	}
+	job.StageSnapshot = strings.TrimSpace(anyToString(status["stage"]))
+	job.NextStageSnapshot = strings.TrimSpace(anyToString(status["next_stage"]))
+	job.ProgressSnapshot = anyToFloat(status["overall_progress"])
+	job.TransferSpeedSnapshot = anyToFloat(status["transfer_speed_mbps"])
+	job.FinalizeRequestedSnapshot = anyToBool(status["finalize_requested"])
+	job.FinalizeNowRequestedSnapshot = anyToBool(status["finalize_now_requested"])
+	job.UpdatedAtSnapshot = now
 }
 
 func (s *apiServer) latestJobForVM(vmName string) *apiJob {
@@ -1005,6 +1083,17 @@ func (s *apiServer) latestJobForVM(vmName string) *apiJob {
 		return nil
 	}
 	job := s.jobs[ids[len(ids)-1]]
+	if job == nil {
+		return nil
+	}
+	copy := *job
+	return &copy
+}
+
+func (s *apiServer) getJobByID(jobID string) *apiJob {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	job := s.jobs[jobID]
 	if job == nil {
 		return nil
 	}
@@ -1574,10 +1663,47 @@ func (s *apiServer) jobRuntimeDir(vmName string, specFile string) string {
 	return filepath.Join(s.controlDir, safeVMName(vmName))
 }
 
+func (s *apiServer) runtimeDirForJob(job *apiJob) string {
+	if job == nil {
+		return ""
+	}
+	if strings.TrimSpace(job.RuntimeDir) != "" {
+		return strings.TrimSpace(job.RuntimeDir)
+	}
+	return s.jobRuntimeDir(job.VMName, job.SpecFile)
+}
+
+func statePathFromDir(dir string) string {
+	for _, p := range []string{
+		filepath.Join(dir, "state.json"),
+		filepath.Join(dir, "state.engine.json"),
+	} {
+		if st, err := os.Stat(p); err == nil && !st.IsDir() {
+			return p
+		}
+	}
+	return ""
+}
+
+func (s *apiServer) loadStateFromDir(dir string) *runState {
+	if strings.TrimSpace(dir) == "" {
+		return nil
+	}
+	statePath := statePathFromDir(dir)
+	if statePath == "" {
+		return nil
+	}
+	st, err := loadRunState(statePath)
+	if err != nil {
+		return nil
+	}
+	return st
+}
+
 func (s *apiServer) statePathForVM(vmName string) string {
 	for _, dir := range s.candidateVMDirs(vmName) {
-		p := filepath.Join(dir, "state.json")
-		if st, err := os.Stat(p); err == nil && !st.IsDir() {
+		p := statePathFromDir(dir)
+		if p != "" {
 			return p
 		}
 	}
@@ -1598,12 +1724,7 @@ func (s *apiServer) loadState(vmName string) *runState {
 
 func (s *apiServer) finalizeRequestedForVM(vmName string) bool {
 	for _, dir := range s.candidateVMDirs(vmName) {
-		p := filepath.Join(dir, "FINALIZE")
-		pNow := filepath.Join(dir, "FINALIZE_NOW")
-		if st, err := os.Stat(p); err == nil && !st.IsDir() {
-			return true
-		}
-		if st, err := os.Stat(pNow); err == nil && !st.IsDir() {
+		if finalizeRequestedForDir(dir) {
 			return true
 		}
 	}
@@ -1612,10 +1733,35 @@ func (s *apiServer) finalizeRequestedForVM(vmName string) bool {
 
 func (s *apiServer) finalizeNowRequestedForVM(vmName string) bool {
 	for _, dir := range s.candidateVMDirs(vmName) {
-		p := filepath.Join(dir, "FINALIZE_NOW")
-		if st, err := os.Stat(p); err == nil && !st.IsDir() {
+		if finalizeNowRequestedForDir(dir) {
 			return true
 		}
+	}
+	return false
+}
+
+func finalizeRequestedForDir(dir string) bool {
+	if strings.TrimSpace(dir) == "" {
+		return false
+	}
+	p := filepath.Join(dir, "FINALIZE")
+	pNow := filepath.Join(dir, "FINALIZE_NOW")
+	if st, err := os.Stat(p); err == nil && !st.IsDir() {
+		return true
+	}
+	if st, err := os.Stat(pNow); err == nil && !st.IsDir() {
+		return true
+	}
+	return false
+}
+
+func finalizeNowRequestedForDir(dir string) bool {
+	if strings.TrimSpace(dir) == "" {
+		return false
+	}
+	p := filepath.Join(dir, "FINALIZE_NOW")
+	if st, err := os.Stat(p); err == nil && !st.IsDir() {
+		return true
 	}
 	return false
 }
@@ -1648,7 +1794,7 @@ func (s *apiServer) runVirtSettingForVM(vmName string) bool {
 	return runVirt
 }
 
-func (s *apiServer) buildStatusPayload(vmName string, st *runState, job *apiJob) map[string]any {
+func (s *apiServer) buildStatusPayload(vmName string, st *runState, job *apiJob, runtimeDir string) map[string]any {
 	stage := ""
 	progress := float64(0)
 	transfer := float64(0)
@@ -1759,8 +1905,15 @@ func (s *apiServer) buildStatusPayload(vmName string, st *runState, job *apiJob)
 	if transfer <= 0 && speedCount > 0 {
 		transfer = math.Round((speedSum/float64(speedCount))*100) / 100
 	}
-	finalizeRequested := s.finalizeRequestedForVM(vmName)
-	finalizeNowRequested := s.finalizeNowRequestedForVM(vmName)
+	finalizeRequested := false
+	finalizeNowRequested := false
+	if strings.TrimSpace(runtimeDir) != "" {
+		finalizeRequested = finalizeRequestedForDir(runtimeDir)
+		finalizeNowRequested = finalizeNowRequestedForDir(runtimeDir)
+	} else {
+		finalizeRequested = s.finalizeRequestedForVM(vmName)
+		finalizeNowRequested = s.finalizeNowRequestedForVM(vmName)
+	}
 	currentStage := strings.TrimSpace(stage)
 	if currentStage == "" {
 		currentStage = "not_started"
@@ -1789,6 +1942,92 @@ func (s *apiServer) buildStatusPayload(vmName string, st *runState, job *apiJob)
 	return payload
 }
 
+func (s *apiServer) statusPayloadForJobListing(job *apiJob, runtimeDir string) map[string]any {
+	if job == nil {
+		return map[string]any{}
+	}
+	if strings.TrimSpace(job.Status) == "running" || strings.TrimSpace(job.Status) == "queued" {
+		st := s.loadStateFromDir(runtimeDir)
+		return s.buildStatusPayload(job.VMName, st, job, runtimeDir)
+	}
+	if strings.TrimSpace(job.StageSnapshot) != "" {
+		return map[string]any{
+			"stage":                  emptyToNil(job.StageSnapshot),
+			"next_stage":             emptyToNil(job.NextStageSnapshot),
+			"overall_progress":       job.ProgressSnapshot,
+			"transfer_speed_mbps":    job.TransferSpeedSnapshot,
+			"finalize_requested":     job.FinalizeRequestedSnapshot,
+			"finalize_now_requested": job.FinalizeNowRequestedSnapshot,
+			"updated_at":             job.UpdatedAtSnapshot,
+		}
+	}
+	stage := "unknown"
+	progress := float64(0)
+	switch strings.ToLower(strings.TrimSpace(job.Status)) {
+	case "completed":
+		stage = stageDone
+		progress = 100
+	case "failed":
+		stage = "failed"
+	}
+	return map[string]any{
+		"stage":                  stage,
+		"next_stage":             "none",
+		"overall_progress":       progress,
+		"transfer_speed_mbps":    0,
+		"finalize_requested":     false,
+		"finalize_now_requested": false,
+		"updated_at":             job.FinishedAt,
+	}
+}
+
+func anyToFloat(v any) float64 {
+	switch t := v.(type) {
+	case float64:
+		return t
+	case float32:
+		return float64(t)
+	case int:
+		return float64(t)
+	case int64:
+		return float64(t)
+	case string:
+		f, _ := strconv.ParseFloat(strings.TrimSpace(t), 64)
+		return f
+	default:
+		return 0
+	}
+}
+
+func anyToString(v any) string {
+	if v == nil {
+		return ""
+	}
+	switch t := v.(type) {
+	case string:
+		return t
+	default:
+		return fmt.Sprintf("%v", t)
+	}
+}
+
+func anyToBool(v any) bool {
+	switch t := v.(type) {
+	case bool:
+		return t
+	case string:
+		return parseBool(strings.TrimSpace(t), false)
+	case int:
+		return t != 0
+	case int64:
+		return t != 0
+	case float64:
+		return t != 0
+	default:
+		return false
+	}
+}
+
 func (s *apiServer) getLogs(vmName string, lines int, jobID string) map[string]any {
 	job := s.latestJobForVM(vmName)
 	targetDir := ""
@@ -1799,11 +2038,11 @@ func (s *apiServer) getLogs(vmName string, lines int, jobID string) map[string]a
 		explicit := s.jobs[resolvedJobID]
 		s.mu.Unlock()
 		if explicit != nil && explicit.VMName == vmName {
-			targetDir = s.jobRuntimeDir(explicit.VMName, explicit.SpecFile)
+			targetDir = s.runtimeDirForJob(explicit)
 		}
 	}
 	if targetDir == "" && job != nil {
-		targetDir = s.jobRuntimeDir(job.VMName, job.SpecFile)
+		targetDir = s.runtimeDirForJob(job)
 		if resolvedJobID == "" {
 			resolvedJobID = job.JobID
 		}

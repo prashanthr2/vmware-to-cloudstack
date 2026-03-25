@@ -58,17 +58,6 @@ function optionLabel(item) {
   return item.name || item.description || item.displaytext || item.id || "Unknown";
 }
 
-function uniqueByVm(jobs) {
-  const seen = new Set();
-  const result = [];
-  jobs.forEach((job) => {
-    if (seen.has(job.vm_name)) return;
-    seen.add(job.vm_name);
-    result.push(job.vm_name);
-  });
-  return result;
-}
-
 function pickValidOrFirst(currentId, items) {
   if (!items.length) return "";
   return items.some((item) => item.id === currentId) ? currentId : items[0].id;
@@ -206,7 +195,8 @@ export default function App() {
 
   const [lastSpecFile, setLastSpecFile] = useState("");
   const [jobs, setJobs] = useState([]);
-  const [statusByVm, setStatusByVm] = useState({});
+  const [statusByJob, setStatusByJob] = useState({});
+  const [showJobHistory, setShowJobHistory] = useState(false);
   const [selectedJob, setSelectedJob] = useState(null);
   const [logs, setLogs] = useState({ stdout: "", stderr: "", stdout_path: "", stderr_path: "", job_id: "" });
   const [logsBusy, setLogsBusy] = useState(false);
@@ -589,32 +579,38 @@ export default function App() {
 
   const refreshJobs = useCallback(async () => {
     try {
-      const list = await apiRequest("/migration/jobs?limit=200");
+      const latestOnly = showJobHistory ? "false" : "true";
+      const list = await apiRequest(`/migration/jobs?limit=200&latest_per_vm=${latestOnly}`);
       setJobs(list);
     } catch (err) {
       pushToast("error", err.message || "Failed to load jobs.");
     }
-  }, [pushToast]);
+  }, [pushToast, showJobHistory]);
 
   const pollStatuses = useCallback(async () => {
-    const vmNames = uniqueByVm(jobs);
-    if (!vmNames.length) return;
+    const activeJobs = (jobs || []).filter((job) => {
+      const status = String(job?.status || "").toLowerCase();
+      return status === "running" || status === "queued";
+    });
+    if (!activeJobs.length) return;
     try {
       const responses = await Promise.all(
-        vmNames.map(async (vmName) => {
+        activeJobs.map(async (job) => {
           try {
-            const status = await apiRequest(`/migration/status/${encodeURIComponent(vmName)}`);
-            return [vmName, status];
+            const status = await apiRequest(
+              `/migration/status/${encodeURIComponent(job.vm_name)}?job_id=${encodeURIComponent(job.job_id)}`
+            );
+            return [job.job_id, status];
           } catch {
-            return [vmName, null];
+            return [job.job_id, null];
           }
         })
       );
       const updates = {};
-      responses.forEach(([vmName, payload]) => {
-        if (payload) updates[vmName] = payload;
+      responses.forEach(([jobID, payload]) => {
+        if (payload) updates[jobID] = payload;
       });
-      if (Object.keys(updates).length > 0) setStatusByVm((prev) => ({ ...prev, ...updates }));
+      if (Object.keys(updates).length > 0) setStatusByJob((prev) => ({ ...prev, ...updates }));
     } catch {
       // silence polling failures
     }
@@ -640,8 +636,11 @@ export default function App() {
 
   useEffect(() => {
     loadInventory();
+  }, [loadInventory]);
+
+  useEffect(() => {
     refreshJobs();
-  }, [loadInventory, refreshJobs]);
+  }, [refreshJobs]);
 
   useEffect(() => {
     const interval = setInterval(refreshJobs, 8000);
@@ -660,6 +659,28 @@ export default function App() {
     const interval = setInterval(() => loadLogsForJob(selectedJob), 2000);
     return () => clearInterval(interval);
   }, [selectedJob, loadLogsForJob]);
+
+  useEffect(() => {
+    if (!jobs.length) {
+      if (selectedJob) setSelectedJob(null);
+      return;
+    }
+    if (selectedJob && jobs.some((job) => job.job_id === selectedJob.job_id)) {
+      return;
+    }
+    setSelectedJob(jobs[0]);
+  }, [jobs, selectedJob]);
+
+  useEffect(() => {
+    const valid = new Set(jobs.map((job) => job.job_id));
+    setStatusByJob((prev) => {
+      const next = {};
+      Object.keys(prev).forEach((jobID) => {
+        if (valid.has(jobID)) next[jobID] = prev[jobID];
+      });
+      return next;
+    });
+  }, [jobs]);
 
   const updateField = useCallback(
     (field, value) => {
@@ -877,7 +898,7 @@ export default function App() {
     [pollStatuses, pushToast, refreshJobs]
   );
 
-  const selectedVmStatus = selectedJob ? statusByVm[selectedJob.vm_name] : null;
+  const selectedVmStatus = selectedJob ? statusByJob[selectedJob.job_id] || null : null;
   const selectedSettingsRows = useMemo(
     () =>
       selectedVmNames.map((vmName) => {
@@ -1087,7 +1108,9 @@ export default function App() {
       ) : (
         <MigrationProgress
           jobs={jobs}
-          statusByVm={statusByVm}
+          statusByJob={statusByJob}
+          showJobHistory={showJobHistory}
+          onToggleShowJobHistory={setShowJobHistory}
           selectedJobId={selectedJob?.job_id || ""}
           onSelectJob={(job) => {
             setSelectedJob(job);

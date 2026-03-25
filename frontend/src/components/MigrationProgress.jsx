@@ -20,7 +20,9 @@ function formatDate(value) {
 
 export default function MigrationProgress({
   jobs,
-  statusByVm,
+  statusByJob,
+  showJobHistory,
+  onToggleShowJobHistory,
   selectedJobId,
   onSelectJob,
   onFinalize,
@@ -29,7 +31,17 @@ export default function MigrationProgress({
 }) {
   return (
     <section className="panel">
-      <h2>Migration Progress</h2>
+      <div className="subsection-title-row">
+        <h2>Migration Progress</h2>
+        <label className="checkbox-field">
+          <input
+            type="checkbox"
+            checked={Boolean(showJobHistory)}
+            onChange={(e) => onToggleShowJobHistory(e.target.checked)}
+          />
+          Show History
+        </label>
+      </div>
 
       <div className="table-wrap">
         <table>
@@ -55,7 +67,7 @@ export default function MigrationProgress({
               </tr>
             ) : (
               jobs.map((job) => {
-                const status = statusByVm[job.vm_name] || {};
+                const status = statusByJob[job.job_id] || {};
                 const progress = normalizeProgress(
                   status.overall_progress !== undefined && status.overall_progress !== null
                     ? status.overall_progress
@@ -130,7 +142,7 @@ export default function MigrationProgress({
       {selectedJobId ? (
         <div className="subsection">
           <h3>Disk-Level Progress</h3>
-          <DiskProgress status={jobs.length ? statusByVm[jobs.find((j) => j.job_id === selectedJobId)?.vm_name] : null} />
+          <DiskProgress status={statusByJob[selectedJobId] || null} />
           {logsSection}
         </div>
       ) : null}
