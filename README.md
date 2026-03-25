@@ -90,6 +90,186 @@ Storage behavior:
 - Engine ensures `/mnt/<storageid>` exists and is mounted before copy.
 - If not mounted, engine attempts NFS mount using CloudStack storage pool details (`listStoragePools`).
 
+## How It Works
+
+At a high level, each VM migration follows this model:
+
+1. The engine connects to vCenter, finds the VM, verifies disks/NICs, and ensures CBT is enabled.
+2. It creates a base snapshot and copies each VMware disk directly into QCOW2 on the selected CloudStack primary storage mount.
+3. It enters delta mode and repeatedly uses VMware CBT to fetch only changed blocks since the previous snapshot.
+4. When finalize is requested, or when `finalize_at` time is reached, the engine shuts down the source VM according to policy and performs one final delta sync.
+5. If enabled, it runs `virt-v2v-in-place` on the boot QCOW2.
+6. It imports the root disk into CloudStack, then imports and attaches data disks, and finally attaches additional NICs.
+
+Important behavior:
+
+- Base and delta both write directly into QCOW2.
+- Delta sync preserves QCOW2 metadata by writing through the qemu block path.
+- The workflow is resumable through `state.json`.
+- `status` reports current stage, next stage, and whether finalize has already been requested.
+
+## Migration Methods
+
+The main migration strategies are controlled by the `migration:` block in the VM spec.
+
+### Continuous Delta Loop
+
+This is the default behavior when `delta_interval` is set.
+
+Parameters:
+
+- `delta_interval`
+  - Required for normal continuous sync behavior.
+  - Unit: seconds.
+  - Controls how often the engine performs a delta round during the pre-cutover phase.
+
+Behavior:
+
+- Base copy completes first.
+- The engine waits `delta_interval` seconds before the first delta round.
+- It then keeps running delta rounds every `delta_interval` seconds until finalize is triggered.
+- Finalize can be triggered manually from CLI/API/UI.
+
+Example:
+
+```yaml
+migration:
+  delta_interval: 300
+```
+
+### Scheduled Finalize
+
+This is used when you want the tool to keep syncing until a planned cutover time.
+
+Parameters:
+
+- `finalize_at`
+  - Optional.
+  - Accepts ISO-like timestamps such as:
+    - `2026-03-12T23:30:00+00:00`
+    - `2026-03-12T23:30:00`
+    - `2026-03-12T23:30`
+- `finalize_delta_interval`
+  - Optional.
+  - Unit: seconds.
+  - Default: `30`
+  - Used when the engine is inside the finalize window and wants tighter sync frequency before cutover.
+- `finalize_window`
+  - Optional.
+  - Unit: seconds.
+  - Default: `600`
+  - If current time is within `finalize_window` seconds of `finalize_at`, the engine reduces the sleep interval to `finalize_delta_interval`.
+
+Behavior:
+
+- The engine still does normal delta rounds after base copy.
+- Before the `finalize_at` time, it uses:
+  - `delta_interval` normally
+  - `finalize_delta_interval` once the engine is inside the finalize window
+- Once the current time passes `finalize_at`, the engine treats that as a finalize request.
+- It then powers off the source VM according to `shutdown_mode`, performs `final_sync`, and continues import.
+
+Example:
+
+```yaml
+migration:
+  delta_interval: 300
+  finalize_at: "2026-03-12T23:30:00+00:00"
+  finalize_delta_interval: 30
+  finalize_window: 600
+```
+
+### Manual Finalize
+
+You can trigger finalize explicitly even if `finalize_at` is not set.
+
+Supported methods:
+
+- CLI:
+  - `./v2c-engine finalize --spec ./spec.run.multi.example.yaml --vm Centos7 --config ./config.yaml`
+- API:
+  - `POST /migration/finalize/{vm}`
+- UI:
+  - `Finalize` action from Progress tab
+
+Behavior:
+
+- Finalize request is idempotent.
+- If finalize is already requested, the engine reports that state and does not duplicate work.
+- If the VM is already complete, finalize returns success with completion status.
+
+## Workflow Diagram
+
+```text
+                  +----------------------+
+                  |   v2c-engine run     |
+                  +----------+-----------+
+                             |
+                             v
+                  +----------------------+
+                  | init                 |
+                  | - find VM            |
+                  | - ensure CBT         |
+                  | - create base snap   |
+                  +----------+-----------+
+                             |
+                             v
+                  +----------------------+
+                  | base_copy            |
+                  | - VDDK reads         |
+                  | - write QCOW2        |
+                  | - per-disk parallel  |
+                  +----------+-----------+
+                             |
+                             v
+                  +----------------------+
+                  | delta loop           |
+                  | - wait delta_interval|
+                  | - create delta snap  |
+                  | - QueryChanged...    |
+                  | - apply CBT blocks   |
+                  +----------+-----------+
+                             |
+              +--------------+---------------+
+              |                              |
+              | finalize requested?          | no
+              | finalize_at reached?         +------> back to delta loop
+              |
+              v
+   +---------------------------+
+   | final_sync                |
+   | - shutdown source VM      |
+   | - create final snapshot   |
+   | - apply last CBT changes  |
+   +-------------+-------------+
+                 |
+                 v
+   +---------------------------+
+   | converting                |
+   | - virt-v2v-in-place       |
+   |   (if enabled)            |
+   +-------------+-------------+
+                 |
+                 v
+   +---------------------------+
+   | import_root_disk          |
+   | - importVm                |
+   | - attach extra NICs       |
+   +-------------+-------------+
+                 |
+                 v
+   +---------------------------+
+   | import_data_disk          |
+   | - importVolume            |
+   | - attachVolume            |
+   +-------------+-------------+
+                 |
+                 v
+   +---------------------------+
+   | done                      |
+   +---------------------------+
+```
+
 ## Primary Commands
 
 ```bash
