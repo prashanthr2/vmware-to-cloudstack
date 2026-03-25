@@ -7,6 +7,7 @@ REPO_DIR="$(cd -- "$SCRIPT_DIR/.." >/dev/null 2>&1 && pwd)"
 VDDK_DIR=""
 VDDK_TAR=""
 CONFIG_PATH="$REPO_DIR/config.yaml"
+BIN_PATH="/usr/local/bin/v2c-engine"
 LISTEN_ADDR=":8000"
 INSTALL_SERVICE=0
 WITH_UI=0
@@ -20,6 +21,7 @@ Options:
   --vddk-dir <path>        Path to VMware VDDK root (contains include/ and lib64/)
   --vddk-tar <path>        Path to VMware VDDK tarball to extract under /opt/vmware-vddk
   --config <path>          Config file path for service (default: ./config.yaml)
+  --bin-path <path>        Installed binary path for service (default: /usr/local/bin/v2c-engine)
   --listen <addr>          API listen address for service (default: :8000)
   --install-service        Create and start systemd service: v2c-engine
   --with-ui                Install frontend npm dependencies
@@ -163,7 +165,9 @@ build_engine() {
     go mod tidy
     go build -o v2c-engine ./cmd/v2c-engine
   )
+  run_root install -m 0755 "$REPO_DIR/v2c-engine" "$BIN_PATH"
   log "Built binary: $REPO_DIR/v2c-engine"
+  log "Installed binary: $BIN_PATH"
 }
 
 install_ui_deps() {
@@ -180,6 +184,15 @@ install_ui_deps() {
 install_systemd_service() {
   [[ "$INSTALL_SERVICE" -eq 1 ]] || return
   local unit="/etc/systemd/system/v2c-engine.service"
+  local service_config="$CONFIG_PATH"
+  if [[ "$service_config" == /root/* ]] || [[ "$service_config" == /home/* ]]; then
+    # Systemd services often cannot read files under home paths due host policy/SELinux.
+    run_root mkdir -p /etc/v2c-engine
+    run_root install -m 0640 "$service_config" /etc/v2c-engine/config.yaml
+    service_config="/etc/v2c-engine/config.yaml"
+    log "Copied config to service-safe path: $service_config"
+  fi
+  run_root mkdir -p /var/lib/vm-migrator
   local tmp
   tmp="$(mktemp)"
   cat >"$tmp" <<EOF
@@ -190,11 +203,12 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=$REPO_DIR
+User=root
+WorkingDirectory=/var/lib/vm-migrator
 Environment=PATH=/usr/libexec:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
 Environment=LD_LIBRARY_PATH=$VDDK_DIR/lib64
 EnvironmentFile=-/etc/default/v2c-engine
-ExecStart=$REPO_DIR/v2c-engine serve --config $CONFIG_PATH --listen $LISTEN_ADDR
+ExecStart=$BIN_PATH serve --config $service_config --listen $LISTEN_ADDR
 Restart=on-failure
 RestartSec=5
 LimitNOFILE=65535
@@ -227,7 +241,7 @@ Bootstrap complete.
 Repo:         $REPO_DIR
 Config:       $CONFIG_PATH
 VDDK:         $VDDK_DIR
-Binary:       $REPO_DIR/v2c-engine
+Binary:       $BIN_PATH
 Service:      $([[ "$INSTALL_SERVICE" -eq 1 ]] && echo "installed (v2c-engine)" || echo "not installed")
 Frontend deps:$([[ "$WITH_UI" -eq 1 ]] && echo "installed" || echo "not installed")
 
@@ -238,7 +252,7 @@ Next:
    journalctl -u v2c-engine -f
 3) If service not installed:
    export VC_PASSWORD='your-vcenter-password'
-   $REPO_DIR/v2c-engine serve --config $CONFIG_PATH --listen $LISTEN_ADDR
+   $BIN_PATH serve --config $CONFIG_PATH --listen $LISTEN_ADDR
 
 EOF
 }
@@ -251,6 +265,8 @@ while [[ $# -gt 0 ]]; do
       VDDK_TAR="${2:-}"; shift 2 ;;
     --config)
       CONFIG_PATH="${2:-}"; shift 2 ;;
+    --bin-path)
+      BIN_PATH="${2:-}"; shift 2 ;;
     --listen)
       LISTEN_ADDR="${2:-}"; shift 2 ;;
     --install-service)
