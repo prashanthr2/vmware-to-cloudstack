@@ -788,6 +788,10 @@ func (s *apiServer) handleMigrationFinalize(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	finalizePath := filepath.Join(targetDir, "FINALIZE")
+	alreadyRequested := false
+	if st, err := os.Stat(finalizePath); err == nil && !st.IsDir() {
+		alreadyRequested = true
+	}
 	if f, err := os.OpenFile(finalizePath, os.O_CREATE|os.O_WRONLY, 0o644); err == nil {
 		_ = f.Close()
 	} else {
@@ -795,9 +799,15 @@ func (s *apiServer) handleMigrationFinalize(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"vm_name":       vmName,
-		"finalize_file": finalizePath,
-		"message":       "Finalize marker created",
+		"vm_name":           vmName,
+		"finalize_file":     finalizePath,
+		"already_requested": alreadyRequested,
+		"message": func() string {
+			if alreadyRequested {
+				return "Finalize marker already present"
+			}
+			return "Finalize marker created"
+		}(),
 	})
 }
 
@@ -1534,6 +1544,44 @@ func (s *apiServer) loadState(vmName string) *runState {
 	return st
 }
 
+func (s *apiServer) finalizeRequestedForVM(vmName string) bool {
+	for _, dir := range s.candidateVMDirs(vmName) {
+		p := filepath.Join(dir, "FINALIZE")
+		if st, err := os.Stat(p); err == nil && !st.IsDir() {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *apiServer) runVirtSettingForVM(vmName string) bool {
+	runVirt := false
+	if s.cfg != nil {
+		runVirt = s.cfg.Virt.RunVirtV2V
+	}
+
+	specPath, err := s.latestSpecForVM(vmName)
+	if err != nil {
+		return runVirt
+	}
+	specs, err := loadRunSpecs([]string{specPath})
+	if err != nil || len(specs) == 0 {
+		return runVirt
+	}
+	for _, spec := range specs {
+		if spec == nil {
+			continue
+		}
+		if strings.TrimSpace(spec.VM.Name) == strings.TrimSpace(vmName) {
+			return effectiveRunVirtV2V(s.cfg, spec)
+		}
+	}
+	if len(specs) == 1 {
+		return effectiveRunVirtV2V(s.cfg, specs[0])
+	}
+	return runVirt
+}
+
 func (s *apiServer) buildStatusPayload(vmName string, st *runState, job *apiJob) map[string]any {
 	stage := ""
 	progress := float64(0)
@@ -1632,10 +1680,18 @@ func (s *apiServer) buildStatusPayload(vmName string, st *runState, job *apiJob)
 	if transfer <= 0 && speedCount > 0 {
 		transfer = math.Round((speedSum/float64(speedCount))*100) / 100
 	}
+	finalizeRequested := s.finalizeRequestedForVM(vmName)
+	currentStage := strings.TrimSpace(stage)
+	if currentStage == "" {
+		currentStage = "not_started"
+	}
+	nextStage := nextStageForStatus(currentStage, s.runVirtSettingForVM(vmName), finalizeRequested)
 
 	payload := map[string]any{
 		"vm_name":             vmName,
 		"stage":               emptyToNil(stage),
+		"next_stage":          nextStage,
+		"finalize_requested":  finalizeRequested,
 		"progress":            overall,
 		"overall_progress":    overall,
 		"transfer_speed_mbps": transfer,

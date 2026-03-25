@@ -38,6 +38,8 @@ export default function MigrationProgress({
               <th>Job</th>
               <th>Job Status</th>
               <th>Stage</th>
+              <th>Next Stage</th>
+              <th>Finalize</th>
               <th>Overall Progress</th>
               <th>Speed</th>
               <th>Started</th>
@@ -48,7 +50,7 @@ export default function MigrationProgress({
           <tbody>
             {jobs.length === 0 ? (
               <tr>
-                <td colSpan={9}>No jobs yet.</td>
+                <td colSpan={11}>No jobs yet.</td>
               </tr>
             ) : (
               jobs.map((job) => {
@@ -63,13 +65,24 @@ export default function MigrationProgress({
                 const endedAt =
                   job.finished_at ||
                   ((jobStatus === "completed" || jobStatus === "failed") ? status.updated_at : null);
+                const finalizeRequested = Boolean(status.finalize_requested);
+                const stage = status.stage || job.stage || "-";
+                const nextStage = status.next_stage || "-";
+                const finalizeButtonDisabled =
+                  finalizeRequested || stage === "done" || stage === "final_sync";
 
                 return (
                   <tr key={job.job_id} className={selectedJobId === job.job_id ? "selected-row" : ""}>
                     <td>{job.vm_name}</td>
                     <td><code>{job.job_id.slice(0, 8)}</code></td>
                     <td><span className={`pill ${statusClass}`}>{jobStatus}</span></td>
-                    <td>{status.stage || job.stage || "-"}</td>
+                    <td>{stage}</td>
+                    <td>{nextStage}</td>
+                    <td>
+                      <span className={`pill ${finalizeRequested ? "completed" : "queued"}`}>
+                        {finalizeRequested ? "Requested" : "Not Requested"}
+                      </span>
+                    </td>
                     <td>
                       <div className="progress-cell">
                         <div className="progress-track">
@@ -85,8 +98,13 @@ export default function MigrationProgress({
                       <button className="secondary" onClick={() => onSelectJob(job)}>
                         Details
                       </button>
-                      <button className="secondary" onClick={() => onFinalize(job.vm_name)}>
-                        Finalize
+                      <button
+                        className="secondary"
+                        onClick={() => onFinalize(job.vm_name)}
+                        disabled={finalizeButtonDisabled}
+                        title={finalizeRequested ? "Finalize already requested" : "Request finalize"}
+                      >
+                        {finalizeRequested ? "Finalize Requested" : "Finalize"}
                       </button>
                     </td>
                   </tr>

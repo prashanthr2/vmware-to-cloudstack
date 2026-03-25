@@ -797,12 +797,20 @@ export default function App() {
     async (vmName) => {
       try {
         const response = await apiRequest(`/migration/finalize/${encodeURIComponent(vmName)}`, { method: "POST" });
-        pushToast("success", response.message);
+        const alreadyRequested = Boolean(response?.already_requested);
+        pushToast(
+          "success",
+          alreadyRequested
+            ? `${vmName}: FINALIZE already requested.`
+            : `${vmName}: FINALIZE requested successfully.`
+        );
+        await pollStatuses();
+        await refreshJobs();
       } catch (err) {
         pushToast("error", err.message || "Failed to finalize migration.");
       }
     },
-    [pushToast]
+    [pollStatuses, pushToast, refreshJobs]
   );
 
   const selectedVmStatus = selectedJob ? statusByVm[selectedJob.vm_name] : null;
