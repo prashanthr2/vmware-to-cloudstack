@@ -1628,7 +1628,7 @@ func (s *apiServer) buildStatusPayload(vmName string, st *runState, job *apiJob)
 
 	diskProgress := make([]map[string]any, 0, len(disksRaw))
 	totalBytes := int64(0)
-	copiedBytes := int64(0)
+	readTotalBytes := int64(0)
 	speedSum := float64(0)
 	speedCount := 0
 
@@ -1656,6 +1656,9 @@ func (s *apiServer) buildStatusPayload(vmName string, st *runState, job *apiJob)
 		}
 		copied := ds.CopiedBytes
 		if copied <= 0 {
+			copied = ds.BytesWritten
+		}
+		if copied <= 0 {
 			copied = ds.BytesRead
 		}
 		if copied < 0 {
@@ -1664,17 +1667,27 @@ func (s *apiServer) buildStatusPayload(vmName string, st *runState, job *apiJob)
 		if copied > total && total > 0 {
 			copied = total
 		}
-		remaining := total - copied
+		readBytes := ds.BytesRead
+		if readBytes <= 0 {
+			readBytes = copied
+		}
+		if readBytes < 0 {
+			readBytes = 0
+		}
+		if readBytes > total && total > 0 {
+			readBytes = total
+		}
+		remaining := total - readBytes
 		if remaining < 0 {
 			remaining = 0
 		}
 		pct := ds.Progress
 		if pct <= 0 && total > 0 {
-			pct = math.Round((float64(copied)*10000)/float64(total)) / 100
+			pct = math.Round((float64(readBytes)*10000)/float64(total)) / 100
 		}
 
 		totalBytes += total
-		copiedBytes += copied
+		readTotalBytes += readBytes
 		if ds.SpeedMBps > 0 {
 			speedSum += ds.SpeedMBps
 			speedCount++
@@ -1701,7 +1714,7 @@ func (s *apiServer) buildStatusPayload(vmName string, st *runState, job *apiJob)
 
 	overall := progress
 	if overall <= 0 && totalBytes > 0 {
-		overall = math.Round((float64(copiedBytes)*10000)/float64(totalBytes)) / 100
+		overall = math.Round((float64(readTotalBytes)*10000)/float64(totalBytes)) / 100
 	}
 	if overall <= 0 && stage == stageDone {
 		overall = 100
