@@ -131,6 +131,8 @@ export CGO_LDFLAGS="-L/opt/vmware-vddk/lib64 -lvixDiskLib -ldl -lpthread"
 ./v2c-engine run --spec ./spec.run.example.yaml --config ./config.yaml
 ./v2c-engine run --spec ./spec.run.example.yaml --spec ./another-vm.yaml --config ./config.yaml
 ./v2c-engine run --spec ./spec.run.multi.example.yaml --parallel-vms 3 --config ./config.yaml
+./v2c-engine status --spec ./spec.run.multi.example.yaml --config ./config.yaml
+./v2c-engine finalize --spec ./spec.run.multi.example.yaml --vm Centos7 --config ./config.yaml
 ./v2c-engine serve --config ./config.yaml --listen :8000
 ```
 
@@ -178,6 +180,10 @@ You can still override any value from spec with CLI flags:
 
 Use [spec.run.example.yaml](./spec.run.example.yaml) as the template for full run-mode specs.
 Use [spec.run.multi.example.yaml](./spec.run.multi.example.yaml) for top-level `vms:` batch format.
+
+Finalize/status notes:
+- `status` prints current stage and next stage per VM. If finalize marker is present during delta stage, next stage is shown as `Finalize`.
+- `finalize` works per VM from batch specs using `--vm` and optional `--vm-id` (MoRef) to disambiguate.
 
 Expert mode note:
 - `base-copy` and `delta-sync` are hidden from normal CLI usage.

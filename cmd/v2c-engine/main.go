@@ -3190,6 +3190,31 @@ type runOptions struct {
 	ParallelDisks int
 }
 
+type finalizeOptions struct {
+	SpecPaths  []string
+	ConfigPath string
+	ControlDir string
+	VMNames    []string
+	VMMorefs   []string
+}
+
+type statusOptions struct {
+	SpecPaths  []string
+	ConfigPath string
+	ControlDir string
+	VMNames    []string
+	VMMorefs   []string
+	JSON       bool
+}
+
+type vmRuntimeTarget struct {
+	Spec         *runSpec
+	ControlDir   string
+	StatePath    string
+	FinalizePath string
+	State        *runState
+}
+
 type multiStringFlag []string
 
 func (m *multiStringFlag) String() string {
@@ -3203,6 +3228,262 @@ func (m *multiStringFlag) Set(v string) error {
 	}
 	*m = append(*m, v)
 	return nil
+}
+
+func sliceToSet(vals []string) map[string]struct{} {
+	if len(vals) == 0 {
+		return nil
+	}
+	out := map[string]struct{}{}
+	for _, v := range vals {
+		v = strings.TrimSpace(v)
+		if v == "" {
+			continue
+		}
+		out[v] = struct{}{}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func controlRootFromConfig(cfg *appConfig, override string) string {
+	if strings.TrimSpace(override) != "" {
+		return strings.TrimSpace(override)
+	}
+	if cfg != nil && strings.TrimSpace(cfg.Migration.ControlDir) != "" {
+		return strings.TrimSpace(cfg.Migration.ControlDir)
+	}
+	return "/var/lib/vm-migrator"
+}
+
+func filterRunSpecsByVMNames(specs []*runSpec, vmNames map[string]struct{}) ([]*runSpec, error) {
+	if len(specs) == 0 {
+		return nil, errors.New("no VM specs provided")
+	}
+	if len(vmNames) == 0 {
+		return specs, nil
+	}
+
+	filtered := make([]*runSpec, 0, len(specs))
+	found := map[string]struct{}{}
+	for _, spec := range specs {
+		if spec == nil {
+			continue
+		}
+		name := strings.TrimSpace(spec.VM.Name)
+		if name == "" {
+			continue
+		}
+		if _, ok := vmNames[name]; ok {
+			filtered = append(filtered, spec)
+			found[name] = struct{}{}
+		}
+	}
+	if len(filtered) == 0 {
+		names := make([]string, 0, len(vmNames))
+		for n := range vmNames {
+			names = append(names, n)
+		}
+		sort.Strings(names)
+		return nil, fmt.Errorf("no VMs from --vm filters were found in spec(s): %s", strings.Join(names, ", "))
+	}
+
+	missing := make([]string, 0)
+	for n := range vmNames {
+		if _, ok := found[n]; !ok {
+			missing = append(missing, n)
+		}
+	}
+	if len(missing) > 0 {
+		sort.Strings(missing)
+		return nil, fmt.Errorf("some --vm filters were not present in spec(s): %s", strings.Join(missing, ", "))
+	}
+	return filtered, nil
+}
+
+func candidateVMRuntimeDirs(controlRoot, vmName string) []string {
+	base := filepath.Clean(controlRoot)
+	safe := safeVMName(vmName)
+	seen := map[string]struct{}{}
+	out := make([]string, 0)
+
+	add := func(path string) {
+		if strings.TrimSpace(path) == "" {
+			return
+		}
+		st, err := os.Stat(path)
+		if err != nil || !st.IsDir() {
+			return
+		}
+		clean := filepath.Clean(path)
+		if _, ok := seen[clean]; ok {
+			return
+		}
+		seen[clean] = struct{}{}
+		out = append(out, clean)
+	}
+
+	if matches, _ := filepath.Glob(filepath.Join(base, safe+"_*")); len(matches) > 0 {
+		for _, m := range matches {
+			add(m)
+		}
+	}
+	if vmName != safe {
+		if matches, _ := filepath.Glob(filepath.Join(base, vmName+"_*")); len(matches) > 0 {
+			for _, m := range matches {
+				add(m)
+			}
+		}
+	}
+	add(filepath.Join(base, safe))
+	if vmName != safe {
+		add(filepath.Join(base, vmName))
+	}
+
+	sort.Slice(out, func(i, j int) bool {
+		ai, aerr := os.Stat(out[i])
+		aj, jerr := os.Stat(out[j])
+		if aerr != nil || jerr != nil {
+			return out[i] < out[j]
+		}
+		return ai.ModTime().After(aj.ModTime())
+	})
+	return out
+}
+
+func loadRuntimeStateForDir(dir string) (*runState, string, error) {
+	paths := []string{
+		filepath.Join(dir, "state.json"),
+		filepath.Join(dir, "state.engine.json"),
+	}
+	for _, p := range paths {
+		st, err := loadRunState(p)
+		if err != nil {
+			return nil, "", err
+		}
+		if st != nil {
+			return st, p, nil
+		}
+	}
+	return nil, "", nil
+}
+
+func resolveRuntimeTarget(controlRoot string, spec *runSpec, vmMorefFilter map[string]struct{}, requireState bool) (*vmRuntimeTarget, error) {
+	if spec == nil {
+		return nil, errors.New("nil spec")
+	}
+	vmName := strings.TrimSpace(spec.VM.Name)
+	if vmName == "" {
+		return nil, errors.New("spec.vm.name is required")
+	}
+
+	candidates := candidateVMRuntimeDirs(controlRoot, vmName)
+	matches := make([]*vmRuntimeTarget, 0)
+	for _, dir := range candidates {
+		st, statePath, err := loadRuntimeStateForDir(dir)
+		if err != nil {
+			return nil, fmt.Errorf("load state for %s: %w", dir, err)
+		}
+		if st == nil {
+			continue
+		}
+		if strings.TrimSpace(st.VMName) != "" && strings.TrimSpace(st.VMName) != vmName {
+			continue
+		}
+		if len(vmMorefFilter) > 0 {
+			if _, ok := vmMorefFilter[strings.TrimSpace(st.VMMoref)]; !ok {
+				continue
+			}
+		}
+		matches = append(matches, &vmRuntimeTarget{
+			Spec:         spec,
+			ControlDir:   dir,
+			StatePath:    statePath,
+			FinalizePath: filepath.Join(dir, "FINALIZE"),
+			State:        st,
+		})
+	}
+
+	if len(matches) == 0 {
+		if requireState {
+			if len(vmMorefFilter) > 0 {
+				return nil, nil
+			}
+			return nil, fmt.Errorf("no runtime state found for vm=%s under %s", vmName, controlRoot)
+		}
+		return &vmRuntimeTarget{
+			Spec:         spec,
+			FinalizePath: filepath.Join(controlRoot, safeVMName(vmName), "FINALIZE"),
+		}, nil
+	}
+
+	if len(matches) > 1 {
+		found := make([]string, 0, len(matches))
+		for _, m := range matches {
+			moref := ""
+			if m.State != nil {
+				moref = strings.TrimSpace(m.State.VMMoref)
+			}
+			if moref == "" {
+				found = append(found, m.ControlDir)
+			} else {
+				found = append(found, fmt.Sprintf("%s (%s)", moref, m.ControlDir))
+			}
+		}
+		sort.Strings(found)
+		return nil, fmt.Errorf(
+			"multiple runtime states found for vm=%s; pass --vm-id to disambiguate. matches: %s",
+			vmName,
+			strings.Join(found, ", "),
+		)
+	}
+	return matches[0], nil
+}
+
+func effectiveRunVirtV2V(cfg *appConfig, spec *runSpec) bool {
+	runVirtV2V := false
+	if cfg != nil {
+		runVirtV2V = cfg.Virt.RunVirtV2V
+	}
+	if spec != nil && spec.Migration.RunVirtV2V != nil {
+		runVirtV2V = *spec.Migration.RunVirtV2V
+	}
+	return runVirtV2V
+}
+
+func nextStageForStatus(currentStage string, runVirtV2V bool, finalizeRequested bool) string {
+	switch strings.TrimSpace(currentStage) {
+	case "":
+		return stageInit
+	case "not_started":
+		return stageInit
+	case stageInit:
+		return stageBaseCopy
+	case stageBaseCopy:
+		return stageDelta
+	case stageDelta:
+		if finalizeRequested {
+			return "Finalize"
+		}
+		return stageDelta
+	case stageFinalSync:
+		if runVirtV2V {
+			return stageConverting
+		}
+		return stageImportRoot
+	case stageConverting:
+		return stageImportRoot
+	case stageImportRoot:
+		return stageImportData
+	case stageImportData:
+		return stageDone
+	case stageDone:
+		return "none"
+	default:
+		return "unknown"
+	}
 }
 
 type runLogger struct {
@@ -4371,6 +4652,16 @@ func main() {
 			fmt.Fprintf(os.Stderr, "run failed: %v\n", err)
 			os.Exit(1)
 		}
+	case "status":
+		if err := cmdStatus(os.Args[2:]); err != nil {
+			fmt.Fprintf(os.Stderr, "status failed: %v\n", err)
+			os.Exit(1)
+		}
+	case "finalize":
+		if err := cmdFinalize(os.Args[2:]); err != nil {
+			fmt.Fprintf(os.Stderr, "finalize failed: %v\n", err)
+			os.Exit(1)
+		}
 	case "serve":
 		if err := cmdServe(os.Args[2:]); err != nil {
 			fmt.Fprintf(os.Stderr, "serve failed: %v\n", err)
@@ -4405,6 +4696,8 @@ func main() {
 func usage() {
 	fmt.Fprintf(os.Stderr, "Usage:\n")
 	fmt.Fprintf(os.Stderr, "  v2c-engine run        --spec /path/spec.yaml [--spec /path/spec2.yaml] [--config /path/config.yaml]\n")
+	fmt.Fprintf(os.Stderr, "  v2c-engine status     --spec /path/spec.yaml [--vm VM_NAME] [--vm-id VM_MOREF] [--config /path/config.yaml]\n")
+	fmt.Fprintf(os.Stderr, "  v2c-engine finalize   --spec /path/spec.yaml [--vm VM_NAME] [--vm-id VM_MOREF] [--config /path/config.yaml]\n")
 	fmt.Fprintf(os.Stderr, "  v2c-engine serve      [--config /path/config.yaml] [--listen :8000]\n")
 	fmt.Fprintf(os.Stderr, "\n")
 	fmt.Fprintf(os.Stderr, "Note: base-copy and delta-sync are internal expert commands.\n")
@@ -4442,6 +4735,253 @@ func cmdRun(args []string) error {
 		return errors.New("run requires at least one --spec <file>")
 	}
 	return runWorkflow(context.Background(), opts)
+}
+
+func cmdFinalize(args []string) error {
+	var opts finalizeOptions
+	var specs multiStringFlag
+	var vmNames multiStringFlag
+	var vmMorefs multiStringFlag
+
+	fs := flag.NewFlagSet("finalize", flag.ContinueOnError)
+	fs.Var(&specs, "spec", "VM migration spec YAML (repeatable)")
+	fs.StringVar(&opts.ConfigPath, "config", defaultConfigPath(), "Global config.yaml path")
+	fs.StringVar(&opts.ControlDir, "control-dir", "", "Control directory root (override config migration.control_dir)")
+	fs.Var(&vmNames, "vm", "VM name to finalize (repeatable)")
+	fs.Var(&vmMorefs, "vm-id", "VM MoRef to disambiguate target (repeatable)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	opts.SpecPaths = specs
+	opts.VMNames = vmNames
+	opts.VMMorefs = vmMorefs
+	if extra := fs.Args(); len(extra) > 0 {
+		opts.SpecPaths = append(opts.SpecPaths, extra...)
+	}
+	if len(opts.SpecPaths) == 0 {
+		return errors.New("finalize requires at least one --spec <file>")
+	}
+
+	cfg, err := loadAppConfig(opts.ConfigPath)
+	if err != nil {
+		if strings.TrimSpace(opts.ControlDir) == "" {
+			return err
+		}
+		cfg = &appConfig{}
+	}
+	controlRoot := controlRootFromConfig(cfg, opts.ControlDir)
+
+	specList, err := loadRunSpecs(opts.SpecPaths)
+	if err != nil {
+		return err
+	}
+	specList, err = filterRunSpecsByVMNames(specList, sliceToSet(opts.VMNames))
+	if err != nil {
+		return err
+	}
+
+	vmMorefFilter := sliceToSet(opts.VMMorefs)
+	processed := map[string]struct{}{}
+	count := 0
+	errs := make([]error, 0)
+
+	for _, spec := range specList {
+		target, err := resolveRuntimeTarget(controlRoot, spec, vmMorefFilter, true)
+		if err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		if target == nil {
+			continue
+		}
+		if strings.TrimSpace(target.ControlDir) == "" {
+			errs = append(errs, fmt.Errorf("runtime target not found for vm=%s", spec.VM.Name))
+			continue
+		}
+		if _, seen := processed[target.ControlDir]; seen {
+			continue
+		}
+		processed[target.ControlDir] = struct{}{}
+
+		stage := ""
+		if target.State != nil {
+			stage = strings.TrimSpace(target.State.Stage)
+		}
+		if stage == stageDone {
+			fmt.Fprintf(os.Stdout, "[finalize] vm=%s moref=%s stage=%s already completed\n", spec.VM.Name, target.State.VMMoref, stageDone)
+			count++
+			continue
+		}
+
+		already := fileExists(target.FinalizePath)
+		f, err := os.OpenFile(target.FinalizePath, os.O_CREATE|os.O_WRONLY, 0o644)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("create finalize marker for vm=%s: %w", spec.VM.Name, err))
+			continue
+		}
+		_ = f.Close()
+		now := time.Now()
+		_ = os.Chtimes(target.FinalizePath, now, now)
+		if already {
+			fmt.Fprintf(os.Stdout, "[finalize] vm=%s moref=%s finalize already requested (%s)\n", spec.VM.Name, target.State.VMMoref, target.FinalizePath)
+		} else {
+			fmt.Fprintf(os.Stdout, "[finalize] vm=%s moref=%s finalize requested (%s)\n", spec.VM.Name, target.State.VMMoref, target.FinalizePath)
+		}
+		count++
+	}
+
+	if count == 0 && len(errs) == 0 {
+		return errors.New("no matching VM runtime found for finalize request")
+	}
+	if len(errs) > 0 {
+		return errors.Join(errs...)
+	}
+	return nil
+}
+
+func cmdStatus(args []string) error {
+	var opts statusOptions
+	var specs multiStringFlag
+	var vmNames multiStringFlag
+	var vmMorefs multiStringFlag
+
+	fs := flag.NewFlagSet("status", flag.ContinueOnError)
+	fs.Var(&specs, "spec", "VM migration spec YAML (repeatable)")
+	fs.StringVar(&opts.ConfigPath, "config", defaultConfigPath(), "Global config.yaml path")
+	fs.StringVar(&opts.ControlDir, "control-dir", "", "Control directory root (override config migration.control_dir)")
+	fs.Var(&vmNames, "vm", "VM name filter (repeatable)")
+	fs.Var(&vmMorefs, "vm-id", "VM MoRef filter (repeatable)")
+	fs.BoolVar(&opts.JSON, "json", false, "Print status as JSON")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	opts.SpecPaths = specs
+	opts.VMNames = vmNames
+	opts.VMMorefs = vmMorefs
+	if extra := fs.Args(); len(extra) > 0 {
+		opts.SpecPaths = append(opts.SpecPaths, extra...)
+	}
+	if len(opts.SpecPaths) == 0 {
+		return errors.New("status requires at least one --spec <file>")
+	}
+
+	cfg, err := loadAppConfig(opts.ConfigPath)
+	if err != nil {
+		if strings.TrimSpace(opts.ControlDir) == "" {
+			return err
+		}
+		cfg = &appConfig{}
+	}
+	controlRoot := controlRootFromConfig(cfg, opts.ControlDir)
+
+	specList, err := loadRunSpecs(opts.SpecPaths)
+	if err != nil {
+		return err
+	}
+	specList, err = filterRunSpecsByVMNames(specList, sliceToSet(opts.VMNames))
+	if err != nil {
+		return err
+	}
+
+	vmMorefFilter := sliceToSet(opts.VMMorefs)
+	rows := make([]map[string]any, 0)
+	seen := map[string]struct{}{}
+
+	for _, spec := range specList {
+		target, err := resolveRuntimeTarget(controlRoot, spec, vmMorefFilter, false)
+		if err != nil {
+			return err
+		}
+		if target != nil && target.State != nil && strings.TrimSpace(target.ControlDir) != "" {
+			if _, ok := seen[target.ControlDir]; ok {
+				continue
+			}
+			seen[target.ControlDir] = struct{}{}
+		}
+
+		vmName := spec.VM.Name
+		vmMoref := ""
+		currentStage := "not_started"
+		progress := float64(0)
+		finalizeRequested := false
+		runVirt := effectiveRunVirtV2V(cfg, spec)
+
+		if target != nil && target.State != nil {
+			vmMoref = strings.TrimSpace(target.State.VMMoref)
+			currentStage = strings.TrimSpace(target.State.Stage)
+			if currentStage == "" {
+				currentStage = stageInit
+			}
+			progress = target.State.Progress
+			if strings.TrimSpace(target.FinalizePath) != "" {
+				finalizeRequested = fileExists(target.FinalizePath)
+			}
+		}
+
+		nextStage := nextStageForStatus(currentStage, runVirt, finalizeRequested)
+		row := map[string]any{
+			"vm_name":            vmName,
+			"vm_moref":           emptyToNil(vmMoref),
+			"current_stage":      currentStage,
+			"next_stage":         nextStage,
+			"finalize_requested": finalizeRequested,
+			"progress":           progress,
+		}
+		if target != nil {
+			row["control_dir"] = emptyToNil(strings.TrimSpace(target.ControlDir))
+			row["state_file"] = emptyToNil(strings.TrimSpace(target.StatePath))
+		}
+		rows = append(rows, row)
+	}
+
+	if len(vmMorefFilter) > 0 {
+		filtered := make([]map[string]any, 0, len(rows))
+		for _, r := range rows {
+			moref, _ := r["vm_moref"].(string)
+			if moref == "" {
+				continue
+			}
+			if _, ok := vmMorefFilter[moref]; ok {
+				filtered = append(filtered, r)
+			}
+		}
+		rows = filtered
+	}
+
+	if len(rows) == 0 {
+		return errors.New("no matching VM status found")
+	}
+
+	sort.Slice(rows, func(i, j int) bool {
+		li := fmt.Sprintf("%v", rows[i]["vm_name"])
+		lj := fmt.Sprintf("%v", rows[j]["vm_name"])
+		if li == lj {
+			mi := fmt.Sprintf("%v", rows[i]["vm_moref"])
+			mj := fmt.Sprintf("%v", rows[j]["vm_moref"])
+			return mi < mj
+		}
+		return li < lj
+	})
+
+	if opts.JSON {
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		return enc.Encode(rows)
+	}
+
+	for _, row := range rows {
+		fmt.Fprintf(
+			os.Stdout,
+			"[status] vm=%s moref=%v current=%s next=%s finalize_requested=%t progress=%.2f%%\n",
+			row["vm_name"],
+			row["vm_moref"],
+			row["current_stage"],
+			row["next_stage"],
+			row["finalize_requested"],
+			row["progress"],
+		)
+	}
+	return nil
 }
 
 func cmdBaseCopy(args []string) error {
