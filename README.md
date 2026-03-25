@@ -52,6 +52,13 @@ chmod +x ./scripts/bootstrap.sh
 sudo ./scripts/bootstrap.sh --vddk-dir /opt/vmware-vddk/vmware-vix-disklib-distrib --install-service --with-ui
 ```
 
+If you have a VDDK tarball instead of an extracted directory:
+
+```bash
+chmod +x ./scripts/bootstrap.sh
+sudo ./scripts/bootstrap.sh --vddk-tar /tmp/VMware-vix-disklib-8.0.2-xxxxxxx.x86_64.tar.gz --install-service --with-ui
+```
+
 3. Configure engine and UI endpoint:
 
 ```bash
