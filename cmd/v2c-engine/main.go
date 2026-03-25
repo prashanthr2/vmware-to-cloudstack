@@ -4377,11 +4377,21 @@ func main() {
 			os.Exit(1)
 		}
 	case "base-copy":
+		if !expertCommandsEnabled() {
+			fmt.Fprintf(os.Stderr, "base-copy is an internal expert command. Use 'run' for normal migrations.\n")
+			fmt.Fprintf(os.Stderr, "To enable expert commands, set V2C_ENABLE_EXPERT_COMMANDS=1.\n")
+			os.Exit(2)
+		}
 		if err := cmdBaseCopy(os.Args[2:]); err != nil {
 			fmt.Fprintf(os.Stderr, "base-copy failed: %v\n", err)
 			os.Exit(1)
 		}
 	case "delta-sync":
+		if !expertCommandsEnabled() {
+			fmt.Fprintf(os.Stderr, "delta-sync is an internal expert command. Use 'run' for normal migrations.\n")
+			fmt.Fprintf(os.Stderr, "To enable expert commands, set V2C_ENABLE_EXPERT_COMMANDS=1.\n")
+			os.Exit(2)
+		}
 		if err := cmdDeltaSync(os.Args[2:]); err != nil {
 			fmt.Fprintf(os.Stderr, "delta-sync failed: %v\n", err)
 			os.Exit(1)
@@ -4396,10 +4406,18 @@ func usage() {
 	fmt.Fprintf(os.Stderr, "Usage:\n")
 	fmt.Fprintf(os.Stderr, "  v2c-engine run        --spec /path/spec.yaml [--spec /path/spec2.yaml] [--config /path/config.yaml]\n")
 	fmt.Fprintf(os.Stderr, "  v2c-engine serve      [--config /path/config.yaml] [--listen :8000]\n")
-	fmt.Fprintf(os.Stderr, "  v2c-engine base-copy  [flags]\n")
-	fmt.Fprintf(os.Stderr, "  v2c-engine delta-sync [flags]\n")
-	fmt.Fprintf(os.Stderr, "  v2c-engine base-copy --spec /path/spec.yaml\n")
-	fmt.Fprintf(os.Stderr, "  v2c-engine delta-sync --spec /path/spec.yaml\n")
+	fmt.Fprintf(os.Stderr, "\n")
+	fmt.Fprintf(os.Stderr, "Note: base-copy and delta-sync are internal expert commands.\n")
+	fmt.Fprintf(os.Stderr, "Set V2C_ENABLE_EXPERT_COMMANDS=1 to use them directly.\n")
+}
+
+func expertCommandsEnabled() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("V2C_ENABLE_EXPERT_COMMANDS"))) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
 }
 
 func cmdRun(args []string) error {

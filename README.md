@@ -4,20 +4,17 @@ This repository is now Go-first and contains the migration copy/sync engine with
 
 ## What it does
 
-- `base-copy`:
+- `run` is the primary migration command for end users.
+- Internally, `run` performs base copy and delta sync:
   - Opens multiple independent VDDK handles (`VixDiskLib_Open`) in parallel readers.
   - Uses a shared dynamic work queue.
-  - Starts with 1 MB reads, adaptively increases up to 4 MB, and shrinks on high latency.
-  - Detects all-zero blocks and skips writes (sparse QCOW2 preserved).
-  - Auto-detects source disk capacity from VDDK (ignores mismatched `-disk-size-bytes`).
-  - Writes non-zero blocks directly into QCOW2 through `qemu-nbd`.
-  - Runs `virt-v2v-in-place` immediately after base copy (optional flag).
-
-- `delta-sync`:
-  - Accepts CBT changed ranges (JSON file).
-  - Reads changed blocks via VDDK.
-  - Writes changed blocks directly into existing QCOW2 (no RAW intermediary).
-  - Preserves QCOW2 metadata by writing via qemu block layer (`qemu-nbd` + NBD protocol).
+  - Uses adaptive chunk sizing (1 MB to 4 MB) based on read performance.
+  - Detects all-zero blocks and skips writes to preserve sparse QCOW2 behavior.
+  - Auto-detects source disk capacity from VDDK.
+  - Writes directly to QCOW2 via `qemu-nbd` (no RAW intermediary).
+  - Uses CBT changed ranges for delta rounds.
+  - Runs `virt-v2v-in-place` in the `converting` stage (after final sync), when enabled.
+- `base-copy` and `delta-sync` remain available as expert/internal commands only.
 
 ## Build prerequisites
 
@@ -66,7 +63,7 @@ After bootstrap:
 Config note:
 - `run`/`serve` use vCenter credentials only from `vcenter` in config (plus `VC_PASSWORD` fallback).
 - You do not need a second `vddk` credential block in `config.yaml`.
-- For direct `base-copy` / `delta-sync` commands, `thumbprint` is optional; engine auto-detects it from `--server` when not provided.
+- For expert `base-copy` / `delta-sync` commands, `thumbprint` is optional; engine auto-detects it from `--server` when not provided.
 
 ## Clean uninstall / reset
 
@@ -114,53 +111,6 @@ export CGO_CFLAGS="-I/opt/vmware-vddk/include"
 export CGO_LDFLAGS="-L/opt/vmware-vddk/lib64 -lvixDiskLib -ldl -lpthread"
 ```
 
-## Example: base copy
-
-```bash
-./v2c-engine base-copy \
-  -vddk-libdir /opt/vmware-vddk/vmware-vix-disklib-distrib \
-  -server 10.0.35.3 \
-  -user administrator@vsphere.local \
-  -password '***' \
-  -thumbprint 'AA:BB:CC:...' \
-  -vm-moref vm-123 \
-  -snapshot-moref snapshot-456 \
-  -disk-path '[datastore1] vm/vm_1-000001.vmdk' \
-  -target-qcow2 /mnt/storage/vm_disk1.qcow2 \
-  -disk-size-bytes 21474836480 \
-  -readers 4 \
-  -min-chunk-mb 1 \
-  -max-chunk-mb 4 \
-  -run-virt-v2v=true
-```
-
-## Example: delta sync
-
-`ranges.json` format:
-
-```json
-[
-  { "start": 0, "length": 1048576 },
-  { "start": 8388608, "length": 4194304 }
-]
-```
-
-```bash
-./v2c-engine delta-sync \
-  -vddk-libdir /opt/vmware-vddk/vmware-vix-disklib-distrib \
-  -server 10.0.35.3 \
-  -user administrator@vsphere.local \
-  -password '***' \
-  -thumbprint 'AA:BB:CC:...' \
-  -vm-moref vm-123 \
-  -snapshot-moref snapshot-789 \
-  -disk-path '[datastore1] vm/vm_1-000002.vmdk' \
-  -target-qcow2 /mnt/storage/vm_disk1.qcow2 \
-  -ranges-file /tmp/ranges.json \
-  -readers 4 \
-  -chunk-mb 4
-```
-
 ## Spec-file mode (UI-friendly)
 
 `v2c-engine` can read a YAML spec directly:
@@ -170,8 +120,6 @@ export CGO_LDFLAGS="-L/opt/vmware-vddk/lib64 -lvixDiskLib -ldl -lpthread"
 ./v2c-engine run --spec ./spec.run.example.yaml --spec ./another-vm.yaml --config ./config.yaml
 ./v2c-engine run --spec ./spec.run.multi.example.yaml --parallel-vms 3 --config ./config.yaml
 ./v2c-engine serve --config ./config.yaml --listen :8000
-./v2c-engine base-copy --spec ./spec.engine.example.yaml
-./v2c-engine delta-sync --spec ./spec.engine.example.yaml
 ```
 
 `run` mode follows the established migration workflow for base copy and delta loop scheduling:
@@ -212,14 +160,16 @@ export CGO_LDFLAGS="-L/opt/vmware-vddk/lib64 -lvixDiskLib -ldl -lpthread"
 You can still override any value from spec with CLI flags:
 
 ```bash
-./v2c-engine base-copy --spec ./spec.engine.example.yaml -readers 8
 ./v2c-engine run --spec ./spec.run.example.yaml --readers 8 --override-run-virt-v2v --run-virt-v2v=true
 ./v2c-engine run --spec ./specs.yaml --parallel-vms 3 --parallel-disks 4
 ```
 
-Use [spec.engine.example.yaml](./spec.engine.example.yaml) as the template for UI-generated specs.
 Use [spec.run.example.yaml](./spec.run.example.yaml) as the template for full run-mode specs.
 Use [spec.run.multi.example.yaml](./spec.run.multi.example.yaml) for top-level `vms:` batch format.
+
+Expert mode note:
+- `base-copy` and `delta-sync` are hidden from normal CLI usage.
+- To enable them for troubleshooting, set `V2C_ENABLE_EXPERT_COMMANDS=1`.
 
 ## GUI integration (pure Go)
 
