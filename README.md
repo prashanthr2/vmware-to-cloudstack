@@ -2,7 +2,7 @@
 
 This repository is Go-first and provides a production migration engine + API/UI services for VMware to CloudStack migrations.
 
-## Prerequisites (Top Priority)
+## Prerequisites
 
 - Linux host
 - VMware VDDK installed (must include `include/vixDiskLib.h` and `lib64/libvixDiskLib.so*`)
@@ -12,7 +12,7 @@ This repository is Go-first and provides a production migration engine + API/UI 
 
 The bootstrap script installs required OS packages (Go, qemu tools, virt-v2v, guestfs, and optional node/npm for UI).
 
-## Bootstrap Script Options (Top Priority)
+## Bootstrap Script Options
 
 Use `scripts/bootstrap.sh` to install dependencies, build the engine, and install services.
 
@@ -40,7 +40,7 @@ Supported bootstrap options:
 - `--start-services` (optional immediate start after setup)
 - `--skip-build`
 
-## Enable API and UI Services (Top Priority)
+## Enable API and UI Services
 
 Bootstrap installs service units by default without auto-start (unless `--start-services` is passed).  
 Configure first, then enable/start:
