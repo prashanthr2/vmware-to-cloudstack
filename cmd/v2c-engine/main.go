@@ -3517,6 +3517,7 @@ type finalizeOptions struct {
 	ControlDir string
 	VMNames    []string
 	VMMorefs   []string
+	Immediate  bool
 }
 
 type statusOptions struct {
@@ -4002,6 +4003,7 @@ func runVMWorkflow(ctx context.Context, cfg *appConfig, spec *runSpec, opts runO
 	statePath := filepath.Join(controlDir, "state.json")
 	legacyStatePath := filepath.Join(controlDir, "state.engine.json")
 	finalizeFile := filepath.Join(controlDir, "FINALIZE")
+	finalizeNowFile := filepath.Join(controlDir, "FINALIZE_NOW")
 	log.Printf("Starting workflow vm=%s moref=%s", spec.VM.Name, vmMoref)
 
 	vmRef := vmObj.Reference()
@@ -4704,6 +4706,24 @@ func runVMWorkflow(ctx context.Context, cfg *appConfig, spec *runSpec, opts runO
 			}
 			return sleepSec
 		}
+		waitDeltaSleep := func(sleepSec int) bool {
+			if sleepSec <= 0 {
+				return false
+			}
+			remaining := time.Duration(sleepSec) * time.Second
+			for remaining > 0 {
+				if fileExists(finalizeNowFile) {
+					return true
+				}
+				wait := time.Second
+				if remaining < wait {
+					wait = remaining
+				}
+				time.Sleep(wait)
+				remaining -= wait
+			}
+			return false
+		}
 
 		for {
 			finalizeNow := st.Stage == stageFinalSync
@@ -4711,7 +4731,7 @@ func runVMWorkflow(ctx context.Context, cfg *appConfig, spec *runSpec, opts runO
 				finalizeNow = true
 			}
 			if !finalizeNow {
-				if _, err := os.Stat(finalizeFile); err == nil {
+				if fileExists(finalizeFile) || fileExists(finalizeNowFile) {
 					finalizeNow = true
 				}
 			}
@@ -4721,7 +4741,9 @@ func runVMWorkflow(ctx context.Context, cfg *appConfig, spec *runSpec, opts runO
 				firstDeltaDelayDone = true
 				if sleepSec > 0 {
 					log.Printf("Waiting %ds before first delta sync round", sleepSec)
-					time.Sleep(time.Duration(sleepSec) * time.Second)
+					if waitDeltaSleep(sleepSec) {
+						log.Printf("FINALIZE NOW detected, interrupting delta wait")
+					}
 					continue
 				}
 			}
@@ -4755,7 +4777,9 @@ func runVMWorkflow(ctx context.Context, cfg *appConfig, spec *runSpec, opts runO
 			if sleepSec <= 0 {
 				continue
 			}
-			time.Sleep(time.Duration(sleepSec) * time.Second)
+			if waitDeltaSleep(sleepSec) {
+				log.Printf("FINALIZE NOW detected, interrupting delta wait")
+			}
 		}
 		nextStage := stageImportRoot
 		if runVirtV2V {
@@ -5052,7 +5076,7 @@ func usage() {
 	fmt.Fprintf(os.Stderr, "Usage:\n")
 	fmt.Fprintf(os.Stderr, "  v2c-engine run        --spec /path/spec.yaml [--spec /path/spec2.yaml] [--config /path/config.yaml]\n")
 	fmt.Fprintf(os.Stderr, "  v2c-engine status     --spec /path/spec.yaml [--vm VM_NAME] [--vm-id VM_MOREF] [--config /path/config.yaml]\n")
-	fmt.Fprintf(os.Stderr, "  v2c-engine finalize   --spec /path/spec.yaml [--vm VM_NAME] [--vm-id VM_MOREF] [--config /path/config.yaml]\n")
+	fmt.Fprintf(os.Stderr, "  v2c-engine finalize   --spec /path/spec.yaml [--vm VM_NAME] [--vm-id VM_MOREF] [--now] [--config /path/config.yaml]\n")
 	fmt.Fprintf(os.Stderr, "  v2c-engine serve      [--config /path/config.yaml] [--listen :8000]\n")
 	fmt.Fprintf(os.Stderr, "\n")
 	fmt.Fprintf(os.Stderr, "Note: base-copy and delta-sync are internal expert commands.\n")
@@ -5104,6 +5128,7 @@ func cmdFinalize(args []string) error {
 	fs.StringVar(&opts.ControlDir, "control-dir", "", "Control directory root (override config migration.control_dir)")
 	fs.Var(&vmNames, "vm", "VM name to finalize (repeatable)")
 	fs.Var(&vmMorefs, "vm-id", "VM MoRef to disambiguate target (repeatable)")
+	fs.BoolVar(&opts.Immediate, "now", false, "Trigger finalize immediately (do not wait for next delta interval)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -5168,16 +5193,33 @@ func cmdFinalize(args []string) error {
 			continue
 		}
 
+		touchMarker := func(path string) error {
+			f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY, 0o644)
+			if err != nil {
+				return err
+			}
+			_ = f.Close()
+			now := time.Now()
+			return os.Chtimes(path, now, now)
+		}
 		already := fileExists(target.FinalizePath)
-		f, err := os.OpenFile(target.FinalizePath, os.O_CREATE|os.O_WRONLY, 0o644)
-		if err != nil {
+		if err := touchMarker(target.FinalizePath); err != nil {
 			errs = append(errs, fmt.Errorf("create finalize marker for vm=%s: %w", spec.VM.Name, err))
 			continue
 		}
-		_ = f.Close()
-		now := time.Now()
-		_ = os.Chtimes(target.FinalizePath, now, now)
-		if already {
+		if opts.Immediate {
+			finalizeNowPath := filepath.Join(target.ControlDir, "FINALIZE_NOW")
+			alreadyNow := fileExists(finalizeNowPath)
+			if err := touchMarker(finalizeNowPath); err != nil {
+				errs = append(errs, fmt.Errorf("create finalize-now marker for vm=%s: %w", spec.VM.Name, err))
+				continue
+			}
+			if alreadyNow {
+				fmt.Fprintf(os.Stdout, "[finalize] vm=%s moref=%s finalize-now already requested (%s)\n", spec.VM.Name, target.State.VMMoref, finalizeNowPath)
+			} else {
+				fmt.Fprintf(os.Stdout, "[finalize] vm=%s moref=%s finalize-now requested (%s)\n", spec.VM.Name, target.State.VMMoref, finalizeNowPath)
+			}
+		} else if already {
 			fmt.Fprintf(os.Stdout, "[finalize] vm=%s moref=%s finalize already requested (%s)\n", spec.VM.Name, target.State.VMMoref, target.FinalizePath)
 		} else {
 			fmt.Fprintf(os.Stdout, "[finalize] vm=%s moref=%s finalize requested (%s)\n", spec.VM.Name, target.State.VMMoref, target.FinalizePath)
@@ -5259,6 +5301,7 @@ func cmdStatus(args []string) error {
 		currentStage := "not_started"
 		progress := float64(0)
 		finalizeRequested := false
+		finalizeNowRequested := false
 		runVirt := effectiveRunVirtV2V(cfg, spec)
 
 		if target != nil && target.State != nil {
@@ -5270,6 +5313,11 @@ func cmdStatus(args []string) error {
 			progress = target.State.Progress
 			if strings.TrimSpace(target.FinalizePath) != "" {
 				finalizeRequested = fileExists(target.FinalizePath)
+				finalizeNowPath := filepath.Join(target.ControlDir, "FINALIZE_NOW")
+				finalizeNowRequested = fileExists(finalizeNowPath)
+				if finalizeNowRequested {
+					finalizeRequested = true
+				}
 			}
 		}
 
@@ -5280,6 +5328,7 @@ func cmdStatus(args []string) error {
 			"current_stage":      currentStage,
 			"next_stage":         nextStage,
 			"finalize_requested": finalizeRequested,
+			"finalize_now_requested": finalizeNowRequested,
 			"progress":           progress,
 		}
 		if target != nil {
@@ -5327,12 +5376,13 @@ func cmdStatus(args []string) error {
 	for _, row := range rows {
 		fmt.Fprintf(
 			os.Stdout,
-			"[status] vm=%s moref=%v current=%s next=%s finalize_requested=%t progress=%.2f%%\n",
+			"[status] vm=%s moref=%v current=%s next=%s finalize_requested=%t finalize_now_requested=%t progress=%.2f%%\n",
 			row["vm_name"],
 			row["vm_moref"],
 			row["current_stage"],
 			row["next_stage"],
 			row["finalize_requested"],
+			row["finalize_now_requested"],
 			row["progress"],
 		)
 	}

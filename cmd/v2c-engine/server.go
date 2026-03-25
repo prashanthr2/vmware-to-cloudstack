@@ -797,6 +797,7 @@ func (s *apiServer) handleMigrationFinalize(w http.ResponseWriter, r *http.Reque
 		writeError(w, http.StatusBadRequest, "vm name is required")
 		return
 	}
+	immediate := parseBool(strings.TrimSpace(r.URL.Query().Get("now")), false)
 
 	targetDir := ""
 	if job := s.latestJobForVM(vmName); job != nil {
@@ -817,9 +818,14 @@ func (s *apiServer) handleMigrationFinalize(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	finalizePath := filepath.Join(targetDir, "FINALIZE")
+	finalizeNowPath := filepath.Join(targetDir, "FINALIZE_NOW")
 	alreadyRequested := false
+	alreadyImmediate := false
 	if st, err := os.Stat(finalizePath); err == nil && !st.IsDir() {
 		alreadyRequested = true
+	}
+	if st, err := os.Stat(finalizeNowPath); err == nil && !st.IsDir() {
+		alreadyImmediate = true
 	}
 	if f, err := os.OpenFile(finalizePath, os.O_CREATE|os.O_WRONLY, 0o644); err == nil {
 		_ = f.Close()
@@ -827,11 +833,28 @@ func (s *apiServer) handleMigrationFinalize(w http.ResponseWriter, r *http.Reque
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	if immediate {
+		if f, err := os.OpenFile(finalizeNowPath, os.O_CREATE|os.O_WRONLY, 0o644); err == nil {
+			_ = f.Close()
+		} else {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"vm_name":           vmName,
 		"finalize_file":     finalizePath,
+		"finalize_now_file": finalizeNowPath,
 		"already_requested": alreadyRequested,
+		"already_immediate": alreadyImmediate,
+		"immediate":         immediate,
 		"message": func() string {
+			if immediate && alreadyImmediate {
+				return "Finalize-now marker already present"
+			}
+			if immediate {
+				return "Finalize-now marker created"
+			}
 			if alreadyRequested {
 				return "Finalize marker already present"
 			}
@@ -1576,6 +1599,20 @@ func (s *apiServer) loadState(vmName string) *runState {
 func (s *apiServer) finalizeRequestedForVM(vmName string) bool {
 	for _, dir := range s.candidateVMDirs(vmName) {
 		p := filepath.Join(dir, "FINALIZE")
+		pNow := filepath.Join(dir, "FINALIZE_NOW")
+		if st, err := os.Stat(p); err == nil && !st.IsDir() {
+			return true
+		}
+		if st, err := os.Stat(pNow); err == nil && !st.IsDir() {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *apiServer) finalizeNowRequestedForVM(vmName string) bool {
+	for _, dir := range s.candidateVMDirs(vmName) {
+		p := filepath.Join(dir, "FINALIZE_NOW")
 		if st, err := os.Stat(p); err == nil && !st.IsDir() {
 			return true
 		}
@@ -1723,6 +1760,7 @@ func (s *apiServer) buildStatusPayload(vmName string, st *runState, job *apiJob)
 		transfer = math.Round((speedSum/float64(speedCount))*100) / 100
 	}
 	finalizeRequested := s.finalizeRequestedForVM(vmName)
+	finalizeNowRequested := s.finalizeNowRequestedForVM(vmName)
 	currentStage := strings.TrimSpace(stage)
 	if currentStage == "" {
 		currentStage = "not_started"
@@ -1734,6 +1772,7 @@ func (s *apiServer) buildStatusPayload(vmName string, st *runState, job *apiJob)
 		"stage":               emptyToNil(stage),
 		"next_stage":          nextStage,
 		"finalize_requested":  finalizeRequested,
+		"finalize_now_requested": finalizeNowRequested,
 		"progress":            overall,
 		"overall_progress":    overall,
 		"transfer_speed_mbps": transfer,

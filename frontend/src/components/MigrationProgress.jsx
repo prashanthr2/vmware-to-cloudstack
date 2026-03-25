@@ -24,6 +24,7 @@ export default function MigrationProgress({
   selectedJobId,
   onSelectJob,
   onFinalize,
+  onFinalizeNow,
   logsSection,
 }) {
   return (
@@ -66,10 +67,13 @@ export default function MigrationProgress({
                   job.finished_at ||
                   ((jobStatus === "completed" || jobStatus === "failed") ? status.updated_at : null);
                 const finalizeRequested = Boolean(status.finalize_requested);
+                const finalizeNowRequested = Boolean(status.finalize_now_requested);
                 const stage = status.stage || job.stage || "-";
                 const nextStage = status.next_stage || "-";
                 const finalizeButtonDisabled =
                   finalizeRequested || stage === "done" || stage === "final_sync";
+                const finalizeNowButtonDisabled =
+                  finalizeNowRequested || stage === "done" || stage === "final_sync";
 
                 return (
                   <tr key={job.job_id} className={selectedJobId === job.job_id ? "selected-row" : ""}>
@@ -105,6 +109,14 @@ export default function MigrationProgress({
                         title={finalizeRequested ? "Finalize already requested" : "Request finalize"}
                       >
                         {finalizeRequested ? "Finalize Requested" : "Finalize"}
+                      </button>
+                      <button
+                        className="secondary"
+                        onClick={() => onFinalizeNow(job.vm_name)}
+                        disabled={finalizeNowButtonDisabled}
+                        title={finalizeNowRequested ? "Finalize-now already requested" : "Request finalize now"}
+                      >
+                        {finalizeNowRequested ? "Finalize Now Requested" : "Finalize Now"}
                       </button>
                     </td>
                   </tr>

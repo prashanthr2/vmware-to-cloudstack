@@ -852,15 +852,21 @@ export default function App() {
   );
 
   const finalizeVm = useCallback(
-    async (vmName) => {
+    async (vmName, immediate = false) => {
       try {
-        const response = await apiRequest(`/migration/finalize/${encodeURIComponent(vmName)}`, { method: "POST" });
+        const suffix = immediate ? "?now=true" : "";
+        const response = await apiRequest(`/migration/finalize/${encodeURIComponent(vmName)}${suffix}`, { method: "POST" });
         const alreadyRequested = Boolean(response?.already_requested);
+        const alreadyImmediate = Boolean(response?.already_immediate);
         pushToast(
           "success",
-          alreadyRequested
-            ? `${vmName}: FINALIZE already requested.`
-            : `${vmName}: FINALIZE requested successfully.`
+          immediate
+            ? (alreadyImmediate
+                ? `${vmName}: FINALIZE NOW already requested.`
+                : `${vmName}: FINALIZE NOW requested successfully.`)
+            : (alreadyRequested
+                ? `${vmName}: FINALIZE already requested.`
+                : `${vmName}: FINALIZE requested successfully.`)
         );
         await pollStatuses();
         await refreshJobs();
@@ -1088,6 +1094,7 @@ export default function App() {
             loadLogsForJob(job);
           }}
           onFinalize={finalizeVm}
+          onFinalizeNow={(vmName) => finalizeVm(vmName, true)}
           logsSection={
             <div className="logs-pane">
               <div className="subsection-title-row">
