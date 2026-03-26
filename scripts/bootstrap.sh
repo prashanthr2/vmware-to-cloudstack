@@ -274,7 +274,8 @@ Type=simple
 User=root
 WorkingDirectory=$REPO_DIR/frontend
 Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
-ExecStart=/bin/bash -lc 'set -e; cp -f "$UI_CONFIG_PATH" "$REPO_DIR/frontend/.env.local"; npm run build; npm run preview -- --host $ui_host --port $ui_port'
+Environment=LD_LIBRARY_PATH=
+ExecStart=/bin/bash -c 'set -e; cp -f "$UI_CONFIG_PATH" "$REPO_DIR/frontend/.env.local"; npm run build; npm run preview -- --host $ui_host --port $ui_port'
 Restart=on-failure
 RestartSec=5
 LimitNOFILE=65535
