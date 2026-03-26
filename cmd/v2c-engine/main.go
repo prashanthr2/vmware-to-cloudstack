@@ -735,13 +735,32 @@ func sanitizedChildEnv() []string {
 			}
 		case strings.HasPrefix(kv, "CGO_CFLAGS="),
 			strings.HasPrefix(kv, "CGO_LDFLAGS="),
-			strings.HasPrefix(kv, "CGO_ENABLED="):
+			strings.HasPrefix(kv, "CGO_ENABLED="),
+			strings.HasPrefix(kv, "LIBVIRT_DEFAULT_URI="):
 			continue
 		default:
 			out = append(out, kv)
 		}
 	}
 	return out
+}
+
+func setEnvKV(env []string, key string, value string) []string {
+	prefix := key + "="
+	for i, kv := range env {
+		if strings.HasPrefix(kv, prefix) {
+			env[i] = prefix + value
+			return env
+		}
+	}
+	return append(env, prefix+value)
+}
+
+func guestfsChildEnv() []string {
+	env := sanitizedChildEnv()
+	// Avoid libvirt socket dependency on hosts without virtqemud.
+	env = setEnvKV(env, "LIBGUESTFS_BACKEND", "direct")
+	return env
 }
 
 func createSparseQCOW2(path string, sizeBytes int64) error {
@@ -777,7 +796,7 @@ func runVirtV2VInPlace(path string, virtioISO string) error {
 
 	runCmd := func(args []string) (string, error) {
 		cmd := exec.Command(v2vPath, args...)
-		cmd.Env = sanitizedChildEnv()
+		cmd.Env = guestfsChildEnv()
 		var buf bytes.Buffer
 		cmd.Stdout = io.MultiWriter(os.Stdout, &buf)
 		cmd.Stderr = io.MultiWriter(os.Stderr, &buf)
@@ -854,7 +873,11 @@ func isExecutableFile(path string) bool {
 func verifyImageBeforeV2V(path string) error {
 	run := func(name string, args ...string) error {
 		cmd := exec.Command(name, args...)
-		cmd.Env = sanitizedChildEnv()
+		env := sanitizedChildEnv()
+		if name == "virt-inspector" {
+			env = guestfsChildEnv()
+		}
+		cmd.Env = env
 		out, err := cmd.CombinedOutput()
 		if err != nil {
 			return fmt.Errorf("%s %v failed: %w\n%s", name, args, err, string(out))
