@@ -474,13 +474,11 @@ export default function App() {
     setVmSpecsByName((prev) => {
       const next = { ...prev };
       let changed = false;
-      const templateName = selectedVmNames.find((name) => !!next[name]);
-      const template = templateName ? next[templateName] : null;
       selectedVmNames.forEach((vmName) => {
         if (next[vmName]) return;
         const vm = vmwareVms.find((item) => item.name === vmName);
         if (!vm) return;
-        next[vmName] = buildDraftForVm(vm, template);
+        next[vmName] = buildDraftForVm(vm);
         changed = true;
       });
       return changed ? next : prev;
