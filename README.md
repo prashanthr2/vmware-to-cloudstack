@@ -209,6 +209,8 @@ Storage behavior:
 - Selected CloudStack primary storage is validated as NFS.
 - Engine ensures `/mnt/<storageid>` exists and is mounted before copy.
 - If not mounted, engine attempts NFS mount using CloudStack storage pool details (`listStoragePools`).
+- On Ubuntu hosts, engine-managed NFS mounts use explicit `vers=3` options to avoid QCOW2 flush I/O issues seen with some NFSv4 environments.
+  - Optional override: `V2C_NFS_MOUNT_OPTS="<mount-options>"`
 
 ## How It Works
 

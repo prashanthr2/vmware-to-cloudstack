@@ -203,6 +203,9 @@ var (
 
 	vddkOpenLimiterOnce sync.Once
 	vddkOpenLimiter     chan struct{}
+
+	hostOSReleaseOnce sync.Once
+	hostOSRelease     map[string]string
 )
 
 func vddkMaxOpenHandles() int {
@@ -2826,6 +2829,62 @@ func decodeProcMountField(v string) string {
 	return replacer.Replace(v)
 }
 
+func parseOSReleaseValue(v string) string {
+	v = strings.TrimSpace(v)
+	if len(v) >= 2 {
+		if (v[0] == '"' && v[len(v)-1] == '"') || (v[0] == '\'' && v[len(v)-1] == '\'') {
+			v = v[1 : len(v)-1]
+		}
+	}
+	return strings.TrimSpace(v)
+}
+
+func readHostOSRelease() map[string]string {
+	hostOSReleaseOnce.Do(func() {
+		hostOSRelease = map[string]string{}
+		data, err := os.ReadFile("/etc/os-release")
+		if err != nil {
+			return
+		}
+		for _, raw := range strings.Split(string(data), "\n") {
+			line := strings.TrimSpace(raw)
+			if line == "" || strings.HasPrefix(line, "#") {
+				continue
+			}
+			idx := strings.Index(line, "=")
+			if idx <= 0 {
+				continue
+			}
+			k := strings.TrimSpace(line[:idx])
+			v := parseOSReleaseValue(line[idx+1:])
+			if k != "" {
+				hostOSRelease[k] = v
+			}
+		}
+	})
+	return hostOSRelease
+}
+
+func hostIsUbuntu() bool {
+	info := readHostOSRelease()
+	id := strings.ToLower(strings.TrimSpace(info["ID"]))
+	if id == "ubuntu" {
+		return true
+	}
+	idLike := strings.ToLower(strings.TrimSpace(info["ID_LIKE"]))
+	return strings.Contains(idLike, "ubuntu")
+}
+
+func nfsMountOptionsForHost() string {
+	if override := strings.TrimSpace(os.Getenv("V2C_NFS_MOUNT_OPTS")); override != "" {
+		return override
+	}
+	if hostIsUbuntu() {
+		return "rw,relatime,vers=3,rsize=1048576,wsize=1048576,hard,proto=tcp,timeo=600,retrans=2"
+	}
+	return ""
+}
+
 func findMountEntry(mountPath string) (source string, fsType string, mounted bool, err error) {
 	data, err := os.ReadFile("/proc/mounts")
 	if err != nil {
@@ -2890,15 +2949,22 @@ func ensureStorageMounted(cs *cloudStackClient, storageID string) (string, error
 		return "", err
 	}
 
-	cmd := exec.Command("mount", "-t", "nfs", nfsSource, mountPath)
+	mountArgs := []string{"-t", "nfs"}
+	if opts := nfsMountOptionsForHost(); opts != "" {
+		mountArgs = append(mountArgs, "-o", opts)
+	}
+	mountArgs = append(mountArgs, nfsSource, mountPath)
+
+	cmd := exec.Command("mount", mountArgs...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return "", fmt.Errorf(
-			"failed to mount storage pool %s (%s) on %s using %s: %w (%s)",
+			"failed to mount storage pool %s (%s) on %s using %s (args=%v): %w (%s)",
 			pool.ID,
 			pool.Name,
 			mountPath,
 			nfsSource,
+			mountArgs,
 			err,
 			strings.TrimSpace(string(out)),
 		)
