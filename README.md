@@ -493,6 +493,9 @@ Status payload includes:
 
 Use [examples/README.md](./examples/README.md).
 
+Known limitations and platform-specific workarounds are tracked in
+[docs/KNOWN_ISSUES.md](./docs/KNOWN_ISSUES.md).
+
 Common templates:
 
 - [examples/config.full.example.yaml](./examples/config.full.example.yaml)
