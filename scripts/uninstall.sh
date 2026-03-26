@@ -41,7 +41,7 @@ This will remove:
 - installed binary: /usr/local/bin/v2c-engine
 - service config: /etc/v2c-engine/config.yaml (and directory)
 - UI env config: /etc/v2c-ui/.env.local (and directory)
-- env files: /etc/default/v2c-engine and /etc/profile.d/v2c-engine.sh
+- env files: /etc/default/v2c-engine, /etc/v2c-engine/build.env and /etc/profile.d/v2c-engine.sh (legacy)
 
 Optional flag can also remove runtime state.
 EOF
@@ -72,6 +72,7 @@ remove_service() {
 remove_files() {
   run_root rm -f /usr/local/bin/v2c-engine
   run_root rm -f /etc/default/v2c-engine
+  run_root rm -f /etc/v2c-engine/build.env
   run_root rm -f /etc/profile.d/v2c-engine.sh
   run_root rm -f /etc/v2c-engine/config.yaml
   run_root rmdir /etc/v2c-engine 2>/dev/null || true

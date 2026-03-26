@@ -164,8 +164,14 @@ Installed paths:
 
 - Engine binary: `/usr/local/bin/v2c-engine`
 - Engine config: `/etc/v2c-engine/config.yaml`
+- Optional manual build env helper: `/etc/v2c-engine/build.env` (not auto-sourced)
 - UI env config: `/etc/v2c-ui/.env.local`
 - Runtime state/log root: `/var/lib/vm-migrator`
+
+Environment note:
+
+- Bootstrap does not set global `LD_LIBRARY_PATH` in `/etc/profile.d`.
+- This avoids breaking host tools like `journalctl` / `dnf` with VDDK libraries.
 
 Config notes:
 

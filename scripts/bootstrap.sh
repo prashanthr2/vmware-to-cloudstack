@@ -132,21 +132,31 @@ resolve_vddk_dir() {
   fi
 }
 
-write_env_profile() {
-  local profile_path="/etc/profile.d/v2c-engine.sh"
+write_build_env_file() {
+  local env_path="/etc/v2c-engine/build.env"
   local tmp
   tmp="$(mktemp)"
   cat >"$tmp" <<EOF
+# Optional helper for manual build/run in interactive shells.
+# This file is NOT auto-sourced to avoid global LD_LIBRARY_PATH pollution.
 export VDDK="$VDDK_DIR"
 export PATH="/usr/libexec:\$PATH"
-export LD_LIBRARY_PATH="$VDDK_DIR/lib64:\${LD_LIBRARY_PATH:-}"
 export CGO_ENABLED=1
 export CGO_CFLAGS="-I$VDDK_DIR/include"
 export CGO_LDFLAGS="-L$VDDK_DIR/lib64 -lvixDiskLib -ldl -lpthread"
+export LD_LIBRARY_PATH="$VDDK_DIR/lib64:\${LD_LIBRARY_PATH:-}"
 EOF
-  run_root install -m 0644 "$tmp" "$profile_path"
+  run_root mkdir -p /etc/v2c-engine
+  run_root install -m 0644 "$tmp" "$env_path"
   rm -f "$tmp"
-  log "Wrote environment profile: $profile_path"
+  log "Wrote optional build environment helper: $env_path"
+
+  # Legacy cleanup: old bootstrap versions wrote global shell env that can
+  # break system tools (dnf/journalctl) by forcing VDDK libraries.
+  if [[ -f /etc/profile.d/v2c-engine.sh ]]; then
+    run_root rm -f /etc/profile.d/v2c-engine.sh
+    log "Removed legacy global env profile: /etc/profile.d/v2c-engine.sh"
+  fi
 }
 
 ensure_config_exists() {
@@ -377,7 +387,7 @@ fi
 
 detect_and_install_packages
 resolve_vddk_dir
-write_env_profile
+write_build_env_file
 ensure_config_exists
 build_engine
 install_ui_deps
