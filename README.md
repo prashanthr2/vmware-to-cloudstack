@@ -47,6 +47,11 @@ cd vmware-to-cloudstack
 
 2. Bootstrap dependencies, build, and install services:
 
+Before running bootstrap, make sure one of these is already present on the host:
+
+- Extracted VDDK directory (for `--vddk-dir`), for example `/opt/vmware-vddk/vmware-vix-disklib-distrib`
+- VDDK tarball file (for `--vddk-tar`)
+
 ```bash
 chmod +x ./scripts/bootstrap.sh
 sudo ./scripts/bootstrap.sh --vddk-dir /opt/vmware-vddk/vmware-vix-disklib-distrib --install-service --with-ui
@@ -65,6 +70,12 @@ sudo ./scripts/bootstrap.sh --vddk-tar /tmp/VMware-vix-disklib-8.0.2-xxxxxxx.x86
 sudo vi /etc/v2c-engine/config.yaml
 sudo vi /etc/v2c-ui/.env.local
 ```
+
+In `/etc/v2c-ui/.env.local`, set:
+
+- `VITE_API_BASE=http://<migration-host-ip>:8000`
+
+Use the IP/hostname of the same host where `v2c-engine serve` is running (not `127.0.0.1` unless browser is on that same host).
 
 4. Start services:
 
@@ -162,9 +173,9 @@ Config notes:
 - `migration.vddk_path` is required for `run` (path to extracted VDDK root, for example `/opt/vmware-vddk/vmware-vix-disklib-distrib`).
 - You do not need a second vCenter credential block under `vddk`.
 - CloudStack endpoint input is flexible:
-  - `10.0.35.146`
-  - `10.0.35.146:8080`
-  - `http://10.0.35.146:8080/client/api`
+  - `cloudstack-mgmt.example.com`
+  - `cloudstack-mgmt.example.com:8080`
+  - `http://cloudstack-mgmt.example.com:8080/client/api`
   - `https://cloudstack.example.com`
 
 Sample references:

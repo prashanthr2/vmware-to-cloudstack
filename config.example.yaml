@@ -3,16 +3,16 @@
 # see: examples/config.full.example.yaml
 
 vcenter:
-  host: 10.0.35.3
+  host: vcenter.example.com
   user: administrator@vsphere.local
   # Prefer passing password as env var VC_PASSWORD at runtime.
   password: ""
 
 cloudstack:
   # Accepts any of:
-  # - hostname/IP only: "10.0.35.146" (defaults to http + /client/api)
-  # - hostname/IP with port: "10.0.35.146:8080"
-  # - full URL: "http://10.0.35.146:8080/client/api"
+  # - hostname/IP only: "cloudstack-mgmt.example.com" (defaults to http + /client/api)
+  # - hostname/IP with port: "cloudstack-mgmt.example.com:8080"
+  # - full URL: "http://cloudstack-mgmt.example.com:8080/client/api"
   endpoint: "cloudstack.example.com:8080"
   api_key: "change-me"
   secret_key: "change-me"

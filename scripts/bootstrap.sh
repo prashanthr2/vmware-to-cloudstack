@@ -195,8 +195,8 @@ ensure_ui_config() {
   cat >"$tmp" <<EOF
 # UI API endpoint (edit before starting v2c-ui service)
 # Example:
-# VITE_API_BASE=http://<engine-host>:8000
-VITE_API_BASE=http://127.0.0.1:8000
+# VITE_API_BASE=http://<migration-host-ip>:8000
+VITE_API_BASE=http://<migration-host-ip>:8000
 EOF
   if [[ ! -f "$UI_CONFIG_PATH" ]]; then
     run_root install -m 0644 "$tmp" "$UI_CONFIG_PATH"
