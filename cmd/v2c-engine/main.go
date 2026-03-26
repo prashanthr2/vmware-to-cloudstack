@@ -1736,12 +1736,13 @@ func runBaseCopy(ctx context.Context, opts baseCopyOptions) (copyStats, error) {
 			}
 		}(i + 1)
 	}
-	go func() {
-		openWG.Wait()
-		if atomic.LoadInt32(&activeReaders) == 0 {
-			pushErr(fmt.Errorf("no VDDK readers could open disk %s (server=%s vm=%s snapshot=%s)", opts.DiskPath, opts.VDDK.Server, opts.VDDK.VMMoref, opts.VDDK.SnapshotMoref))
-		}
-	}()
+	// Wait until all readers either opened successfully or failed open.
+	// This removes a race where base-copy could appear successful before
+	// we knew whether any VDDK handle was actually usable.
+	openWG.Wait()
+	if atomic.LoadInt32(&activeReaders) == 0 {
+		pushErr(fmt.Errorf("no VDDK readers could open disk %s (server=%s vm=%s snapshot=%s)", opts.DiskPath, opts.VDDK.Server, opts.VDDK.VMMoref, opts.VDDK.SnapshotMoref))
+	}
 
 	workerWG.Wait()
 	close(writeQ)
@@ -1753,6 +1754,12 @@ func runBaseCopy(ctx context.Context, opts baseCopyOptions) (copyStats, error) {
 		report()
 		return copyStats{}, e
 	default:
+	}
+
+	if opts.DiskSizeBytes > 0 && atomic.LoadInt64(&bytesRead) == 0 {
+		close(progressStop)
+		report()
+		return copyStats{}, fmt.Errorf("base copy read zero bytes for non-zero disk size=%d; refusing to continue", opts.DiskSizeBytes)
 	}
 
 	if err := writerClient.flush(); err != nil {
