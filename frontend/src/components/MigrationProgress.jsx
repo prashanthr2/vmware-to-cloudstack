@@ -27,6 +27,7 @@ export default function MigrationProgress({
   onSelectJob,
   onFinalize,
   onFinalizeNow,
+  onRetry,
   logsSection,
 }) {
   return (
@@ -82,10 +83,12 @@ export default function MigrationProgress({
                 const finalizeNowRequested = Boolean(status.finalize_now_requested);
                 const stage = status.stage || job.stage || "-";
                 const nextStage = status.next_stage || "-";
+                const statusLower = typeof jobStatus === "string" ? jobStatus.toLowerCase() : "";
                 const finalizeButtonDisabled =
                   finalizeRequested || stage === "done" || stage === "final_sync";
                 const finalizeNowButtonDisabled =
                   finalizeNowRequested || stage === "done" || stage === "final_sync";
+                const retryDisabled = statusLower !== "failed";
 
                 return (
                   <tr key={job.job_id} className={selectedJobId === job.job_id ? "selected-row" : ""}>
@@ -113,6 +116,14 @@ export default function MigrationProgress({
                     <td className="row-actions">
                       <button className="secondary" onClick={() => onSelectJob(job)}>
                         Details
+                      </button>
+                      <button
+                        className="secondary"
+                        onClick={() => onRetry(job)}
+                        disabled={retryDisabled}
+                        title={retryDisabled ? "Retry is available only for failed jobs" : "Retry failed migration"}
+                      >
+                        Retry
                       </button>
                       <button
                         className="secondary"

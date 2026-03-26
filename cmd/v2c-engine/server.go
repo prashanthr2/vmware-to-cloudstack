@@ -291,6 +291,7 @@ func (s *apiServer) serve(listenAddr string) error {
 	mux.HandleFunc("/migration/settings", s.handleMigrationSettings)
 	mux.HandleFunc("/migration/spec", s.handleMigrationSpec)
 	mux.HandleFunc("/migration/start", s.handleMigrationStart)
+	mux.HandleFunc("/migration/retry/", s.handleMigrationRetry)
 	mux.HandleFunc("/migration/jobs", s.handleMigrationJobs)
 	mux.HandleFunc("/migration/status/", s.handleMigrationStatus)
 	mux.HandleFunc("/migration/finalize/", s.handleMigrationFinalize)
@@ -977,6 +978,50 @@ func (s *apiServer) handleMigrationFinalize(w http.ResponseWriter, r *http.Reque
 	})
 }
 
+func (s *apiServer) handleMigrationRetry(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	vmName := strings.TrimPrefix(r.URL.Path, "/migration/retry/")
+	vmName, _ = neturl.PathUnescape(vmName)
+	vmName = strings.TrimSpace(vmName)
+	if vmName == "" {
+		writeError(w, http.StatusBadRequest, "vm name is required")
+		return
+	}
+
+	if running := s.activeJobForVM(vmName); running != nil {
+		writeError(
+			w,
+			http.StatusConflict,
+			fmt.Sprintf("VM '%s' already has an active job (%s)", vmName, running.JobID),
+		)
+		return
+	}
+
+	specHint := strings.TrimSpace(r.URL.Query().Get("spec_file"))
+	specPath, err := s.resolveSpecFile(vmName, specHint)
+	if err != nil {
+		writeError(w, http.StatusNotFound, err.Error())
+		return
+	}
+
+	previous := s.latestJobForVM(vmName)
+	retryOf := ""
+	if previous != nil {
+		retryOf = previous.JobID
+	}
+	job := s.startJob(vmName, specPath)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"vm_name":   job.VMName,
+		"job_id":    job.JobID,
+		"spec_file": job.SpecFile,
+		"status":    job.Status,
+		"retry_of":  emptyToNil(retryOf),
+	})
+}
+
 func (s *apiServer) handleMigrationLogs(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
@@ -1026,6 +1071,28 @@ func (s *apiServer) startJob(vmName string, specFile string) *apiJob {
 
 	go s.runJob(job)
 	return job
+}
+
+func (s *apiServer) activeJobForVM(vmName string) *apiJob {
+	vmName = strings.TrimSpace(vmName)
+	if vmName == "" {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	ids := append([]string(nil), s.jobsByVM[vmName]...)
+	for i := len(ids) - 1; i >= 0; i-- {
+		job := s.jobs[ids[i]]
+		if job == nil {
+			continue
+		}
+		status := strings.ToLower(strings.TrimSpace(job.Status))
+		if status == "queued" || status == "running" {
+			return job
+		}
+	}
+	return nil
 }
 
 func (s *apiServer) runJob(job *apiJob) {

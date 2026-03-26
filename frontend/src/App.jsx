@@ -972,6 +972,26 @@ export default function App() {
     [pollStatuses, pushToast, refreshJobs]
   );
 
+  const retryVm = useCallback(
+    async (job) => {
+      if (!job?.vm_name) {
+        pushToast("error", "Invalid job selected for retry.");
+        return;
+      }
+      try {
+        const specFile = job.spec_file ? `?spec_file=${encodeURIComponent(job.spec_file)}` : "";
+        const response = await apiRequest(`/migration/retry/${encodeURIComponent(job.vm_name)}${specFile}`, {
+          method: "POST",
+        });
+        pushToast("success", `${job.vm_name}: retry started (job ${String(response?.job_id || "").slice(0, 8)}).`);
+        await refreshJobs();
+      } catch (err) {
+        pushToast("error", err.message || "Failed to retry migration.");
+      }
+    },
+    [pushToast, refreshJobs]
+  );
+
   const selectedVmStatus = selectedJob ? statusByJob[selectedJob.job_id] || null : null;
   const selectedSettingsRows = useMemo(
     () =>
@@ -1192,6 +1212,7 @@ export default function App() {
           }}
           onFinalize={finalizeVm}
           onFinalizeNow={(vmName) => finalizeVm(vmName, true)}
+          onRetry={retryVm}
           logsSection={
             <div className="logs-pane">
               <div className="subsection-title-row">
