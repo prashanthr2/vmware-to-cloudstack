@@ -306,6 +306,24 @@ Behavior:
 - Both requests are idempotent.
 - If VM is already complete, finalize calls return success with completion status.
 
+### Retry Failed Migration
+
+If a VM migration job fails, you can retry it from UI or API without regenerating all settings.
+
+Supported methods:
+
+- API:
+  - `POST /migration/retry/{vm}`
+  - Optional query: `?spec_file=/absolute/path/to/spec.yaml` to force a specific spec.
+  - If `spec_file` is not provided, server retries using the latest resolved spec for that VM.
+- UI:
+  - `Retry` action from Progress tab (enabled only for failed jobs).
+
+Behavior:
+
+- Retry creates a new job ID and keeps previous failed job history.
+- Retry is blocked (`409`) if a job for that VM is already `queued` or `running`.
+
 ## Workflow Diagram
 
 ```text
@@ -435,6 +453,8 @@ API endpoints:
 - `GET /cloudstack/{zones|clusters|storage|networks|diskofferings|serviceofferings}`
 - `POST /migration/spec`
 - `POST /migration/start`
+- `POST /migration/retry/{vm}`
+  - Optional query: `?spec_file=...`
 - `GET /migration/status/{vm}`
 - `GET /migration/jobs`
 - `POST /migration/finalize/{vm}`
