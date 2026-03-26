@@ -428,7 +428,30 @@ func (s *apiServer) handleCloudStackList(w http.ResponseWriter, r *http.Request,
 		writeJSON(w, http.StatusOK, []any{})
 		return
 	}
+	if command == "listStoragePools" {
+		items = filterNFSUpStoragePools(items)
+	}
 	writeJSON(w, http.StatusOK, items)
+}
+
+func filterNFSUpStoragePools(items []any) []any {
+	out := make([]any, 0, len(items))
+	for _, item := range items {
+		m, ok := item.(map[string]any)
+		if !ok || m == nil {
+			continue
+		}
+		info := parseStoragePoolInfo(m)
+		if !isNFSStoragePool(info) {
+			continue
+		}
+		state := strings.TrimSpace(firstNonEmptyString(mapGetString(m, "state"), mapGetString(m, "status")))
+		if !strings.EqualFold(state, "Up") {
+			continue
+		}
+		out = append(out, item)
+	}
+	return out
 }
 
 func (s *apiServer) handleMigrationSettings(w http.ResponseWriter, r *http.Request) {
