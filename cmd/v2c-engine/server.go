@@ -279,6 +279,7 @@ func cmdServe(args []string) error {
 func (s *apiServer) serve(listenAddr string) error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", s.handleHealth)
+	mux.HandleFunc("/environments/defaults", s.handleEnvironmentDefaults)
 	mux.HandleFunc("/vmware/vms", s.handleVMwareVMs)
 	mux.HandleFunc("/cloudstack/zones", s.handleCloudStackZones)
 	mux.HandleFunc("/cloudstack/clusters", s.handleCloudStackClusters)
@@ -343,6 +344,46 @@ func (s *apiServer) handleHealth(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+func (s *apiServer) handleEnvironmentDefaults(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	vcHost := strings.TrimSpace(s.cfg.VCenter.Host)
+	vcUser := strings.TrimSpace(s.cfg.VCenter.User)
+	vcPass := strings.TrimSpace(s.cfg.VCenter.Password)
+	vcAvailable := vcHost != "" && vcUser != "" && vcPass != ""
+
+	csEndpointRaw := strings.TrimSpace(s.cfg.CloudStack.Endpoint)
+	csEndpoint := normalizeCloudStackEndpoint(csEndpointRaw)
+	csName := cloudStackEndpointName(csEndpointRaw)
+	if csName == "" {
+		csName = cloudStackEndpointName(csEndpoint)
+	}
+	csAvailable := csEndpoint != "" &&
+		strings.TrimSpace(s.cfg.CloudStack.APIKey) != "" &&
+		strings.TrimSpace(s.cfg.CloudStack.SecretKey) != ""
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"vcenter": map[string]any{
+			"id":        "config-default-vcenter",
+			"name":      vcHost,
+			"host":      vcHost,
+			"username":  vcUser,
+			"source":    "config",
+			"available": vcAvailable,
+		},
+		"cloudstack": map[string]any{
+			"id":        "config-default-cloudstack",
+			"name":      csName,
+			"apiUrl":    csEndpoint,
+			"source":    "config",
+			"available": csAvailable,
+		},
+	})
 }
 
 func (s *apiServer) handleVMwareVMs(w http.ResponseWriter, r *http.Request) {
@@ -1389,6 +1430,32 @@ func normalizeCloudStackEndpoint(endpoint string) string {
 	u.RawQuery = ""
 	u.Fragment = ""
 	return strings.TrimRight(u.String(), "/")
+}
+
+func cloudStackEndpointName(endpoint string) string {
+	value := strings.TrimSpace(endpoint)
+	if value == "" {
+		return ""
+	}
+	if !strings.Contains(value, "://") {
+		value = "http://" + strings.TrimLeft(value, "/")
+	}
+	u, err := neturl.Parse(value)
+	if err == nil {
+		if host := strings.TrimSpace(u.Hostname()); host != "" {
+			return host
+		}
+	}
+	value = strings.TrimSpace(endpoint)
+	value = strings.TrimPrefix(value, "http://")
+	value = strings.TrimPrefix(value, "https://")
+	if slash := strings.Index(value, "/"); slash >= 0 {
+		value = value[:slash]
+	}
+	if colon := strings.Index(value, ":"); colon >= 0 {
+		value = value[:colon]
+	}
+	return strings.TrimSpace(value)
 }
 
 func detectBootDiskUnit(cfg *types.VirtualMachineConfigInfo) *int {

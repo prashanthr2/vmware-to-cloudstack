@@ -40,6 +40,8 @@ export default function EnvironmentManager({ envState, onChange, onToast }) {
     });
   };
 
+  const isConfigEnv = (item) => item?.source === "config";
+
   const saveVcenter = () => {
     if (!vcForm.name || !vcForm.host || !vcForm.username || !vcForm.password) {
       onToast("error", "vCenter env requires name, host, username, and password.");
@@ -93,6 +95,7 @@ export default function EnvironmentManager({ envState, onChange, onToast }) {
   };
 
   const editVcenter = (item) => {
+    if (isConfigEnv(item)) return;
     setVcEditId(item.id);
     setVcForm({
       name: item.name || "",
@@ -103,6 +106,7 @@ export default function EnvironmentManager({ envState, onChange, onToast }) {
   };
 
   const editCloudstack = (item) => {
+    if (isConfigEnv(item)) return;
     setCsEditId(item.id);
     setCsForm({
       name: item.name || "",
@@ -114,6 +118,8 @@ export default function EnvironmentManager({ envState, onChange, onToast }) {
 
   const removeItem = (kind, id) => {
     if (kind === "vcenter") {
+      const target = envState.vcenters.find((item) => item.id === id);
+      if (isConfigEnv(target)) return;
       const remaining = envState.vcenters.filter((item) => item.id !== id);
       onChange({
         ...envState,
@@ -125,6 +131,8 @@ export default function EnvironmentManager({ envState, onChange, onToast }) {
         setVcForm(defaultVcenterForm);
       }
     } else {
+      const target = envState.cloudstacks.find((item) => item.id === id);
+      if (isConfigEnv(target)) return;
       const remaining = envState.cloudstacks.filter((item) => item.id !== id);
       onChange({
         ...envState,
@@ -156,7 +164,7 @@ export default function EnvironmentManager({ envState, onChange, onToast }) {
               <option value="">Select vCenter</option>
               {envState.vcenters.map((item) => (
                 <option key={item.id} value={item.id}>
-                  {item.name}
+                  {isConfigEnv(item) ? `${item.name} (Default)` : item.name}
                 </option>
               ))}
             </select>
@@ -206,12 +214,18 @@ export default function EnvironmentManager({ envState, onChange, onToast }) {
               <div key={item.id} className="env-list-row">
                 <span>{item.name}</span>
                 <div className="row-actions">
-                  <button className="secondary" onClick={() => editVcenter(item)}>
-                    Edit
-                  </button>
-                  <button className="danger" onClick={() => removeItem("vcenter", item.id)}>
-                    Delete
-                  </button>
+                  {isConfigEnv(item) ? (
+                    <span className="hint">Config default</span>
+                  ) : (
+                    <>
+                      <button className="secondary" onClick={() => editVcenter(item)}>
+                        Edit
+                      </button>
+                      <button className="danger" onClick={() => removeItem("vcenter", item.id)}>
+                        Delete
+                      </button>
+                    </>
+                  )}
                 </div>
               </div>
             ))}
@@ -229,7 +243,7 @@ export default function EnvironmentManager({ envState, onChange, onToast }) {
               <option value="">Select CloudStack</option>
               {envState.cloudstacks.map((item) => (
                 <option key={item.id} value={item.id}>
-                  {item.name}
+                  {isConfigEnv(item) ? `${item.name} (Default)` : item.name}
                 </option>
               ))}
             </select>
@@ -279,12 +293,18 @@ export default function EnvironmentManager({ envState, onChange, onToast }) {
               <div key={item.id} className="env-list-row">
                 <span>{item.name}</span>
                 <div className="row-actions">
-                  <button className="secondary" onClick={() => editCloudstack(item)}>
-                    Edit
-                  </button>
-                  <button className="danger" onClick={() => removeItem("cloudstack", item.id)}>
-                    Delete
-                  </button>
+                  {isConfigEnv(item) ? (
+                    <span className="hint">Config default</span>
+                  ) : (
+                    <>
+                      <button className="secondary" onClick={() => editCloudstack(item)}>
+                        Edit
+                      </button>
+                      <button className="danger" onClick={() => removeItem("cloudstack", item.id)}>
+                        Delete
+                      </button>
+                    </>
+                  )}
                 </div>
               </div>
             ))}

@@ -8,6 +8,8 @@ import VMSelector from "./components/VMSelector";
 
 const API_BASE = import.meta.env.VITE_API_BASE || `${window.location.protocol}//${window.location.hostname}:8000`;
 const ENV_STORAGE_KEY = "vm_migrator_environments_v1";
+const CONFIG_DEFAULT_VCENTER_ID = "config-default-vcenter";
+const CONFIG_DEFAULT_CLOUDSTACK_ID = "config-default-cloudstack";
 
 const DEFAULT_ENV_STATE = {
   selectedVcenterId: "",
@@ -147,6 +149,64 @@ function validateDraft(draft) {
   return { valid, message, diskErrors, nicErrors };
 }
 
+function dedupeByID(items) {
+  const seen = new Set();
+  return (items || []).filter((item) => {
+    const id = String(item?.id || "").trim();
+    if (!id || seen.has(id)) return false;
+    seen.add(id);
+    return true;
+  });
+}
+
+function mergeConfigDefaultEnvironments(current, defaults) {
+  const next = {
+    ...DEFAULT_ENV_STATE,
+    ...current,
+    vcenters: Array.isArray(current?.vcenters) ? [...current.vcenters] : [],
+    cloudstacks: Array.isArray(current?.cloudstacks) ? [...current.cloudstacks] : [],
+  };
+
+  next.vcenters = next.vcenters.filter((item) => item?.id !== CONFIG_DEFAULT_VCENTER_ID);
+  next.cloudstacks = next.cloudstacks.filter((item) => item?.id !== CONFIG_DEFAULT_CLOUDSTACK_ID);
+
+  const defaultVC = defaults?.vcenter;
+  if (defaultVC?.available) {
+    next.vcenters.unshift({
+      id: CONFIG_DEFAULT_VCENTER_ID,
+      name: defaultVC.name || defaultVC.host || "Default vCenter",
+      host: defaultVC.host || "",
+      username: defaultVC.username || "",
+      password: "",
+      source: "config",
+    });
+  }
+
+  const defaultCS = defaults?.cloudstack;
+  if (defaultCS?.available) {
+    next.cloudstacks.unshift({
+      id: CONFIG_DEFAULT_CLOUDSTACK_ID,
+      name: defaultCS.name || defaultCS.apiUrl || "Default CloudStack",
+      apiUrl: defaultCS.apiUrl || "",
+      apiKey: "",
+      secretKey: "",
+      source: "config",
+    });
+  }
+
+  next.vcenters = dedupeByID(next.vcenters);
+  next.cloudstacks = dedupeByID(next.cloudstacks);
+
+  if (!next.vcenters.some((item) => item.id === next.selectedVcenterId)) {
+    next.selectedVcenterId = next.vcenters[0]?.id || "";
+  }
+  if (!next.cloudstacks.some((item) => item.id === next.selectedCloudstackId)) {
+    next.selectedCloudstackId = next.cloudstacks[0]?.id || "";
+  }
+
+  return next;
+}
+
 async function apiRequest(path, options = {}) {
   const { headers: customHeaders = {}, ...fetchOptions } = options;
   const response = await fetch(`${API_BASE}${path}`, {
@@ -216,6 +276,22 @@ export default function App() {
     localStorage.setItem(ENV_STORAGE_KEY, JSON.stringify(envState));
   }, [envState]);
 
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const defaults = await apiRequest("/environments/defaults");
+        if (cancelled) return;
+        setEnvState((prev) => mergeConfigDefaultEnvironments(prev, defaults));
+      } catch {
+        // Keep working with local env profiles if defaults endpoint is unavailable.
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   const selectedVcenter = useMemo(
     () => envState.vcenters.find((item) => item.id === envState.selectedVcenterId) || null,
     [envState.selectedVcenterId, envState.vcenters]
@@ -226,7 +302,7 @@ export default function App() {
   );
 
   const vmwareHeaders = useMemo(() => {
-    if (!selectedVcenter) return {};
+    if (!selectedVcenter || selectedVcenter.source === "config") return {};
     return {
       "x-vcenter-host": selectedVcenter.host || "",
       "x-vcenter-user": selectedVcenter.username || "",
@@ -235,7 +311,7 @@ export default function App() {
   }, [selectedVcenter]);
 
   const cloudstackHeaders = useMemo(() => {
-    if (!selectedCloudstack) return {};
+    if (!selectedCloudstack || selectedCloudstack.source === "config") return {};
     return {
       "x-cloudstack-endpoint": selectedCloudstack.apiUrl || "",
       "x-cloudstack-api-key": selectedCloudstack.apiKey || "",
