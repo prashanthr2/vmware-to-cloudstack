@@ -441,7 +441,7 @@ func filterNFSUpStoragePools(items []any) []any {
 		if !ok || m == nil {
 			continue
 		}
-		info := parseStoragePoolInfo(m)
+		info := storagePoolInfoFromMap(m)
 		if !isNFSStoragePool(info) {
 			continue
 		}
