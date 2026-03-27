@@ -787,8 +787,12 @@ func createSparseQCOW2(path string, sizeBytes int64) error {
 	return cmd.Run()
 }
 
-func runVirtV2VInPlace(path string, virtioISO string) error {
-	if err := verifyImageBeforeV2V(path); err != nil {
+func runVirtV2VInPlace(paths []string, virtioISO string) error {
+	if len(paths) == 0 {
+		return errors.New("no disk paths provided to virt-v2v-in-place")
+	}
+
+	if err := verifyImageBeforeV2V(paths[0], len(paths)); err != nil {
 		return fmt.Errorf("pre-v2v integrity check failed: %w", err)
 	}
 
@@ -807,7 +811,7 @@ func runVirtV2VInPlace(path string, virtioISO string) error {
 		return buf.String(), err
 	}
 
-	baseArgs := []string{"-i", "disk", path}
+	baseArgs := append([]string{"-i", "disk"}, paths...)
 	if strings.TrimSpace(virtioISO) == "" {
 		_, err := runCmd(baseArgs)
 		return err
@@ -873,7 +877,7 @@ func isExecutableFile(path string) bool {
 	return info.Mode()&0o111 != 0
 }
 
-func verifyImageBeforeV2V(path string) error {
+func verifyImageBeforeV2V(path string, totalDisks int) error {
 	run := func(name string, args ...string) error {
 		cmd := exec.Command(name, args...)
 		env := sanitizedChildEnv()
@@ -905,9 +909,48 @@ func verifyImageBeforeV2V(path string) error {
 		}
 	}
 	if err := run("virt-inspector", "-a", path); err != nil {
+		if totalDisks > 1 {
+			log.Printf("[virt-v2v] warning: virt-inspector could not detect an OS on %s before multi-disk conversion; continuing with all disks attached", filepath.Base(path))
+			return nil
+		}
 		return err
 	}
 	return nil
+}
+
+func buildVirtV2VDiskPaths(disks []vmDisk, diskStates map[string]*runDiskState, bootUnit int) ([]string, error) {
+	if len(disks) == 0 {
+		return nil, errors.New("no VM disks available for virt-v2v-in-place")
+	}
+
+	paths := make([]string, 0, len(disks))
+	seenUnits := map[int]struct{}{}
+	appendDisk := func(unit int) error {
+		if _, ok := seenUnits[unit]; ok {
+			return nil
+		}
+		ds := diskStates[strconv.Itoa(unit)]
+		if ds == nil {
+			return fmt.Errorf("disk state not found for unit=%d", unit)
+		}
+		path := strings.TrimSpace(ds.TargetQCOW2)
+		if path == "" {
+			return fmt.Errorf("target qcow2 path missing for unit=%d", unit)
+		}
+		paths = append(paths, path)
+		seenUnits[unit] = struct{}{}
+		return nil
+	}
+
+	if err := appendDisk(bootUnit); err != nil {
+		return nil, err
+	}
+	for _, d := range disks {
+		if err := appendDisk(d.Unit); err != nil {
+			return nil, err
+		}
+	}
+	return paths, nil
 }
 
 type readMetric struct {
@@ -4905,15 +4948,15 @@ func runVMWorkflow(ctx context.Context, cfg *appConfig, spec *runSpec, opts runO
 
 	if st.Stage == stageConverting {
 		if runVirtV2V {
-			bootDiskState := st.Disks[strconv.Itoa(bootUnit)]
-			if bootDiskState == nil {
-				return fmt.Errorf("boot disk state not found for unit=%d", bootUnit)
+			v2vDiskPaths, err := buildVirtV2VDiskPaths(disks, st.Disks, bootUnit)
+			if err != nil {
+				return err
 			}
-			log.Printf("Running virt-v2v-in-place on boot disk: %s", bootDiskState.TargetQCOW2)
-			if err := runVirtV2VInPlace(bootDiskState.TargetQCOW2, virtioISO); err != nil {
+			log.Printf("Running virt-v2v-in-place with %d disk(s); boot disk first: %s", len(v2vDiskPaths), v2vDiskPaths[0])
+			if err := runVirtV2VInPlace(v2vDiskPaths, virtioISO); err != nil {
 				return fmt.Errorf("virt-v2v-in-place failed: %w", err)
 			}
-			log.Printf("virt-v2v-in-place completed for boot disk")
+			log.Printf("virt-v2v-in-place completed for %d disk(s)", len(v2vDiskPaths))
 			stateMu.Lock()
 			st.VirtV2VDone = true
 			stateMu.Unlock()

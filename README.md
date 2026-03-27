@@ -18,7 +18,7 @@ This design keeps source VM downtime mostly to the final sync + import boundary,
 
 - Disk copy path: VMware VDDK -> direct QCOW2 writes (no RAW intermediate).
 - Delta path: CBT ranges -> direct QCOW2 updates.
-- Conversion path: optional `virt-v2v-in-place` on boot disk after final sync.
+- Conversion path: optional `virt-v2v-in-place` after final sync, passing the boot disk first and all remaining VM disks so multi-disk guests convert correctly.
 - State machine + resume: per-VM runtime state under `/var/lib/vm-migrator/<vm>_<moref>/`.
 - Control actions: `Finalize` and `Finalize Now` markers, plus CLI/API/UI triggers.
 
@@ -220,7 +220,7 @@ At a high level, each VM migration follows this model:
 2. It creates a base snapshot and copies each VMware disk directly into QCOW2 on the selected CloudStack primary storage mount.
 3. It enters delta mode and repeatedly uses VMware CBT to fetch only changed blocks since the previous snapshot.
 4. When finalize is requested, or when `finalize_at` time is reached, the engine shuts down the source VM according to policy and performs one final delta sync.
-5. If enabled, it runs `virt-v2v-in-place` on the boot QCOW2.
+5. If enabled, it runs `virt-v2v-in-place` on the boot QCOW2 plus any additional VM disks.
 6. It imports the root disk into CloudStack, then imports and attaches data disks, and finally attaches additional NICs.
 
 Important behavior:
