@@ -2,8 +2,12 @@ export default function VMSelector({
   vmOptions,
   selectedVmNames,
   activeVmName,
+  showTemplates,
+  showVcls,
   onToggleVm,
   onSetActiveVm,
+  onToggleShowTemplates,
+  onToggleShowVcls,
   onSelectAll,
   onClearSelection,
   onRefreshSelected,
@@ -14,6 +18,14 @@ export default function VMSelector({
       <div className="subsection-title-row">
         <h2>VM Selection</h2>
         <div className="actions compact">
+          <label className="checkbox-inline">
+            <input type="checkbox" checked={showTemplates} onChange={(e) => onToggleShowTemplates(e.target.checked)} />
+            Show Templates
+          </label>
+          <label className="checkbox-inline">
+            <input type="checkbox" checked={showVcls} onChange={(e) => onToggleShowVcls(e.target.checked)} />
+            Show vCLS VMs
+          </label>
           <button className="secondary" onClick={onSelectAll} disabled={!vmOptions.length || loading}>
             Select All
           </button>

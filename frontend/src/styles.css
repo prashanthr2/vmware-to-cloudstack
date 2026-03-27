@@ -207,6 +207,19 @@ select {
   margin-bottom: 12px;
 }
 
+.checkbox-inline {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.9rem;
+  color: #223833;
+}
+
+.checkbox-inline input[type="checkbox"] {
+  width: 16px;
+  height: 16px;
+}
+
 .vm-select-card {
   display: grid;
   grid-template-columns: auto 1fr;

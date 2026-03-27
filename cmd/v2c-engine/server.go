@@ -92,13 +92,20 @@ type vmwareNICInfo struct {
 }
 
 type vmwareVMInfo struct {
-	Name      string           `json:"name"`
-	Moref     string           `json:"moref"`
-	CPU       int              `json:"cpu"`
-	Memory    int              `json:"memory"`
-	Disks     []vmwareDiskInfo `json:"disks"`
-	NICs      []vmwareNICInfo  `json:"nics"`
-	Datastore []string         `json:"datastore"`
+	Name       string           `json:"name"`
+	Moref      string           `json:"moref"`
+	CPU        int              `json:"cpu"`
+	Memory     int              `json:"memory"`
+	Disks      []vmwareDiskInfo `json:"disks"`
+	NICs       []vmwareNICInfo  `json:"nics"`
+	Datastore  []string         `json:"datastore"`
+	IsTemplate bool             `json:"is_template,omitempty"`
+	IsVCLS     bool             `json:"is_vcls,omitempty"`
+}
+
+type vmwareInventoryFilter struct {
+	IncludeTemplates bool
+	IncludeVCLS      bool
 }
 
 type diskSpecInput struct {
@@ -404,7 +411,21 @@ func (s *apiServer) handleVMwareVMs(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadGateway, fmt.Sprintf("failed to connect VMware: %v", err))
 		return
 	}
-	vms, err := listVMwareInventory(ctx, client)
+	query := r.URL.Query()
+	includeTemplates := parseBool(strings.TrimSpace(query.Get("include_templates")), false)
+	includeVCLS := parseBool(strings.TrimSpace(query.Get("include_vcls")), false)
+	// Backward-compatible aliases for UI query params.
+	if !includeTemplates {
+		includeTemplates = parseBool(strings.TrimSpace(query.Get("show_templates")), false)
+	}
+	if !includeVCLS {
+		includeVCLS = parseBool(strings.TrimSpace(query.Get("show_vcls")), false)
+	}
+
+	vms, err := listVMwareInventory(ctx, client, vmwareInventoryFilter{
+		IncludeTemplates: includeTemplates,
+		IncludeVCLS:      includeVCLS,
+	})
 	if err != nil {
 		writeError(w, http.StatusBadGateway, fmt.Sprintf("failed to list VMware VMs: %v", err))
 		return
@@ -1294,7 +1315,7 @@ func connectVCenterRuntime(ctx context.Context, cfg vcenterRuntime) (*govmomi.Cl
 	return govmomi.NewClient(ctx, u, insecure)
 }
 
-func listVMwareInventory(ctx context.Context, client *govmomi.Client) ([]vmwareVMInfo, error) {
+func listVMwareInventory(ctx context.Context, client *govmomi.Client, filter vmwareInventoryFilter) ([]vmwareVMInfo, error) {
 	vmgr := view.NewManager(client.Client)
 	cv, err := vmgr.CreateContainerView(ctx, client.ServiceContent.RootFolder, []string{"VirtualMachine"}, true)
 	if err != nil {
@@ -1305,6 +1326,7 @@ func listVMwareInventory(ctx context.Context, client *govmomi.Client) ([]vmwareV
 	var vms []mo.VirtualMachine
 	if err := cv.Retrieve(ctx, []string{"VirtualMachine"}, []string{
 		"name",
+		"config.template",
 		"config.hardware.numCPU",
 		"config.hardware.memoryMB",
 		"config.hardware.device",
@@ -1315,6 +1337,14 @@ func listVMwareInventory(ctx context.Context, client *govmomi.Client) ([]vmwareV
 
 	out := make([]vmwareVMInfo, 0, len(vms))
 	for _, vm := range vms {
+		isTemplate := vm.Config != nil && vm.Config.Template
+		isVCLS := isVCLSVM(vm)
+		if isTemplate && !filter.IncludeTemplates {
+			continue
+		}
+		if isVCLS && !filter.IncludeVCLS {
+			continue
+		}
 		if vm.Config == nil || vm.Config.Hardware.Device == nil {
 			continue
 		}
@@ -1405,19 +1435,35 @@ func listVMwareInventory(ctx context.Context, client *govmomi.Client) ([]vmwareV
 			mem = int(vm.Config.Hardware.MemoryMB)
 		}
 		out = append(out, vmwareVMInfo{
-			Name:      vm.Name,
-			Moref:     vm.Reference().Value,
-			CPU:       cpu,
-			Memory:    mem,
-			Disks:     disks,
-			NICs:      nics,
-			Datastore: dsList,
+			Name:       vm.Name,
+			Moref:      vm.Reference().Value,
+			CPU:        cpu,
+			Memory:     mem,
+			Disks:      disks,
+			NICs:       nics,
+			Datastore:  dsList,
+			IsTemplate: isTemplate,
+			IsVCLS:     isVCLS,
 		})
 	}
 	sort.Slice(out, func(i, j int) bool {
 		return out[i].Name < out[j].Name
 	})
 	return out, nil
+}
+
+func isVCLSVM(vm mo.VirtualMachine) bool {
+	name := strings.ToLower(strings.TrimSpace(vm.Name))
+	if strings.HasPrefix(name, "vcls") || strings.Contains(name, "vcls-") {
+		return true
+	}
+	if vm.Config != nil && vm.Config.ManagedBy != nil {
+		ext := strings.ToLower(strings.TrimSpace(vm.Config.ManagedBy.ExtensionKey))
+		if strings.Contains(ext, "eam") || strings.Contains(ext, "vcls") {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *apiServer) cloudStackClientFromRequest(r *http.Request) (*cloudStackClient, error) {
@@ -1626,7 +1672,10 @@ func (s *apiServer) resolveControlDirName(r *http.Request, req migrationSpecRequ
 	if err != nil {
 		return "", err
 	}
-	vms, err := listVMwareInventory(ctx, client)
+	vms, err := listVMwareInventory(ctx, client, vmwareInventoryFilter{
+		IncludeTemplates: true,
+		IncludeVCLS:      true,
+	})
 	if err != nil {
 		return "", err
 	}

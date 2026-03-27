@@ -241,6 +241,8 @@ export default function App() {
   const [vmDisksLoading, setVmDisksLoading] = useState(false);
 
   const [vmwareVms, setVmwareVms] = useState([]);
+  const [showVmwareTemplates, setShowVmwareTemplates] = useState(false);
+  const [showVmwareVcls, setShowVmwareVcls] = useState(false);
   const [zones, setZones] = useState([]);
   const [clusters, setClusters] = useState([]);
   const [storagePools, setStoragePools] = useState([]);
@@ -318,6 +320,14 @@ export default function App() {
       "x-cloudstack-secret-key": selectedCloudstack.secretKey || "",
     };
   }, [selectedCloudstack]);
+
+  const vmwareVmsPath = useMemo(() => {
+    const params = new URLSearchParams();
+    if (showVmwareTemplates) params.set("include_templates", "true");
+    if (showVmwareVcls) params.set("include_vcls", "true");
+    const query = params.toString();
+    return query ? `/vmware/vms?${query}` : "/vmware/vms";
+  }, [showVmwareTemplates, showVmwareVcls]);
 
   const pushToast = useCallback((type, message) => {
     const id = `${Date.now()}-${Math.floor(Math.random() * 10000)}`;
@@ -515,7 +525,7 @@ export default function App() {
     setInventoryBusy(true);
     try {
       const requests = [
-        { key: "vms", label: "VMware VMs", path: "/vmware/vms", headers: vmwareHeaders },
+        { key: "vms", label: "VMware VMs", path: vmwareVmsPath, headers: vmwareHeaders },
         { key: "zones", label: "CloudStack zones", path: "/cloudstack/zones", headers: cloudstackHeaders },
         { key: "clusters", label: "CloudStack clusters", path: "/cloudstack/clusters", headers: cloudstackHeaders },
         { key: "storage", label: "CloudStack storage", path: "/cloudstack/storage", headers: cloudstackHeaders },
@@ -602,7 +612,7 @@ export default function App() {
     } finally {
       setInventoryBusy(false);
     }
-  }, [cloudstackHeaders, mapInventoryDisks, mapInventoryNics, pushToast, vmwareHeaders]);
+  }, [cloudstackHeaders, mapInventoryDisks, mapInventoryNics, pushToast, vmwareHeaders, vmwareVmsPath]);
 
   const refreshSelectedVmDetails = useCallback(async () => {
     if (selectedVmNames.length === 0) {
@@ -611,7 +621,7 @@ export default function App() {
     }
     setVmDisksLoading(true);
     try {
-      const vms = await apiRequest("/vmware/vms", { headers: vmwareHeaders });
+      const vms = await apiRequest(vmwareVmsPath, { headers: vmwareHeaders });
       setVmwareVms(vms);
       const missing = [];
       setVmSpecsByName((prev) => {
@@ -649,7 +659,7 @@ export default function App() {
     } finally {
       setVmDisksLoading(false);
     }
-  }, [buildDraftForVm, diskOfferings, mapInventoryDisks, mapInventoryNics, networks, pushToast, selectedVmNames, storagePools, vmwareHeaders]);
+  }, [buildDraftForVm, diskOfferings, mapInventoryDisks, mapInventoryNics, networks, pushToast, selectedVmNames, storagePools, vmwareHeaders, vmwareVmsPath]);
 
   const refreshJobs = useCallback(async () => {
     try {
@@ -1063,8 +1073,12 @@ export default function App() {
             vmOptions={vmOptions}
             selectedVmNames={selectedVmNames}
             activeVmName={activeVmName}
+            showTemplates={showVmwareTemplates}
+            showVcls={showVmwareVcls}
             onToggleVm={toggleVmSelection}
             onSetActiveVm={setActiveVmName}
+            onToggleShowTemplates={setShowVmwareTemplates}
+            onToggleShowVcls={setShowVmwareVcls}
             onSelectAll={selectAllVms}
             onClearSelection={clearVmSelection}
             onRefreshSelected={refreshSelectedVmDetails}
