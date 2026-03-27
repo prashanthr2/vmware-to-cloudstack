@@ -909,7 +909,10 @@ func verifyImageBeforeV2V(path string, totalDisks int) error {
 		}
 	}
 	if err := run("virt-inspector", "-a", path); err != nil {
-		if totalDisks > 1 {
+		msg := strings.ToLower(err.Error())
+		osNotDetected := strings.Contains(msg, "inspection could not detect the source guest") ||
+			strings.Contains(msg, "no root device found")
+		if totalDisks > 1 && osNotDetected {
 			log.Printf("[virt-v2v] warning: virt-inspector could not detect an OS on %s before multi-disk conversion; continuing with all disks attached", filepath.Base(path))
 			return nil
 		}
@@ -1825,7 +1828,7 @@ func runBaseCopy(ctx context.Context, opts baseCopyOptions) (copyStats, error) {
 	report()
 
 	if opts.RunVirtV2V {
-		if err := runVirtV2VInPlace(opts.TargetQCOW2, opts.VirtioISO); err != nil {
+		if err := runVirtV2VInPlace([]string{opts.TargetQCOW2}, opts.VirtioISO); err != nil {
 			return copyStats{}, fmt.Errorf("virt-v2v-in-place failed: %w", err)
 		}
 	}
