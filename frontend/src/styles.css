@@ -220,6 +220,18 @@ select {
   height: 16px;
 }
 
+.storage-warning {
+  margin-top: 12px;
+  padding: 10px 12px;
+  border: 1px solid #d4633d;
+  border-radius: 8px;
+  background: #fff4ef;
+}
+
+.storage-warning h4 {
+  margin: 0 0 6px 0;
+}
+
 .vm-select-card {
   display: grid;
   grid-template-columns: auto 1fr;

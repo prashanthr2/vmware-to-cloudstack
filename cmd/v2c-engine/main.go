@@ -2960,11 +2960,37 @@ func isNFSFsType(fsType string) bool {
 	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(fsType)), "nfs")
 }
 
-func ensureStorageMounted(cs *cloudStackClient, storageID string) (string, error) {
+func ensureStorageMounted(cs *cloudStackClient, storageID string, requiredBytes int64) (string, error) {
 	storageID = strings.TrimSpace(storageID)
 	if storageID == "" {
 		return "", errors.New("storage id is empty")
 	}
+	pool, err := cs.storagePoolByID(storageID)
+	if err != nil {
+		return "", fmt.Errorf("failed to lookup storage pool %s: %w", storageID, err)
+	}
+
+	if isSharedMountpointStoragePool(*pool) {
+		rootPath := strings.TrimSpace(pool.Path)
+		if err := validateSharedMountpointPath(rootPath, requiredBytes); err != nil {
+			return "", fmt.Errorf(
+				"shared mountpoint storage pool %s (%s) path=%q failed preflight: %w",
+				pool.ID,
+				pool.Name,
+				rootPath,
+				err,
+			)
+		}
+		return rootPath, nil
+	}
+
+	if !isNFSStoragePool(*pool) {
+		return "", fmt.Errorf(
+			"storage pool %s (%s) is unsupported (type=%q, url=%q). supported types: NFS, Shared Mountpoint",
+			pool.ID, pool.Name, pool.PoolType, pool.URL,
+		)
+	}
+
 	mountPath := filepath.Join("/mnt", storageID)
 	if err := os.MkdirAll(mountPath, 0o755); err != nil {
 		return "", fmt.Errorf("failed to create storage mount path %s: %w", mountPath, err)
@@ -2981,16 +3007,6 @@ func ensureStorageMounted(cs *cloudStackClient, storageID string) (string, error
 		return mountPath, nil
 	}
 
-	pool, err := cs.storagePoolByID(storageID)
-	if err != nil {
-		return "", fmt.Errorf("failed to lookup storage pool %s: %w", storageID, err)
-	}
-	if !isNFSStoragePool(*pool) {
-		return "", fmt.Errorf(
-			"storage pool %s (%s) is not NFS (type=%q, url=%q). only NFS storage is supported",
-			pool.ID, pool.Name, pool.PoolType, pool.URL,
-		)
-	}
 	nfsSource, err := nfsSourceFromPool(*pool)
 	if err != nil {
 		return "", err
@@ -3028,6 +3044,55 @@ func ensureStorageMounted(cs *cloudStackClient, storageID string) (string, error
 		return "", fmt.Errorf("%s mounted as %s (%s), expected NFS", mountPath, fsType, source)
 	}
 	return mountPath, nil
+}
+
+func validateSharedMountpointPath(path string, requiredBytes int64) error {
+	root := strings.TrimSpace(path)
+	if root == "" {
+		return errors.New("path is empty")
+	}
+	if !filepath.IsAbs(root) {
+		return fmt.Errorf("path must be absolute: %s", root)
+	}
+	info, err := os.Stat(root)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return fmt.Errorf("path does not exist: %s", root)
+		}
+		return fmt.Errorf("failed to stat path %s: %w", root, err)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("path is not a directory: %s", root)
+	}
+
+	testName := filepath.Join(root, fmt.Sprintf(".v2c-preflight-%d.tmp", time.Now().UnixNano()))
+	if err := os.WriteFile(testName, []byte("v2c-preflight"), 0o644); err != nil {
+		if os.IsPermission(err) || errors.Is(err, os.ErrPermission) {
+			return fmt.Errorf("path is not writable: %s", root)
+		}
+		return fmt.Errorf("write test failed in %s: %w", root, err)
+	}
+	if err := os.Remove(testName); err != nil {
+		return fmt.Errorf("write test cleanup failed for %s: %w", testName, err)
+	}
+
+	if requiredBytes > 0 {
+		var fsStat syscall.Statfs_t
+		if err := syscall.Statfs(root, &fsStat); err != nil {
+			log.Printf("[preflight] warning: free-space check unavailable for shared mountpoint path=%s: %v", root, err)
+		} else {
+			available := int64(fsStat.Bavail) * int64(fsStat.Bsize)
+			if available >= 0 && available < requiredBytes {
+				return fmt.Errorf(
+					"insufficient free space in %s (available=%s required=%s)",
+					root,
+					formatBytes(available),
+					formatBytes(requiredBytes),
+				)
+			}
+		}
+	}
+	return nil
 }
 
 func parseFinalizeAt(s string) (time.Time, error) {
@@ -3278,6 +3343,23 @@ func isNFSStoragePool(pool cloudStackStoragePoolInfo) bool {
 		return true
 	}
 	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(pool.URL)), "nfs://")
+}
+
+func isSharedMountpointStoragePool(pool cloudStackStoragePoolInfo) bool {
+	t := strings.ToLower(strings.TrimSpace(pool.PoolType))
+	if t == "" {
+		return false
+	}
+	if strings.Contains(t, "networkfilesystem") || strings.Contains(t, "nfs") {
+		return false
+	}
+	if strings.Contains(t, "sharedmountpoint") || strings.Contains(t, "shared mountpoint") || strings.Contains(t, "shared_mountpoint") {
+		return true
+	}
+	if strings.Contains(t, "shared") && strings.Contains(t, "mount") {
+		return true
+	}
+	return strings.Contains(t, "filesystem")
 }
 
 func nfsSourceFromPool(pool cloudStackStoragePoolInfo) (string, error) {
@@ -4400,6 +4482,18 @@ func runVMWorkflow(ctx context.Context, cfg *appConfig, spec *runSpec, opts runO
 		return nil
 	}
 
+	requiredByStorage := map[string]int64{}
+	for _, d := range disks {
+		storageID, err := resolveStorageID(spec, d.Unit, bootUnit)
+		if err != nil {
+			return err
+		}
+		if d.Capacity > 0 {
+			requiredByStorage[storageID] += d.Capacity
+		}
+	}
+
+	storageRootByID := map[string]string{}
 	for _, d := range disks {
 		unitKey := strconv.Itoa(d.Unit)
 		ds := st.Disks[unitKey]
@@ -4424,11 +4518,15 @@ func runVMWorkflow(ctx context.Context, cfg *appConfig, spec *runSpec, opts runO
 			return err
 		}
 		ds.StorageID = storageID
-		mountPath, err := ensureStorageMounted(csClient, storageID)
-		if err != nil {
-			return err
+		rootPath := storageRootByID[storageID]
+		if strings.TrimSpace(rootPath) == "" {
+			rootPath, err = ensureStorageMounted(csClient, storageID, requiredByStorage[storageID])
+			if err != nil {
+				return err
+			}
+			storageRootByID[storageID] = rootPath
 		}
-		ds.TargetQCOW2 = filepath.Join(mountPath, fmt.Sprintf("%s_disk%d.qcow2", migrationID, d.Unit))
+		ds.TargetQCOW2 = filepath.Join(rootPath, fmt.Sprintf("%s_disk%d.qcow2", migrationID, d.Unit))
 	}
 	if err := saveStateLocked(); err != nil {
 		return err
