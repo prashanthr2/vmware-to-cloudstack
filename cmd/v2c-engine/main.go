@@ -3397,32 +3397,36 @@ func (c *cloudStackClient) storagePoolByID(storageID string) (*cloudStackStorage
 	if storageID == "" {
 		return nil, errors.New("storage id is empty")
 	}
-	res, err := c.request("listStoragePools", map[string]string{"id": storageID})
+	parsePools := func(res map[string]any) ([]cloudStackStoragePoolInfo, error) {
+		root, ok := mapGetMap(res, "liststoragepoolsresponse")
+		if !ok {
+			return nil, fmt.Errorf("unexpected listStoragePools response: %v", res)
+		}
+		candidates := make([]cloudStackStoragePoolInfo, 0)
+		for _, raw := range mapGetArray(root, "storagepool") {
+			m, ok := raw.(map[string]any)
+			if !ok {
+				continue
+			}
+			candidates = append(candidates, storagePoolInfoFromMap(m))
+		}
+		if len(candidates) == 0 {
+			if single, ok := mapGetMap(root, "storagepool"); ok {
+				candidates = append(candidates, storagePoolInfoFromMap(single))
+			}
+		}
+		return candidates, nil
+	}
+
+	// Primary lookup by ID.
+	res, err := c.request("listStoragePools", map[string]string{"id": storageID, "listall": "true"})
 	if err != nil {
 		return nil, err
 	}
-	root, ok := mapGetMap(res, "liststoragepoolsresponse")
-	if !ok {
-		return nil, fmt.Errorf("unexpected listStoragePools response: %v", res)
+	candidates, err := parsePools(res)
+	if err != nil {
+		return nil, err
 	}
-
-	candidates := make([]cloudStackStoragePoolInfo, 0)
-	for _, raw := range mapGetArray(root, "storagepool") {
-		m, ok := raw.(map[string]any)
-		if !ok {
-			continue
-		}
-		candidates = append(candidates, storagePoolInfoFromMap(m))
-	}
-	if len(candidates) == 0 {
-		if single, ok := mapGetMap(root, "storagepool"); ok {
-			candidates = append(candidates, storagePoolInfoFromMap(single))
-		}
-	}
-	if len(candidates) == 0 {
-		return nil, fmt.Errorf("storage pool not found: %s", storageID)
-	}
-
 	for _, p := range candidates {
 		if strings.TrimSpace(p.ID) == storageID {
 			pool := p
@@ -3430,8 +3434,23 @@ func (c *cloudStackClient) storagePoolByID(storageID string) (*cloudStackStorage
 		}
 	}
 
-	pool := candidates[0]
-	return &pool, nil
+	// Fallback: some CloudStack setups do not return a record for id=<uuid> even when
+	// the pool is visible via plain listStoragePools. Retry full listing and match client-side.
+	resAll, err := c.request("listStoragePools", map[string]string{"listall": "true"})
+	if err != nil {
+		return nil, err
+	}
+	allPools, err := parsePools(resAll)
+	if err != nil {
+		return nil, err
+	}
+	for _, p := range allPools {
+		if strings.TrimSpace(p.ID) == storageID {
+			pool := p
+			return &pool, nil
+		}
+	}
+	return nil, fmt.Errorf("storage pool not found: %s (verify storageid belongs to the same CloudStack endpoint/credentials used by run)", storageID)
 }
 
 func (c *cloudStackClient) waitJob(jobID string, kind string) (map[string]any, error) {
