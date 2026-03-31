@@ -2146,6 +2146,30 @@ func loadAppConfig(path string) (*appConfig, error) {
 	return &cfg, nil
 }
 
+func applyRuntimeOverridesFromEnv(cfg *appConfig) {
+	if cfg == nil {
+		return
+	}
+	if v := strings.TrimSpace(os.Getenv("V2C_VCENTER_HOST")); v != "" {
+		cfg.VCenter.Host = v
+	}
+	if v := strings.TrimSpace(os.Getenv("V2C_VCENTER_USER")); v != "" {
+		cfg.VCenter.User = v
+	}
+	if v := strings.TrimSpace(os.Getenv("V2C_VCENTER_PASSWORD")); v != "" {
+		cfg.VCenter.Password = v
+	}
+	if v := strings.TrimSpace(os.Getenv("V2C_CLOUDSTACK_ENDPOINT")); v != "" {
+		cfg.CloudStack.Endpoint = normalizeCloudStackEndpoint(v)
+	}
+	if v := strings.TrimSpace(os.Getenv("V2C_CLOUDSTACK_API_KEY")); v != "" {
+		cfg.CloudStack.APIKey = v
+	}
+	if v := strings.TrimSpace(os.Getenv("V2C_CLOUDSTACK_SECRET_KEY")); v != "" {
+		cfg.CloudStack.SecretKey = v
+	}
+}
+
 func loadRunSpec(path string) (*runSpec, error) {
 	specs, err := loadRunSpecs([]string{path})
 	if err != nil {
@@ -5228,6 +5252,7 @@ func runWorkflow(ctx context.Context, opts runOptions) error {
 	if err != nil {
 		return err
 	}
+	applyRuntimeOverridesFromEnv(cfg)
 	if cfg.VCenter.Password == "" {
 		cfg.VCenter.Password = os.Getenv("VC_PASSWORD")
 	}

@@ -56,6 +56,16 @@ type apiJob struct {
 	FinalizeRequestedSnapshot   bool      `json:"-"`
 	FinalizeNowRequestedSnapshot bool     `json:"-"`
 	UpdatedAtSnapshot           time.Time `json:"-"`
+	EnvOverrides                runEnvOverrides `json:"-"`
+}
+
+type runEnvOverrides struct {
+	VCenterHost      string
+	VCenterUser      string
+	VCenterPassword  string
+	CloudEndpoint    string
+	CloudAPIKey      string
+	CloudSecretKey   string
 }
 
 type apiServer struct {
@@ -806,7 +816,25 @@ func (s *apiServer) handleMigrationStart(w http.ResponseWriter, r *http.Request)
 		writeError(w, http.StatusNotFound, err.Error())
 		return
 	}
-	job := s.startJob(req.VMName, specPath)
+	vc, err := s.vcenterFromRequest(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	cs, err := s.cloudStackClientFromRequest(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	overrides := runEnvOverrides{
+		VCenterHost:     vc.Host,
+		VCenterUser:     vc.User,
+		VCenterPassword: vc.Password,
+		CloudEndpoint:   cs.Endpoint,
+		CloudAPIKey:     cs.APIKey,
+		CloudSecretKey:  cs.SecretKey,
+	}
+	job := s.startJob(req.VMName, specPath, overrides)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"vm_name":   job.VMName,
 		"job_id":    job.JobID,
@@ -1043,7 +1071,38 @@ func (s *apiServer) handleMigrationRetry(w http.ResponseWriter, r *http.Request)
 	if previous != nil {
 		retryOf = previous.JobID
 	}
-	job := s.startJob(vmName, specPath)
+	var overrides runEnvOverrides
+	hasVCHeaders := strings.TrimSpace(r.Header.Get("x-vcenter-host")) != "" ||
+		strings.TrimSpace(r.Header.Get("x-vcenter-user")) != "" ||
+		strings.TrimSpace(r.Header.Get("x-vcenter-password")) != ""
+	hasCSHeaders := strings.TrimSpace(r.Header.Get("x-cloudstack-endpoint")) != "" ||
+		strings.TrimSpace(r.Header.Get("x-cloudstack-api-key")) != "" ||
+		strings.TrimSpace(r.Header.Get("x-cloudstack-secret-key")) != ""
+
+	if previous != nil && !hasVCHeaders && !hasCSHeaders {
+		overrides = previous.EnvOverrides
+	} else {
+		vc, err := s.vcenterFromRequest(r)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		cs, err := s.cloudStackClientFromRequest(r)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		overrides = runEnvOverrides{
+			VCenterHost:     vc.Host,
+			VCenterUser:     vc.User,
+			VCenterPassword: vc.Password,
+			CloudEndpoint:   cs.Endpoint,
+			CloudAPIKey:     cs.APIKey,
+			CloudSecretKey:  cs.SecretKey,
+		}
+	}
+
+	job := s.startJob(vmName, specPath, overrides)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"vm_name":   job.VMName,
 		"job_id":    job.JobID,
@@ -1083,7 +1142,7 @@ func (s *apiServer) handleMigrationLogs(w http.ResponseWriter, r *http.Request) 
 	writeJSON(w, http.StatusOK, logs)
 }
 
-func (s *apiServer) startJob(vmName string, specFile string) *apiJob {
+func (s *apiServer) startJob(vmName string, specFile string, overrides runEnvOverrides) *apiJob {
 	id := fmt.Sprintf("%d-%06d", time.Now().UnixNano(), atomic.AddUint64(&s.jobSeq, 1))
 	runtimeDir := s.jobRuntimeDir(vmName, specFile)
 	job := &apiJob{
@@ -1093,6 +1152,7 @@ func (s *apiServer) startJob(vmName string, specFile string) *apiJob {
 		Status:     "queued",
 		StartedAt:  time.Now().UTC(),
 		RuntimeDir: runtimeDir,
+		EnvOverrides: overrides,
 	}
 
 	s.mu.Lock()
@@ -1149,6 +1209,7 @@ func (s *apiServer) runJob(job *apiJob) {
 	}
 	cmd := exec.Command(command[0], command[1:]...)
 	cmd.Dir = s.workDir
+	cmd.Env = withRunEnvOverrides(os.Environ(), job.EnvOverrides)
 
 	stdoutFile, err := os.OpenFile(stdoutPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
 	if err != nil {
@@ -1235,6 +1296,38 @@ func (s *apiServer) finishJob(jobID string, exitCode int, errText string) {
 	job.FinalizeRequestedSnapshot = anyToBool(status["finalize_requested"])
 	job.FinalizeNowRequestedSnapshot = anyToBool(status["finalize_now_requested"])
 	job.UpdatedAtSnapshot = now
+}
+
+func withRunEnvOverrides(base []string, o runEnvOverrides) []string {
+	set := func(env []string, key, value string) []string {
+		if strings.TrimSpace(key) == "" {
+			return env
+		}
+		prefix := key + "="
+		for i := range env {
+			if strings.HasPrefix(env[i], prefix) {
+				if strings.TrimSpace(value) == "" {
+					return append(env[:i], env[i+1:]...)
+				}
+				env[i] = prefix + value
+				return env
+			}
+		}
+		if strings.TrimSpace(value) != "" {
+			env = append(env, prefix+value)
+		}
+		return env
+	}
+
+	env := append([]string{}, base...)
+	env = set(env, "V2C_VCENTER_HOST", o.VCenterHost)
+	env = set(env, "V2C_VCENTER_USER", o.VCenterUser)
+	env = set(env, "V2C_VCENTER_PASSWORD", o.VCenterPassword)
+	env = set(env, "VC_PASSWORD", o.VCenterPassword)
+	env = set(env, "V2C_CLOUDSTACK_ENDPOINT", o.CloudEndpoint)
+	env = set(env, "V2C_CLOUDSTACK_API_KEY", o.CloudAPIKey)
+	env = set(env, "V2C_CLOUDSTACK_SECRET_KEY", o.CloudSecretKey)
+	return env
 }
 
 func (s *apiServer) latestJobForVM(vmName string) *apiJob {

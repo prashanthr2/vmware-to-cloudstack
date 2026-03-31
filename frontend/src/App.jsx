@@ -984,6 +984,7 @@ export default function App() {
           if (startAfter) {
             const startResp = await apiRequest("/migration/start", {
               method: "POST",
+              headers: { ...vmwareHeaders, ...cloudstackHeaders },
               body: JSON.stringify({ vm_name: vmName, spec_file: specResp.spec_file }),
             });
             startedJobs.push(startResp.job_id);
@@ -1041,6 +1042,7 @@ export default function App() {
         const specFile = job.spec_file ? `?spec_file=${encodeURIComponent(job.spec_file)}` : "";
         const response = await apiRequest(`/migration/retry/${encodeURIComponent(job.vm_name)}${specFile}`, {
           method: "POST",
+          headers: { ...vmwareHeaders, ...cloudstackHeaders },
         });
         pushToast("success", `${job.vm_name}: retry started (job ${String(response?.job_id || "").slice(0, 8)}).`);
         await refreshJobs();
@@ -1048,7 +1050,7 @@ export default function App() {
         pushToast("error", err.message || "Failed to retry migration.");
       }
     },
-    [pushToast, refreshJobs]
+    [cloudstackHeaders, pushToast, refreshJobs, vmwareHeaders]
   );
 
   const selectedVmStatus = selectedJob ? statusByJob[selectedJob.job_id] || null : null;
