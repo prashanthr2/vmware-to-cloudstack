@@ -65,7 +65,7 @@ function storagePoolType(item) {
 }
 
 function storagePoolPath(item) {
-  return String(item?.path || item?.sourcepath || item?.mountpoint || "").trim();
+  return String(item?.path || item?.sourcepath || item?.mountpoint || item?.url || "").trim();
 }
 
 function isSharedMountpointPoolItem(item) {
@@ -74,6 +74,13 @@ function isSharedMountpointPoolItem(item) {
   if (t.includes("networkfilesystem") || t.includes("nfs")) return false;
   if (t.includes("sharedmountpoint") || t.includes("shared mountpoint") || t.includes("shared_mountpoint")) return true;
   return t.includes("filesystem");
+}
+
+function isRBDPoolItem(item) {
+  const t = storagePoolType(item).toLowerCase();
+  if (t.includes("rbd") || t.includes("ceph")) return true;
+  const url = String(item?.url || "").trim().toLowerCase();
+  return url.startsWith("rbd://");
 }
 
 function storagePoolOptionLabel(item) {
@@ -544,6 +551,29 @@ export default function App() {
         name: optionLabel(pool),
         type: storagePoolType(pool),
         path: storagePoolPath(pool),
+      });
+    };
+    addByStorageID(activeDraft.boot_storageid, "Boot storage");
+    (activeDraft.disks || [])
+      .filter((disk) => disk.diskType !== "os")
+      .forEach((disk) => addByStorageID(disk.storageid, `${disk.label || `Disk ${disk.unit}`}`));
+    return rows;
+  }, [activeDraft, storagePools]);
+  const rbdSelectionsForActiveVm = useMemo(() => {
+    if (!activeDraft) return [];
+    const rows = [];
+    const addByStorageID = (storageID, scope) => {
+      const id = String(storageID || "").trim();
+      if (!id) return;
+      const pool = (storagePools || []).find((item) => item.id === id);
+      if (!pool || !isRBDPoolItem(pool)) return;
+      rows.push({
+        scope,
+        id,
+        name: optionLabel(pool),
+        type: storagePoolType(pool),
+        path: storagePoolPath(pool),
+        url: String(pool?.url || "").trim(),
       });
     };
     addByStorageID(activeDraft.boot_storageid, "Boot storage");
@@ -1182,6 +1212,22 @@ export default function App() {
                     ))}
                     <p className="hint small">
                       Important: this path must be truly shared across all hosts. If it is local-only, migration may appear successful but the VM can fail later.
+                    </p>
+                  </div>
+                ) : null}
+                {rbdSelectionsForActiveVm.length > 0 ? (
+                  <div className="storage-warning">
+                    <h4>Ceph RBD Storage Selected</h4>
+                    <p className="field-error">
+                      This migration host must have working Ceph client access for the selected pool(s) (for example, valid `/etc/ceph/ceph.conf` and keyring permissions). Migration fails if RBD write preflight cannot create/delete a test image.
+                    </p>
+                    {rbdSelectionsForActiveVm.map((entry, idx) => (
+                      <div key={`${entry.id}-${entry.scope}-${idx}`} className="hint small">
+                        {entry.scope} -> {entry.name} [{entry.type || "RBD"}] pool/path: {entry.path || "(missing)"} {entry.url ? `url: ${entry.url}` : ""}
+                      </div>
+                    ))}
+                    <p className="hint small">
+                      Important: ensure all destination hosts in the target CloudStack cluster have access to the same Ceph backend.
                     </p>
                   </div>
                 ) : null}

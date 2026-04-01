@@ -663,16 +663,26 @@ func (c *nbdClient) close() error {
 	return err
 }
 
-type qcow2Endpoint struct {
+type targetEndpoint struct {
 	path string
 	sock string
 	cmd  *exec.Cmd
 }
 
-func startQcow2Endpoint(path string) (*qcow2Endpoint, error) {
+func targetDiskFormat(path string) string {
+	if isRBDTarget(path) {
+		return "raw"
+	}
+	return "qcow2"
+}
+
+func startTargetEndpoint(path string, format string) (*targetEndpoint, error) {
 	sock := filepath.Join(os.TempDir(), fmt.Sprintf("v2c_qcow_%d_%d.sock", os.Getpid(), time.Now().UnixNano()))
 	_ = os.Remove(sock)
-	cmd := exec.Command("qemu-nbd", "--socket", sock, "--format", "qcow2", path)
+	if strings.TrimSpace(format) == "" {
+		format = targetDiskFormat(path)
+	}
+	cmd := exec.Command("qemu-nbd", "--socket", sock, "--format", format, path)
 	cmd.Env = sanitizedChildEnv()
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -686,13 +696,13 @@ func startQcow2Endpoint(path string) (*qcow2Endpoint, error) {
 			return nil, errors.New("qemu-nbd socket not ready before timeout")
 		}
 		if _, err := os.Stat(sock); err == nil {
-			return &qcow2Endpoint{path: path, sock: sock, cmd: cmd}, nil
+			return &targetEndpoint{path: path, sock: sock, cmd: cmd}, nil
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
 }
 
-func (e *qcow2Endpoint) close() {
+func (e *targetEndpoint) close() {
 	if e == nil {
 		return
 	}
@@ -767,25 +777,117 @@ func guestfsChildEnv() []string {
 	return env
 }
 
-func createSparseQCOW2(path string, sizeBytes int64) error {
-	if sizeBytes <= 0 {
-		return fmt.Errorf("invalid qcow2 size: %d", sizeBytes)
+func isRBDTarget(path string) bool {
+	p := strings.ToLower(strings.TrimSpace(path))
+	return strings.HasPrefix(p, "rbd:")
+}
+
+func parseRBDTarget(path string) (pool string, image string, err error) {
+	raw := strings.TrimSpace(path)
+	if !isRBDTarget(raw) {
+		return "", "", fmt.Errorf("not an rbd target: %s", path)
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	raw = strings.TrimPrefix(raw, "rbd:")
+	raw = strings.TrimPrefix(raw, "RBD:")
+	// Drop optional suffix options (rbd:<pool>/<image>:opt=...).
+	if idx := strings.Index(raw, ":"); idx >= 0 {
+		raw = raw[:idx]
+	}
+	raw = strings.Trim(raw, "/")
+	parts := strings.SplitN(raw, "/", 2)
+	if len(parts) != 2 {
+		return "", "", fmt.Errorf("invalid rbd target format, expected rbd:<pool>/<image>: %s", path)
+	}
+	pool = strings.TrimSpace(parts[0])
+	image = strings.TrimSpace(parts[1])
+	if pool == "" || image == "" {
+		return "", "", fmt.Errorf("invalid rbd target format, expected rbd:<pool>/<image>: %s", path)
+	}
+	return pool, image, nil
+}
+
+func targetDiskBasename(path string) string {
+	p := strings.TrimSpace(path)
+	if p == "" {
+		return ""
+	}
+	if isRBDTarget(p) {
+		_, image, err := parseRBDTarget(p)
+		if err == nil {
+			return image
+		}
+	}
+	return filepath.Base(p)
+}
+
+func removeRBDImageIfExists(path string) error {
+	pool, image, err := parseRBDTarget(path)
+	if err != nil {
 		return err
 	}
-	_ = os.Remove(path)
-	cmd := exec.Command(
-		"qemu-img", "create",
-		"-f", "qcow2",
-		"-o", "compat=1.1,lazy_refcounts=on",
-		path,
-		fmt.Sprintf("%d", sizeBytes),
-	)
+	cmd := exec.Command("rbd", "rm", fmt.Sprintf("%s/%s", pool, image))
+	cmd.Env = sanitizedChildEnv()
+	out, rmErr := cmd.CombinedOutput()
+	if rmErr != nil {
+		msg := strings.ToLower(string(out))
+		// If image does not exist, ignore.
+		if strings.Contains(msg, "no such file") || strings.Contains(msg, "not found") {
+			return nil
+		}
+		return fmt.Errorf("rbd rm failed for %s/%s: %w (%s)", pool, image, rmErr, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+func createTargetDisk(path string, sizeBytes int64) error {
+	if sizeBytes <= 0 {
+		return fmt.Errorf("invalid target disk size: %d", sizeBytes)
+	}
+
+	var cmd *exec.Cmd
+	if isRBDTarget(path) {
+		if err := removeRBDImageIfExists(path); err != nil {
+			return err
+		}
+		cmd = exec.Command(
+			"qemu-img", "create",
+			"-f", "raw",
+			path,
+			fmt.Sprintf("%d", sizeBytes),
+		)
+	} else {
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			return err
+		}
+		_ = os.Remove(path)
+		cmd = exec.Command(
+			"qemu-img", "create",
+			"-f", "qcow2",
+			"-o", "compat=1.1,lazy_refcounts=on",
+			path,
+			fmt.Sprintf("%d", sizeBytes),
+		)
+	}
 	cmd.Env = sanitizedChildEnv()
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	return cmd.Run()
+}
+
+func targetDiskExists(path string) bool {
+	p := strings.TrimSpace(path)
+	if p == "" {
+		return false
+	}
+	if !isRBDTarget(p) {
+		return fileExists(p)
+	}
+	cmd := exec.Command("qemu-img", "info", p)
+	cmd.Env = sanitizedChildEnv()
+	if err := cmd.Run(); err != nil {
+		return false
+	}
+	return true
 }
 
 func runVirtV2VInPlace(paths []string, virtioISO string) error {
@@ -1563,10 +1665,10 @@ func runBaseCopy(ctx context.Context, opts baseCopyOptions) (copyStats, error) {
 	}
 	opts.DiskSizeBytes = sourceDiskBytes
 
-	if err := createSparseQCOW2(opts.TargetQCOW2, opts.DiskSizeBytes); err != nil {
+	if err := createTargetDisk(opts.TargetQCOW2, opts.DiskSizeBytes); err != nil {
 		return copyStats{}, err
 	}
-	endpoint, err := startQcow2Endpoint(opts.TargetQCOW2)
+	endpoint, err := startTargetEndpoint(opts.TargetQCOW2, targetDiskFormat(opts.TargetQCOW2))
 	if err != nil {
 		return copyStats{}, err
 	}
@@ -1665,7 +1767,7 @@ func runBaseCopy(ctx context.Context, opts baseCopyOptions) (copyStats, error) {
 		defer writerWG.Done()
 		for item := range writeQ {
 			if err := writerClient.writeAt(item.Offset, item.Data); err != nil {
-				pushErr(fmt.Errorf("qcow2 write failed at offset=%d: %w", item.Offset, err))
+				pushErr(fmt.Errorf("target write failed at offset=%d: %w", item.Offset, err))
 				return
 			}
 			atomic.AddInt64(&bytesWritten, int64(len(item.Data)))
@@ -1815,7 +1917,7 @@ func runBaseCopy(ctx context.Context, opts baseCopyOptions) (copyStats, error) {
 	if err := writerClient.flush(); err != nil {
 		close(progressStop)
 		report()
-		return copyStats{}, fmt.Errorf("qcow2 flush failed: %w", err)
+		return copyStats{}, fmt.Errorf("target flush failed: %w", err)
 	}
 	if err := writerClient.close(); err != nil {
 		close(progressStop)
@@ -1923,7 +2025,7 @@ func runDeltaSync(ctx context.Context, opts deltaSyncOptions) (copyStats, error)
 			)
 		}
 	}
-	endpoint, err := startQcow2Endpoint(opts.TargetQCOW2)
+	endpoint, err := startTargetEndpoint(opts.TargetQCOW2, targetDiskFormat(opts.TargetQCOW2))
 	if err != nil {
 		return copyStats{}, err
 	}
@@ -2094,7 +2196,7 @@ func runDeltaSync(ctx context.Context, opts deltaSyncOptions) (copyStats, error)
 	if err := writerClient.flush(); err != nil {
 		close(progressStop)
 		report()
-		return copyStats{}, fmt.Errorf("delta qcow2 flush failed: %w", err)
+		return copyStats{}, fmt.Errorf("delta target flush failed: %w", err)
 	}
 	close(progressStop)
 	report()
@@ -3008,9 +3110,26 @@ func ensureStorageMounted(cs *cloudStackClient, storageID string, requiredBytes 
 		return rootPath, nil
 	}
 
+	if isRBDStoragePool(*pool) {
+		poolName, err := rbdPoolNameFromStoragePool(*pool)
+		if err != nil {
+			return "", err
+		}
+		if err := validateRBDPoolWritable(poolName, requiredBytes); err != nil {
+			return "", fmt.Errorf(
+				"ceph rbd storage pool %s (%s) pool=%q failed preflight: %w",
+				pool.ID,
+				pool.Name,
+				poolName,
+				err,
+			)
+		}
+		return "rbd://" + poolName, nil
+	}
+
 	if !isNFSStoragePool(*pool) {
 		return "", fmt.Errorf(
-			"storage pool %s (%s) is unsupported (type=%q, url=%q). supported types: NFS, Shared Mountpoint",
+			"storage pool %s (%s) is unsupported (type=%q, url=%q). supported types: NFS, Shared Mountpoint, Ceph RBD",
 			pool.ID, pool.Name, pool.PoolType, pool.URL,
 		)
 	}
@@ -3386,6 +3505,101 @@ func isSharedMountpointStoragePool(pool cloudStackStoragePoolInfo) bool {
 	return strings.Contains(t, "filesystem")
 }
 
+func isRBDStoragePool(pool cloudStackStoragePoolInfo) bool {
+	t := strings.ToLower(strings.TrimSpace(pool.PoolType))
+	if strings.Contains(t, "rbd") || strings.Contains(t, "ceph") {
+		return true
+	}
+	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(pool.URL)), "rbd://")
+}
+
+func rbdPoolNameFromStoragePool(pool cloudStackStoragePoolInfo) (string, error) {
+	path := strings.Trim(strings.TrimSpace(pool.Path), "/")
+	if path != "" {
+		if i := strings.LastIndex(path, "/"); i >= 0 {
+			path = strings.TrimSpace(path[i+1:])
+		}
+		if path != "" {
+			return path, nil
+		}
+	}
+
+	urlValue := strings.TrimSpace(pool.URL)
+	if strings.HasPrefix(strings.ToLower(urlValue), "rbd://") {
+		u, err := neturl.Parse(urlValue)
+		if err != nil {
+			return "", fmt.Errorf("invalid RBD url %q: %w", urlValue, err)
+		}
+		candidate := strings.Trim(strings.TrimSpace(u.Path), "/")
+		if candidate != "" {
+			if i := strings.LastIndex(candidate, "/"); i >= 0 {
+				candidate = strings.TrimSpace(candidate[i+1:])
+			}
+			if candidate != "" {
+				return candidate, nil
+			}
+		}
+	}
+
+	return "", fmt.Errorf("storage pool %s (%s) missing Ceph pool name in path/url", pool.ID, pool.Name)
+}
+
+func validateRBDPoolWritable(poolName string, requiredBytes int64) error {
+	poolName = strings.TrimSpace(poolName)
+	if poolName == "" {
+		return errors.New("ceph pool name is empty")
+	}
+	image := fmt.Sprintf(".v2c-preflight-%d", time.Now().UnixNano())
+	target := fmt.Sprintf("rbd:%s/%s", poolName, image)
+
+	create := exec.Command("qemu-img", "create", "-f", "raw", target, "1048576")
+	create.Env = sanitizedChildEnv()
+	if out, err := create.CombinedOutput(); err != nil {
+		return fmt.Errorf("rbd write test failed for pool=%s: %w (%s)", poolName, err, strings.TrimSpace(string(out)))
+	}
+
+	remove := exec.Command("rbd", "rm", fmt.Sprintf("%s/%s", poolName, image))
+	remove.Env = sanitizedChildEnv()
+	if out, err := remove.CombinedOutput(); err != nil {
+		return fmt.Errorf("rbd cleanup failed for pool=%s image=%s: %w (%s)", poolName, image, err, strings.TrimSpace(string(out)))
+	}
+
+	if requiredBytes > 0 {
+		dfCmd := exec.Command("rbd", "df", "--format", "json")
+		dfCmd.Env = sanitizedChildEnv()
+		if out, err := dfCmd.CombinedOutput(); err != nil {
+			log.Printf("[preflight] warning: rbd free-space check unavailable for pool=%s: %v (%s)", poolName, err, strings.TrimSpace(string(out)))
+		} else {
+			var payload struct {
+				Pools []struct {
+					Name  string `json:"name"`
+					Stats struct {
+						MaxAvail int64 `json:"max_avail"`
+					} `json:"stats"`
+				} `json:"pools"`
+			}
+			if err := json.Unmarshal(out, &payload); err != nil {
+				log.Printf("[preflight] warning: failed to parse rbd df JSON for pool=%s: %v", poolName, err)
+			} else {
+				for _, p := range payload.Pools {
+					if strings.TrimSpace(p.Name) == poolName {
+						if p.Stats.MaxAvail > 0 && p.Stats.MaxAvail < requiredBytes {
+							return fmt.Errorf(
+								"insufficient ceph free space in pool %s (available=%s required=%s)",
+								poolName,
+								formatBytes(p.Stats.MaxAvail),
+								formatBytes(requiredBytes),
+							)
+						}
+						break
+					}
+				}
+			}
+		}
+	}
+	return nil
+}
+
 func nfsSourceFromPool(pool cloudStackStoragePoolInfo) (string, error) {
 	host := strings.TrimSpace(pool.IPAddress)
 	path := strings.TrimSpace(pool.Path)
@@ -3668,7 +3882,7 @@ func importVMToCloudStack(cs *cloudStackClient, vmName string, targetCloud cloud
 		"importsource":      "shared",
 		"hypervisor":        "kvm",
 		"storageid":         targetCloud.StorageID,
-		"diskpath":          filepath.Base(bootDiskPath),
+		"diskpath":          targetDiskBasename(bootDiskPath),
 		"networkid":         networkID,
 		"serviceofferingid": targetCloud.ServiceOfferingID,
 	}
@@ -3718,11 +3932,11 @@ func attachNICToVM(cs *cloudStackClient, vmID, networkID string) error {
 
 func importDataDiskToCloudStack(cs *cloudStackClient, zoneID, storageID, diskOfferingID, diskPath string) (string, error) {
 	params := map[string]string{
-		"name":           filepath.Base(diskPath),
+		"name":           targetDiskBasename(diskPath),
 		"zoneid":         zoneID,
 		"diskofferingid": diskOfferingID,
 		"storageid":      storageID,
-		"path":           filepath.Base(diskPath),
+		"path":           targetDiskBasename(diskPath),
 	}
 	resp, err := cs.request("importVolume", params)
 	if err != nil {
@@ -4569,7 +4783,12 @@ func runVMWorkflow(ctx context.Context, cfg *appConfig, spec *runSpec, opts runO
 			}
 			storageRootByID[storageID] = rootPath
 		}
-		ds.TargetQCOW2 = filepath.Join(rootPath, fmt.Sprintf("%s_disk%d.qcow2", migrationID, d.Unit))
+		if strings.HasPrefix(strings.ToLower(strings.TrimSpace(rootPath)), "rbd://") {
+			poolName := strings.TrimSpace(strings.TrimPrefix(rootPath, "rbd://"))
+			ds.TargetQCOW2 = fmt.Sprintf("rbd:%s/%s_disk%d.raw", poolName, migrationID, d.Unit)
+		} else {
+			ds.TargetQCOW2 = filepath.Join(rootPath, fmt.Sprintf("%s_disk%d.qcow2", migrationID, d.Unit))
+		}
 	}
 	if err := saveStateLocked(); err != nil {
 		return err
@@ -4645,7 +4864,7 @@ func runVMWorkflow(ctx context.Context, cfg *appConfig, spec *runSpec, opts runO
 		for _, d := range disks {
 			unitKey := strconv.Itoa(d.Unit)
 			ds := st.Disks[unitKey]
-			if ds != nil && ds.BaseCopied && fileExists(ds.TargetQCOW2) {
+			if ds != nil && ds.BaseCopied && targetDiskExists(ds.TargetQCOW2) {
 				continue
 			}
 			meta, ok := baseMeta[d.Key]

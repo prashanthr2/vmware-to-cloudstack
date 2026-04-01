@@ -94,12 +94,18 @@ Bootstrap package list (reference only, not auto-removed):
 
 RHEL/Rocky/Alma/Fedora (dnf):
   gcc make git tar curl ca-certificates golang
-  qemu-img qemu-kvm-core virt-v2v libguestfs-tools-c
+  qemu-img qemu-kvm-core qemu-nbd virt-v2v libguestfs-tools-c
+  libvirt-client libvirt-daemon-driver-qemu
+  nfs-utils rpcbind
+  ceph-common
   nodejs npm (only when bootstrap used with --with-ui)
 
 Debian/Ubuntu (apt):
   build-essential git tar curl ca-certificates golang-go
   qemu-utils qemu-system-x86 virt-v2v libguestfs-tools
+  libvirt-daemon-system libvirt-clients
+  nfs-common rpcbind
+  ceph-common
   nodejs npm (only when bootstrap used with --with-ui)
 
 Suggested manual review commands:

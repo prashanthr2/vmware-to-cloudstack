@@ -5,7 +5,7 @@ function optionLabel(item) {
 function storagePoolLabel(item) {
   const name = optionLabel(item);
   const type = String(item?.type || item?.pooltype || item?.storagetype || "").trim();
-  const path = String(item?.path || item?.sourcepath || item?.mountpoint || "").trim();
+  const path = String(item?.path || item?.sourcepath || item?.mountpoint || item?.url || "").trim();
   const extras = [];
   if (type) extras.push(type);
   if (path) extras.push(path);

@@ -8,7 +8,7 @@ The goal of this project is to provide **near-live / warm migration** from VMwar
 
 How warm migration is achieved:
 
-- A base snapshot is taken and copied to QCOW2 on CloudStack primary storage.
+- A base snapshot is taken and copied to target disk format on CloudStack primary storage (QCOW2 for file-based pools, RAW image on Ceph RBD).
 - Incremental delta rounds are continuously synced using VMware CBT (`QueryChangedDiskAreas`).
 - At cutover (`Finalize`/`Finalize Now`/`finalize_at`), the source VM is shut down, one final delta sync is applied, then import is completed.
 
@@ -16,8 +16,8 @@ This design keeps source VM downtime mostly to the final sync + import boundary,
 
 ## Engine Internals (Summary)
 
-- Disk copy path: VMware VDDK -> direct QCOW2 writes (no RAW intermediate).
-- Delta path: CBT ranges -> direct QCOW2 updates.
+- Disk copy path: VMware VDDK -> direct target-disk writes (QCOW2 file targets, RAW for Ceph RBD).
+- Delta path: CBT ranges -> direct target-disk updates.
 - Conversion path: optional `virt-v2v-in-place` after final sync, passing the boot disk first and all remaining VM disks so multi-disk guests convert correctly.
 - State machine + resume: per-VM runtime state under `/var/lib/vm-migrator/<vm>_<moref>/`.
 - Control actions: `Finalize` and `Finalize Now` markers, plus CLI/API/UI triggers.
@@ -30,9 +30,10 @@ This design keeps source VM downtime mostly to the final sync + import boundary,
 - Root/sudo access (required for service install and storage preflight checks)
 - CloudStack API access
 - vCenter credentials
-- CloudStack primary storage support in this release: **NFS** and **Shared Mountpoint**
+- CloudStack primary storage support in this release: **NFS**, **Shared Mountpoint**, and **Ceph RBD**
 - For NFS pools, the migration host must have network-level access and permission to mount the storage backend.
 - For Shared Mountpoint pools, the CloudStack path must already exist on the migration host and point to the correct shared storage.
+- For Ceph RBD pools, the migration host must have working Ceph client access (for example `/etc/ceph/ceph.conf`, keyring auth, and `ceph-common` tools).
 
 The bootstrap script installs required OS packages (Go, qemu tools, virt-v2v, guestfs, and optional node/npm for UI).
 This project does not redistribute VDDK. Users must obtain VDDK directly from Broadcom and accept Broadcom licensing terms separately.
@@ -194,7 +195,7 @@ Sample references:
 
 - `run` is the primary user command.
 - Internal base copy and delta sync are handled automatically inside `run`.
-- Base copy and delta write directly into QCOW2 (no RAW intermediate).
+- Base copy and delta write directly into target disks (QCOW2 for file-backed targets, RAW for Ceph RBD).
 - Delta sync uses VMware CBT (`QueryChangedDiskAreas` path).
 - Conversion (`virt-v2v-in-place`) runs in `converting` stage after final sync (when enabled).
 - Stateful/resumable workflow persists state and logs per VM under `/var/lib/vm-migrator/<vm>_<moref>/`.
@@ -213,6 +214,10 @@ Storage behavior:
 - Shared Mountpoint pools:
   - Engine uses the CloudStack path directly as the destination root (no mount/unmount operations).
   - Mandatory preflight validates path exists, is a directory, is writable, write+delete works, and free-space check is best-effort.
+- Ceph RBD pools:
+  - Engine writes directly to RBD images (no mount/unmount operations).
+  - Destination naming pattern: `rbd:<pool>/<vm>_<vmMoref>_disk<unit>.raw`
+  - Mandatory preflight validates RBD write/delete access and performs best-effort free-space check (`rbd df`).
 - On Ubuntu hosts, engine-managed NFS mounts use explicit `vers=3` options to avoid QCOW2 flush I/O issues seen with some NFSv4 environments.
   - Optional override: `V2C_NFS_MOUNT_OPTS="<mount-options>"`
 
@@ -229,7 +234,7 @@ At a high level, each VM migration follows this model:
 
 Important behavior:
 
-- Base and delta both write directly into QCOW2.
+- Base and delta both write directly into target disk images.
 - Delta sync preserves QCOW2 metadata by writing through the qemu block path.
 - The workflow is resumable through `state.json`.
 - `status` reports current stage, next stage, and whether finalize has already been requested.

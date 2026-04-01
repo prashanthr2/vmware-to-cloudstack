@@ -515,7 +515,7 @@ func filterSupportedUpStoragePools(items []any) []any {
 			continue
 		}
 		info := storagePoolInfoFromMap(m)
-		if !isNFSStoragePool(info) && !isSharedMountpointStoragePool(info) {
+		if !isNFSStoragePool(info) && !isSharedMountpointStoragePool(info) && !isRBDStoragePool(info) {
 			continue
 		}
 		state := strings.TrimSpace(firstNonEmptyString(mapGetString(m, "state"), mapGetString(m, "status")))
