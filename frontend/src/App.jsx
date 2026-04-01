@@ -1051,11 +1051,18 @@ export default function App() {
   return (
     <div className="app-shell">
       <header className="topbar">
-        <div>
-          <h1>VMware to CloudStack Migrator</h1>
-          <p>Select multiple VMs, define per-VM disk and NIC mappings, and run migrations in parallel.</p>
+        <div className="topbar-left">
+          <div className="brandmark" aria-hidden>
+            <div className="brandmark-ring">
+              <div className="brandmark-dot" />
+            </div>
+          </div>
+          <div className="topbar-title-block">
+            <h1>VMware to CloudStack Migrator</h1>
+            <p>Select multiple VMs, define per-VM disk and NIC mappings, and run migrations in parallel.</p>
+          </div>
         </div>
-        <div className="tab-buttons">
+        <div className="tab-buttons" role="tablist" aria-label="Main Views">
           <button className={tab === "new" ? "active" : ""} onClick={() => setTab("new")}>New Migration</button>
           <button className={tab === "progress" ? "active" : ""} onClick={() => setTab("progress")}>Progress</button>
         </div>
@@ -1067,184 +1074,188 @@ export default function App() {
         ))}
       </div>
 
-      {tab === "new" ? (
-        <>
-          <EnvironmentManager envState={envState} onChange={setEnvState} onToast={pushToast} />
+      <main className="page-shell">
+        {tab === "new" ? (
+          <div className="section-stack">
+            <EnvironmentManager envState={envState} onChange={setEnvState} onToast={pushToast} />
 
-          <VMSelector
-            vmOptions={vmOptions}
-            selectedVmNames={selectedVmNames}
-            activeVmName={activeVmName}
-            showTemplates={showVmwareTemplates}
-            showVcls={showVmwareVcls}
-            onToggleVm={toggleVmSelection}
-            onSetActiveVm={setActiveVmName}
-            onToggleShowTemplates={setShowVmwareTemplates}
-            onToggleShowVcls={setShowVmwareVcls}
-            onSelectAll={selectAllVms}
-            onClearSelection={clearVmSelection}
-            onRefreshSelected={refreshSelectedVmDetails}
-            loading={vmDisksLoading}
-          />
+            <VMSelector
+              vmOptions={vmOptions}
+              selectedVmNames={selectedVmNames}
+              activeVmName={activeVmName}
+              showTemplates={showVmwareTemplates}
+              showVcls={showVmwareVcls}
+              onToggleVm={toggleVmSelection}
+              onSetActiveVm={setActiveVmName}
+              onToggleShowTemplates={setShowVmwareTemplates}
+              onToggleShowVcls={setShowVmwareVcls}
+              onSelectAll={selectAllVms}
+              onClearSelection={clearVmSelection}
+              onRefreshSelected={refreshSelectedVmDetails}
+              loading={vmDisksLoading}
+            />
 
-          {activeDraft ? (
-            <>
-              <section className="panel">
-                <div className="subsection-title-row">
-                  <h2>Target and Strategy ({activeDraft.vm_name})</h2>
-                  <button className="secondary" onClick={loadInventory} disabled={inventoryBusy}>
-                    {inventoryBusy ? "Loading..." : "Reload Inventory"}
-                  </button>
-                </div>
-                <div className="form-grid">
-                  <label>VM MoRef<input value={activeDraft.vm_moref} onChange={(e) => updateField("vm_moref", e.target.value)} placeholder="vm-123" /></label>
-                  <label>Zone<select value={activeDraft.zoneid} onChange={(e) => updateField("zoneid", e.target.value)}><option value="">Select zone</option>{zones.map((item) => <option key={item.id} value={item.id}>{optionLabel(item)}</option>)}</select></label>
-                  <label>Cluster<select value={activeDraft.clusterid} onChange={(e) => updateField("clusterid", e.target.value)}><option value="">Select cluster</option>{clustersForActiveZone.map((item) => <option key={item.id} value={item.id}>{optionLabel(item)}</option>)}</select></label>
-                  <label>Service Offering<select value={activeDraft.serviceofferingid} onChange={(e) => updateField("serviceofferingid", e.target.value)}><option value="">Select service offering</option>{serviceOfferingsForActiveZone.map((item) => <option key={item.id} value={item.id}>{optionLabel(item)}</option>)}</select></label>
-                  <label>Boot Storage<select value={activeDraft.boot_storageid} onChange={(e) => updateField("boot_storageid", e.target.value)}><option value="">Select boot storage</option>{storagePoolsForActiveZone.map((item) => <option key={item.id} value={item.id}>{optionLabel(item)}</option>)}</select></label>
-                  <label>Guest OS Mapping<select value={activeDraft.ostypeid} onChange={(e) => updateField("ostypeid", e.target.value)}><option value="">Default / leave unchanged</option>{osTypes.map((item) => <option key={item.id} value={item.id}>{item.description || item.name || item.id}</option>)}</select></label>
-                  <label>Firmware / Boot Type<select value={activeDraft.boottype} onChange={(e) => updateField("boottype", e.target.value)}>{BOOT_TYPE_OPTIONS.map((item) => <option key={item.value || "default"} value={item.value}>{item.label}</option>)}</select></label>
-                  <label>UEFI Boot Mode<select value={activeDraft.bootmode} onChange={(e) => updateField("bootmode", e.target.value)} disabled={activeDraft.boottype !== "UEFI"}>{UEFI_BOOT_MODE_OPTIONS.map((item) => <option key={item.value || "default"} value={item.value}>{item.label}</option>)}</select></label>
-                  <label>Root Disk Controller<select value={activeDraft.rootdiskcontroller} onChange={(e) => updateField("rootdiskcontroller", e.target.value)}>{ROOT_DISK_CONTROLLER_OPTIONS.map((item) => <option key={item.value || "default"} value={item.value}>{item.label}</option>)}</select></label>
-                  <label>NIC Adapter<select value={activeDraft.nicadapter} onChange={(e) => updateField("nicadapter", e.target.value)}>{NIC_ADAPTER_OPTIONS.map((item) => <option key={item.value || "default"} value={item.value}>{item.label}</option>)}</select></label>
-                  <label>Delta Interval (sec)<input type="number" min="1" value={activeDraft.migration.delta_interval} onChange={(e) => updateMigrationField("delta_interval", e.target.value)} /></label>
-                  <label>Finalize At (ISO)<input value={activeDraft.migration.finalize_at} onChange={(e) => updateMigrationField("finalize_at", e.target.value)} placeholder="2026-03-12T23:30:00+00:00" /></label>
-                  <label>Finalize Delta Interval<input type="number" min="1" value={activeDraft.migration.finalize_delta_interval} onChange={(e) => updateMigrationField("finalize_delta_interval", e.target.value)} /></label>
-                  <label>Finalize Window<input type="number" min="1" value={activeDraft.migration.finalize_window} onChange={(e) => updateMigrationField("finalize_window", e.target.value)} /></label>
-                  <label>Shutdown Mode<input value={activeDraft.migration.shutdown_mode} onChange={(e) => updateMigrationField("shutdown_mode", e.target.value)} placeholder="auto" /></label>
-                  <label>Snapshot Quiesce<input value={activeDraft.migration.snapshot_quiesce} onChange={(e) => updateMigrationField("snapshot_quiesce", e.target.value)} placeholder="auto" /></label>
-                  <label className="checkbox-field"><input type="checkbox" checked={Boolean(activeDraft.migration.start_vm_after_import)} onChange={(e) => updateMigrationField("start_vm_after_import", e.target.checked)} />Start imported VM after CloudStack import</label>
-                </div>
-              </section>
+            {activeDraft ? (
+              <>
+                <section className="panel">
+                  <div className="panel-header">
+                    <h2>Target and Strategy ({activeDraft.vm_name})</h2>
+                    <button className="secondary" onClick={loadInventory} disabled={inventoryBusy}>
+                      {inventoryBusy ? "Loading..." : "Reload Inventory"}
+                    </button>
+                  </div>
+                  <div className="form-grid">
+                    <label>VM MoRef<input value={activeDraft.vm_moref} onChange={(e) => updateField("vm_moref", e.target.value)} placeholder="vm-123" /></label>
+                    <label>Zone<select value={activeDraft.zoneid} onChange={(e) => updateField("zoneid", e.target.value)}><option value="">Select zone</option>{zones.map((item) => <option key={item.id} value={item.id}>{optionLabel(item)}</option>)}</select></label>
+                    <label>Cluster<select value={activeDraft.clusterid} onChange={(e) => updateField("clusterid", e.target.value)}><option value="">Select cluster</option>{clustersForActiveZone.map((item) => <option key={item.id} value={item.id}>{optionLabel(item)}</option>)}</select></label>
+                    <label>Service Offering<select value={activeDraft.serviceofferingid} onChange={(e) => updateField("serviceofferingid", e.target.value)}><option value="">Select service offering</option>{serviceOfferingsForActiveZone.map((item) => <option key={item.id} value={item.id}>{optionLabel(item)}</option>)}</select></label>
+                    <label>Boot Storage<select value={activeDraft.boot_storageid} onChange={(e) => updateField("boot_storageid", e.target.value)}><option value="">Select boot storage</option>{storagePoolsForActiveZone.map((item) => <option key={item.id} value={item.id}>{optionLabel(item)}</option>)}</select></label>
+                    <label>Guest OS Mapping<select value={activeDraft.ostypeid} onChange={(e) => updateField("ostypeid", e.target.value)}><option value="">Default / leave unchanged</option>{osTypes.map((item) => <option key={item.id} value={item.id}>{item.description || item.name || item.id}</option>)}</select></label>
+                    <label>Firmware / Boot Type<select value={activeDraft.boottype} onChange={(e) => updateField("boottype", e.target.value)}>{BOOT_TYPE_OPTIONS.map((item) => <option key={item.value || "default"} value={item.value}>{item.label}</option>)}</select></label>
+                    <label>UEFI Boot Mode<select value={activeDraft.bootmode} onChange={(e) => updateField("bootmode", e.target.value)} disabled={activeDraft.boottype !== "UEFI"}>{UEFI_BOOT_MODE_OPTIONS.map((item) => <option key={item.value || "default"} value={item.value}>{item.label}</option>)}</select></label>
+                    <label>Root Disk Controller<select value={activeDraft.rootdiskcontroller} onChange={(e) => updateField("rootdiskcontroller", e.target.value)}>{ROOT_DISK_CONTROLLER_OPTIONS.map((item) => <option key={item.value || "default"} value={item.value}>{item.label}</option>)}</select></label>
+                    <label>NIC Adapter<select value={activeDraft.nicadapter} onChange={(e) => updateField("nicadapter", e.target.value)}>{NIC_ADAPTER_OPTIONS.map((item) => <option key={item.value || "default"} value={item.value}>{item.label}</option>)}</select></label>
+                    <label>Delta Interval (sec)<input type="number" min="1" value={activeDraft.migration.delta_interval} onChange={(e) => updateMigrationField("delta_interval", e.target.value)} /></label>
+                    <label>Finalize At (ISO)<input value={activeDraft.migration.finalize_at} onChange={(e) => updateMigrationField("finalize_at", e.target.value)} placeholder="2026-03-12T23:30:00+00:00" /></label>
+                    <label>Finalize Delta Interval<input type="number" min="1" value={activeDraft.migration.finalize_delta_interval} onChange={(e) => updateMigrationField("finalize_delta_interval", e.target.value)} /></label>
+                    <label>Finalize Window<input type="number" min="1" value={activeDraft.migration.finalize_window} onChange={(e) => updateMigrationField("finalize_window", e.target.value)} /></label>
+                    <label>Shutdown Mode<input value={activeDraft.migration.shutdown_mode} onChange={(e) => updateMigrationField("shutdown_mode", e.target.value)} placeholder="auto" /></label>
+                    <label>Snapshot Quiesce<input value={activeDraft.migration.snapshot_quiesce} onChange={(e) => updateMigrationField("snapshot_quiesce", e.target.value)} placeholder="auto" /></label>
+                    <label className="checkbox-field"><input type="checkbox" checked={Boolean(activeDraft.migration.start_vm_after_import)} onChange={(e) => updateMigrationField("start_vm_after_import", e.target.checked)} />Start imported VM after CloudStack import</label>
+                  </div>
+                </section>
 
-              <DiskTable
-                disks={activeDraft.disks || []}
-                storagePools={storagePoolsForActiveZone}
-                diskOfferings={diskOfferingsForActiveZone}
-                onDiskChange={updateDisk}
-                validationByUnit={activeValidation.diskErrors}
-              />
+                <DiskTable
+                  disks={activeDraft.disks || []}
+                  storagePools={storagePoolsForActiveZone}
+                  diskOfferings={diskOfferingsForActiveZone}
+                  onDiskChange={updateDisk}
+                  validationByUnit={activeValidation.diskErrors}
+                />
 
-              <NicTable
-                nics={activeDraft.nics || []}
-                networks={networksForActiveZone}
-                onNicChange={updateNic}
-                validationByNic={activeValidation.nicErrors}
-              />
+                <NicTable
+                  nics={activeDraft.nics || []}
+                  networks={networksForActiveZone}
+                  onNicChange={updateNic}
+                  validationByNic={activeValidation.nicErrors}
+                />
 
-              <section className="panel">
-                <h3>Selected VM Settings Summary</h3>
-                <p className="hint">Review these values before generating spec or starting migration.</p>
-                <div className="table-wrap">
-                  <table>
-                    <thead>
-                      <tr>
-                        <th>VM</th>
-                        <th>Zone</th>
-                        <th>Cluster</th>
-                        <th>Service Offering</th>
-                        <th>Boot Storage</th>
-                        <th>Imported VM Settings</th>
-                        <th>Delta (sec)</th>
-                        <th>Finalize At</th>
-                        <th>Data Disk Mapping</th>
-                        <th>NIC Mapping</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {selectedSettingsRows.length === 0 ? (
+                <section className="panel">
+                  <div className="panel-header">
+                    <h3>Selected VM Settings Summary</h3>
+                    <p className="hint">Review these values before generating spec or starting migration.</p>
+                  </div>
+                  <div className="table-wrap">
+                    <table>
+                      <thead>
                         <tr>
-                          <td colSpan={10}>No VM selected.</td>
+                          <th>VM</th>
+                          <th>Zone</th>
+                          <th>Cluster</th>
+                          <th>Service Offering</th>
+                          <th>Boot Storage</th>
+                          <th>Imported VM Settings</th>
+                          <th>Delta (sec)</th>
+                          <th>Finalize At</th>
+                          <th>Data Disk Mapping</th>
+                          <th>NIC Mapping</th>
                         </tr>
-                      ) : (
-                        selectedSettingsRows.map((row) => (
-                          <tr key={row.vmName} className={row.vmName === activeVmName ? "selected-row" : ""}>
-                            <td>{row.vmName}</td>
-                            <td>{row.zoneName || "-"}</td>
-                            <td>{row.clusterName || "-"}</td>
-                            <td>{row.serviceOfferingName || "-"}</td>
-                            <td>{row.bootStorageName || "-"}</td>
-                            <td>
-                              <div className="hint small">Guest OS -> {row.osTypeName || "Default / unchanged"}</div>
-                              <div className="hint small">Boot Type -> {row.bootType || "Default"}</div>
-                              {row.bootType === "UEFI" ? <div className="hint small">UEFI Mode -> {row.bootMode || "Default"}</div> : null}
-                              <div className="hint small">Root Disk Controller -> {row.rootDiskController || "Default"}</div>
-                              <div className="hint small">NIC Adapter -> {row.nicAdapter || "Default"}</div>
-                              <div className="hint small">Start VM -> {row.startVmAfterImport ? "Yes" : "No"}</div>
-                            </td>
-                            <td>{row.delta_interval || "-"}</td>
-                            <td>{row.finalize_at || "-"}</td>
-                            <td>
-                              {row.dataDiskDetails.length ? (
-                                row.dataDiskDetails.map((disk) => (
-                                  <div key={`${row.vmName}-disk-${disk.unit}`} className="hint small">{disk.label} -> {disk.storageName}</div>
-                                ))
-                              ) : (
-                                <span className="hint small">No data disks</span>
-                              )}
-                            </td>
-                            <td>
-                              {row.nicDetails.length ? (
-                                row.nicDetails.map((nic) => (
-                                  <div key={`${row.vmName}-nic-${nic.id}`} className="hint small">{nic.label} -> {nic.networkName}</div>
-                                ))
-                              ) : (
-                                <span className="hint small">No NICs</span>
-                              )}
-                            </td>
+                      </thead>
+                      <tbody>
+                        {selectedSettingsRows.length === 0 ? (
+                          <tr>
+                            <td colSpan={10}>No VM selected.</td>
                           </tr>
-                        ))
-                      )}
-                    </tbody>
-                  </table>
-                </div>
-              </section>
+                        ) : (
+                          selectedSettingsRows.map((row) => (
+                            <tr key={row.vmName} className={row.vmName === activeVmName ? "selected-row" : ""}>
+                              <td>{row.vmName}</td>
+                              <td>{row.zoneName || "-"}</td>
+                              <td>{row.clusterName || "-"}</td>
+                              <td>{row.serviceOfferingName || "-"}</td>
+                              <td>{row.bootStorageName || "-"}</td>
+                              <td>
+                                <div className="hint small">Guest OS -> {row.osTypeName || "Default / unchanged"}</div>
+                                <div className="hint small">Boot Type -> {row.bootType || "Default"}</div>
+                                {row.bootType === "UEFI" ? <div className="hint small">UEFI Mode -> {row.bootMode || "Default"}</div> : null}
+                                <div className="hint small">Root Disk Controller -> {row.rootDiskController || "Default"}</div>
+                                <div className="hint small">NIC Adapter -> {row.nicAdapter || "Default"}</div>
+                                <div className="hint small">Start VM -> {row.startVmAfterImport ? "Yes" : "No"}</div>
+                              </td>
+                              <td>{row.delta_interval || "-"}</td>
+                              <td>{row.finalize_at || "-"}</td>
+                              <td>
+                                {row.dataDiskDetails.length ? (
+                                  row.dataDiskDetails.map((disk) => (
+                                    <div key={`${row.vmName}-disk-${disk.unit}`} className="hint small">{disk.label} -> {disk.storageName}</div>
+                                  ))
+                                ) : (
+                                  <span className="hint small">No data disks</span>
+                                )}
+                              </td>
+                              <td>
+                                {row.nicDetails.length ? (
+                                  row.nicDetails.map((nic) => (
+                                    <div key={`${row.vmName}-nic-${nic.id}`} className="hint small">{nic.label} -> {nic.networkName}</div>
+                                  ))
+                                ) : (
+                                  <span className="hint small">No NICs</span>
+                                )}
+                              </td>
+                            </tr>
+                          ))
+                        )}
+                      </tbody>
+                    </table>
+                  </div>
+                </section>
 
+                <section className="panel">
+                  <div className="actions">
+                    <button disabled={busy || selectedVmNames.length === 0} onClick={() => createSpec(false)}>Generate Spec ({selectedVmNames.length})</button>
+                    <button disabled={!canStartMigration} onClick={() => createSpec(true)}>Start Migration ({selectedVmNames.length})</button>
+                  </div>
+                  {!activeValidation.valid ? <p className="field-error">{activeValidation.message}</p> : null}
+                  {lastSpecFile ? <p className="hint">Last generated spec(s):<br /><code className="inline-block">{lastSpecFile}</code></p> : null}
+                </section>
+              </>
+            ) : (
               <section className="panel">
-                <div className="actions">
-                  <button disabled={busy || selectedVmNames.length === 0} onClick={() => createSpec(false)}>Generate Spec ({selectedVmNames.length})</button>
-                  <button disabled={!canStartMigration} onClick={() => createSpec(true)}>Start Migration ({selectedVmNames.length})</button>
-                </div>
-                {!activeValidation.valid ? <p className="field-error">{activeValidation.message}</p> : null}
-                {lastSpecFile ? <p className="hint">Last generated spec(s):<br /><code className="inline-block">{lastSpecFile}</code></p> : null}
+                <p className="hint">Select one or more VMs to define per-VM migration specs.</p>
               </section>
-            </>
-          ) : (
-            <section className="panel">
-              <p className="hint">Select one or more VMs to define per-VM migration specs.</p>
-            </section>
-          )}
-        </>
-      ) : (
-        <MigrationProgress
-          jobs={jobs}
-          statusByJob={statusByJob}
-          showJobHistory={showJobHistory}
-          onToggleShowJobHistory={setShowJobHistory}
-          selectedJobId={selectedJob?.job_id || ""}
-          onSelectJob={(job) => {
-            setSelectedJob(job);
-            loadLogsForJob(job);
-          }}
-          onFinalize={finalizeVm}
-          onFinalizeNow={(vmName) => finalizeVm(vmName, true)}
-          onRetry={retryVm}
-          logsSection={
-            <div className="logs-pane">
-              <div className="subsection-title-row">
-                <h3>Logs</h3>
-                {logsBusy ? <span className="hint">Loading...</span> : null}
+            )}
+          </div>
+        ) : (
+          <MigrationProgress
+            jobs={jobs}
+            statusByJob={statusByJob}
+            showJobHistory={showJobHistory}
+            onToggleShowJobHistory={setShowJobHistory}
+            selectedJobId={selectedJob?.job_id || ""}
+            onSelectJob={(job) => {
+              setSelectedJob(job);
+              loadLogsForJob(job);
+            }}
+            onFinalize={finalizeVm}
+            onFinalizeNow={(vmName) => finalizeVm(vmName, true)}
+            onRetry={retryVm}
+            logsSection={
+              <div className="logs-pane">
+                <div className="subsection-title-row">
+                  <h3>Logs</h3>
+                  {logsBusy ? <span className="hint">Loading...</span> : null}
+                </div>
+                {selectedJob ? <p className="hint">Job <code>{selectedJob.job_id}</code> | VM <strong>{selectedJob.vm_name}</strong></p> : null}
+                <div className="logs-grid">
+                  <div><h4>STDOUT</h4><pre>{logs.stdout || "No stdout logs available."}</pre></div>
+                  <div><h4>STDERR</h4><pre>{logs.stderr || "No stderr logs available."}</pre></div>
+                </div>
+                {selectedVmStatus?.job_error ? <p className="field-error">{selectedVmStatus.job_error}</p> : null}
               </div>
-              {selectedJob ? <p className="hint">Job <code>{selectedJob.job_id}</code> | VM <strong>{selectedJob.vm_name}</strong></p> : null}
-              <div className="logs-grid">
-                <div><h4>STDOUT</h4><pre>{logs.stdout || "No stdout logs available."}</pre></div>
-                <div><h4>STDERR</h4><pre>{logs.stderr || "No stderr logs available."}</pre></div>
-              </div>
-              {selectedVmStatus?.job_error ? <p className="field-error">{selectedVmStatus.job_error}</p> : null}
-            </div>
-          }
-        />
-      )}
+            }
+          />
+        )}
+      </main>
     </div>
   );
 }

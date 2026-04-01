@@ -83,6 +83,40 @@ textarea {
   border-bottom: 1px solid rgba(255, 255, 255, 0.09);
 }
 
+.topbar-left {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+}
+
+.brandmark {
+  width: 24px;
+  height: 24px;
+  flex-shrink: 0;
+}
+
+.brandmark-ring {
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  border: 2px solid #22d3ee;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.brandmark-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #22d3ee;
+}
+
+.topbar-title-block {
+  min-width: 0;
+}
+
 .topbar h1 {
   margin: 0;
   font-size: 1.32rem;
@@ -125,18 +159,20 @@ textarea {
   color: var(--nav-active);
 }
 
-.app-shell > :not(.topbar):not(.toast-stack) {
+.page-shell {
   max-width: 1400px;
-  margin-left: auto;
-  margin-right: auto;
+  margin: 0 auto;
   width: 100%;
-  padding-left: 24px;
-  padding-right: 24px;
+  padding: 18px 24px 42px;
+}
+
+.section-stack {
+  display: grid;
+  gap: 16px;
 }
 
 .panel {
-  margin-top: 16px;
-  margin-bottom: 16px;
+  margin: 0;
   background: var(--panel);
   border: 1px solid var(--line);
   border-radius: var(--radius-lg);
@@ -158,6 +194,18 @@ textarea {
 
 .panel h3 {
   font-size: 1.05rem;
+}
+
+.panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+
+.panel-header p {
+  margin: 0;
 }
 
 button {
@@ -537,7 +585,7 @@ code {
     justify-content: flex-start;
   }
 
-  .app-shell > :not(.topbar):not(.toast-stack) {
+  .page-shell {
     padding-left: 14px;
     padding-right: 14px;
   }

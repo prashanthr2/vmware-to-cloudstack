@@ -32,7 +32,7 @@ export default function MigrationProgress({
 }) {
   return (
     <section className="panel">
-      <div className="subsection-title-row">
+      <div className="panel-header">
         <h2>Migration Progress</h2>
         <label className="checkbox-field">
           <input

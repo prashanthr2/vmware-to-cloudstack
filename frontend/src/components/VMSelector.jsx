@@ -15,7 +15,7 @@ export default function VMSelector({
 }) {
   return (
     <section className="panel">
-      <div className="subsection-title-row">
+      <div className="panel-header">
         <h2>VM Selection</h2>
         <div className="actions compact">
           <label className="checkbox-inline">
@@ -37,6 +37,9 @@ export default function VMSelector({
           </button>
         </div>
       </div>
+      <p className="hint">
+        Selected: <strong>{selectedVmNames.length}</strong> | Inventory: <strong>{vmOptions.length}</strong>
+      </p>
 
       <div className="vm-select-grid">
         {vmOptions.map((vm) => (

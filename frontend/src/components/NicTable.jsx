@@ -5,7 +5,10 @@ function optionLabel(item) {
 export default function NicTable({ nics, networks, onNicChange, validationByNic }) {
   return (
     <section className="panel">
-      <h2>NIC Mapping</h2>
+      <div className="panel-header">
+        <h2>NIC Mapping</h2>
+        <p className="hint">Each source NIC must map to a unique CloudStack network.</p>
+      </div>
       <div className="table-wrap">
         <table>
           <thead>
