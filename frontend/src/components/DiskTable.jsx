@@ -2,17 +2,6 @@ function optionLabel(item) {
   return item.name || item.displaytext || item.id || "Unknown";
 }
 
-function storagePoolLabel(item) {
-  const name = optionLabel(item);
-  const type = String(item?.type || item?.pooltype || item?.storagetype || "").trim();
-  const path = String(item?.path || item?.sourcepath || item?.mountpoint || "").trim();
-  const extras = [];
-  if (type) extras.push(type);
-  if (path) extras.push(path);
-  if (extras.length === 0) return name;
-  return `${name} (${extras.join(" | ")})`;
-}
-
 export default function DiskTable({
   disks,
   storagePools,
@@ -69,7 +58,7 @@ export default function DiskTable({
                           <option value="">Select storage</option>
                           {storagePools.map((item) => (
                             <option key={item.id} value={item.id}>
-                              {storagePoolLabel(item)}
+                              {optionLabel(item)}
                             </option>
                           ))}
                         </select>

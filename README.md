@@ -27,12 +27,11 @@ This design keeps source VM downtime mostly to the final sync + import boundary,
 - Linux host
 - VMware VDDK installed (must include `include/vixDiskLib.h` and `lib64/libvixDiskLib.so*`)
   - Official download: [Broadcom VDDK](https://developer.broadcom.com/sdks/vmware-virtual-disk-development-kit-vddk/latest/)
-- Root/sudo access (required for service install and storage preflight checks)
+- Root/sudo access (required for service install and NFS mount operations)
 - CloudStack API access
 - vCenter credentials
-- CloudStack primary storage support in this release: **NFS** and **Shared Mountpoint**
-- For NFS pools, the migration host must have network-level access and permission to mount the storage backend.
-- For Shared Mountpoint pools, the CloudStack path must already exist on the migration host and point to the correct shared storage.
+- CloudStack primary storage support in this release: **NFS only**
+- The migration host/appliance must have network and mount-level access to the NFS primary storage backends selected in CloudStack
 
 The bootstrap script installs required OS packages (Go, qemu tools, virt-v2v, guestfs, and optional node/npm for UI).
 This project does not redistribute VDDK. Users must obtain VDDK directly from Broadcom and accept Broadcom licensing terms separately.
@@ -206,13 +205,10 @@ Sample references:
 
 Storage behavior:
 
-- NFS pools:
-  - Destination path pattern: `/mnt/<storageid>/<vm>_<vmMoref>_disk<unit>.qcow2`
-  - Engine ensures `/mnt/<storageid>` exists and is mounted before copy.
-  - If not mounted, engine attempts NFS mount using CloudStack storage pool details (`listStoragePools`).
-- Shared Mountpoint pools:
-  - Engine uses the CloudStack path directly as the destination root (no mount/unmount operations).
-  - Mandatory preflight validates path exists, is a directory, is writable, write+delete works, and free-space check is best-effort.
+- Destination path pattern: `/mnt/<storageid>/<vm>_<vmMoref>_disk<unit>.qcow2`
+- Selected CloudStack primary storage is validated as NFS.
+- Engine ensures `/mnt/<storageid>` exists and is mounted before copy.
+- If not mounted, engine attempts NFS mount using CloudStack storage pool details (`listStoragePools`).
 - On Ubuntu hosts, engine-managed NFS mounts use explicit `vers=3` options to avoid QCOW2 flush I/O issues seen with some NFSv4 environments.
   - Optional override: `V2C_NFS_MOUNT_OPTS="<mount-options>"`
 

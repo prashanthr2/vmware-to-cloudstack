@@ -60,33 +60,6 @@ function optionLabel(item) {
   return item.name || item.description || item.displaytext || item.id || "Unknown";
 }
 
-function storagePoolType(item) {
-  return String(item?.type || item?.pooltype || item?.storagetype || "").trim();
-}
-
-function storagePoolPath(item) {
-  return String(item?.path || item?.sourcepath || item?.mountpoint || "").trim();
-}
-
-function isSharedMountpointPoolItem(item) {
-  const t = storagePoolType(item).toLowerCase();
-  if (!t) return false;
-  if (t.includes("networkfilesystem") || t.includes("nfs")) return false;
-  if (t.includes("sharedmountpoint") || t.includes("shared mountpoint") || t.includes("shared_mountpoint")) return true;
-  return t.includes("filesystem");
-}
-
-function storagePoolOptionLabel(item) {
-  const name = optionLabel(item);
-  const type = storagePoolType(item);
-  const path = storagePoolPath(item);
-  const extras = [];
-  if (type) extras.push(type);
-  if (path) extras.push(path);
-  if (extras.length === 0) return name;
-  return `${name} (${extras.join(" | ")})`;
-}
-
 function pickValidOrFirst(currentId, items) {
   if (!items.length) return "";
   return items.some((item) => item.id === currentId) ? currentId : items[0].id;
@@ -530,28 +503,6 @@ export default function App() {
   const networksForActiveZone = useMemo(() => filterByZone(networks, activeZoneID), [networks, activeZoneID]);
   const serviceOfferingsForActiveZone = useMemo(() => filterByZone(serviceOfferings, activeZoneID), [serviceOfferings, activeZoneID]);
   const diskOfferingsForActiveZone = useMemo(() => filterByZone(diskOfferings, activeZoneID), [diskOfferings, activeZoneID]);
-  const sharedMountpointSelectionsForActiveVm = useMemo(() => {
-    if (!activeDraft) return [];
-    const rows = [];
-    const addByStorageID = (storageID, scope) => {
-      const id = String(storageID || "").trim();
-      if (!id) return;
-      const pool = (storagePools || []).find((item) => item.id === id);
-      if (!pool || !isSharedMountpointPoolItem(pool)) return;
-      rows.push({
-        scope,
-        id,
-        name: optionLabel(pool),
-        type: storagePoolType(pool),
-        path: storagePoolPath(pool),
-      });
-    };
-    addByStorageID(activeDraft.boot_storageid, "Boot storage");
-    (activeDraft.disks || [])
-      .filter((disk) => disk.diskType !== "os")
-      .forEach((disk) => addByStorageID(disk.storageid, `${disk.label || `Disk ${disk.unit}`}`));
-    return rows;
-  }, [activeDraft, storagePools]);
 
   const canStartMigration = useMemo(() => {
     if (busy || selectedVmNames.length === 0) return false;
@@ -1066,15 +1017,10 @@ export default function App() {
           const item = items.find((entry) => entry.id === id);
           return item ? optionLabel(item) : id;
         };
-        const resolveStorageName = (id) => {
-          if (!id) return "-";
-          const item = storagePools.find((entry) => entry.id === id);
-          return item ? storagePoolOptionLabel(item) : id;
-        };
         const dataDiskDetails = dataDisks.map((disk) => ({
           unit: disk.unit,
           label: disk.label || `Disk ${disk.unit}`,
-          storageName: resolveStorageName(disk.storageid),
+          storageName: resolveName(storagePools, disk.storageid),
         }));
         const nicDetails = nics.map((nic, index) => ({
           id: nic.id || String(index),
@@ -1086,7 +1032,7 @@ export default function App() {
           zoneName: resolveName(zones, draft?.zoneid || ""),
           clusterName: resolveName(clusters, draft?.clusterid || ""),
           serviceOfferingName: resolveName(serviceOfferings, draft?.serviceofferingid || ""),
-          bootStorageName: resolveStorageName(draft?.boot_storageid || ""),
+          bootStorageName: resolveName(storagePools, draft?.boot_storageid || ""),
           osTypeName: resolveName(osTypes, draft?.ostypeid || ""),
           bootType: draft?.boottype || "",
           bootMode: draft?.boottype === "UEFI" ? draft?.bootmode || "" : "",
@@ -1155,7 +1101,7 @@ export default function App() {
                   <label>Zone<select value={activeDraft.zoneid} onChange={(e) => updateField("zoneid", e.target.value)}><option value="">Select zone</option>{zones.map((item) => <option key={item.id} value={item.id}>{optionLabel(item)}</option>)}</select></label>
                   <label>Cluster<select value={activeDraft.clusterid} onChange={(e) => updateField("clusterid", e.target.value)}><option value="">Select cluster</option>{clustersForActiveZone.map((item) => <option key={item.id} value={item.id}>{optionLabel(item)}</option>)}</select></label>
                   <label>Service Offering<select value={activeDraft.serviceofferingid} onChange={(e) => updateField("serviceofferingid", e.target.value)}><option value="">Select service offering</option>{serviceOfferingsForActiveZone.map((item) => <option key={item.id} value={item.id}>{optionLabel(item)}</option>)}</select></label>
-                  <label>Boot Storage<select value={activeDraft.boot_storageid} onChange={(e) => updateField("boot_storageid", e.target.value)}><option value="">Select boot storage</option>{storagePoolsForActiveZone.map((item) => <option key={item.id} value={item.id}>{storagePoolOptionLabel(item)}</option>)}</select></label>
+                  <label>Boot Storage<select value={activeDraft.boot_storageid} onChange={(e) => updateField("boot_storageid", e.target.value)}><option value="">Select boot storage</option>{storagePoolsForActiveZone.map((item) => <option key={item.id} value={item.id}>{optionLabel(item)}</option>)}</select></label>
                   <label>Guest OS Mapping<select value={activeDraft.ostypeid} onChange={(e) => updateField("ostypeid", e.target.value)}><option value="">Default / leave unchanged</option>{osTypes.map((item) => <option key={item.id} value={item.id}>{item.description || item.name || item.id}</option>)}</select></label>
                   <label>Firmware / Boot Type<select value={activeDraft.boottype} onChange={(e) => updateField("boottype", e.target.value)}>{BOOT_TYPE_OPTIONS.map((item) => <option key={item.value || "default"} value={item.value}>{item.label}</option>)}</select></label>
                   <label>UEFI Boot Mode<select value={activeDraft.bootmode} onChange={(e) => updateField("bootmode", e.target.value)} disabled={activeDraft.boottype !== "UEFI"}>{UEFI_BOOT_MODE_OPTIONS.map((item) => <option key={item.value || "default"} value={item.value}>{item.label}</option>)}</select></label>
@@ -1169,22 +1115,6 @@ export default function App() {
                   <label>Snapshot Quiesce<input value={activeDraft.migration.snapshot_quiesce} onChange={(e) => updateMigrationField("snapshot_quiesce", e.target.value)} placeholder="auto" /></label>
                   <label className="checkbox-field"><input type="checkbox" checked={Boolean(activeDraft.migration.start_vm_after_import)} onChange={(e) => updateMigrationField("start_vm_after_import", e.target.checked)} />Start imported VM after CloudStack import</label>
                 </div>
-                {sharedMountpointSelectionsForActiveVm.length > 0 ? (
-                  <div className="storage-warning">
-                    <h4>Shared Mountpoint Storage Selected</h4>
-                    <p className="field-error">
-                      The selected path must exist on this migration host, point to the correct shared storage, and be accessible from all hosts in the target cluster. Migration fails if incorrect.
-                    </p>
-                    {sharedMountpointSelectionsForActiveVm.map((entry, idx) => (
-                      <div key={`${entry.id}-${entry.scope}-${idx}`} className="hint small">
-                        {entry.scope} -> {entry.name} [{entry.type || "Shared Mountpoint"}] path: {entry.path || "(missing)"}
-                      </div>
-                    ))}
-                    <p className="hint small">
-                      Important: this path must be truly shared across all hosts. If it is local-only, migration may appear successful but the VM can fail later.
-                    </p>
-                  </div>
-                ) : null}
               </section>
 
               <DiskTable

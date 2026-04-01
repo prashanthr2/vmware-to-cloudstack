@@ -502,12 +502,12 @@ func (s *apiServer) handleCloudStackList(w http.ResponseWriter, r *http.Request,
 		return
 	}
 	if command == "listStoragePools" {
-		items = filterSupportedUpStoragePools(items)
+		items = filterNFSUpStoragePools(items)
 	}
 	writeJSON(w, http.StatusOK, items)
 }
 
-func filterSupportedUpStoragePools(items []any) []any {
+func filterNFSUpStoragePools(items []any) []any {
 	out := make([]any, 0, len(items))
 	for _, item := range items {
 		m, ok := item.(map[string]any)
@@ -515,24 +515,14 @@ func filterSupportedUpStoragePools(items []any) []any {
 			continue
 		}
 		info := storagePoolInfoFromMap(m)
-		if !isNFSStoragePool(info) && !isSharedMountpointStoragePool(info) {
+		if !isNFSStoragePool(info) {
 			continue
 		}
 		state := strings.TrimSpace(firstNonEmptyString(mapGetString(m, "state"), mapGetString(m, "status")))
 		if !strings.EqualFold(state, "Up") {
 			continue
 		}
-		normalized := map[string]any{}
-		for k, v := range m {
-			normalized[k] = v
-		}
-		if strings.TrimSpace(mapGetString(normalized, "type")) == "" && strings.TrimSpace(info.PoolType) != "" {
-			normalized["type"] = info.PoolType
-		}
-		if strings.TrimSpace(mapGetString(normalized, "path")) == "" && strings.TrimSpace(info.Path) != "" {
-			normalized["path"] = info.Path
-		}
-		out = append(out, normalized)
+		out = append(out, item)
 	}
 	return out
 }
