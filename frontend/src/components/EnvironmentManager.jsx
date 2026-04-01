@@ -149,8 +149,10 @@ export default function EnvironmentManager({ envState, onChange, onToast }) {
 
   return (
     <section className="panel">
-      <h2>Environment Manager</h2>
-      <p className="hint">Profiles are stored locally in this browser.</p>
+      <div className="panel-header">
+        <h2>Environment Manager</h2>
+        <p className="hint">Profiles are stored locally in this browser.</p>
+      </div>
 
       <div className="env-grid">
         <div className="env-card">

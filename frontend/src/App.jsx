@@ -1200,11 +1200,18 @@ export default function App() {
   return (
     <div className="app-shell">
       <header className="topbar">
-        <div>
-          <h1>VMware to CloudStack Migrator</h1>
-          <p>Select multiple VMs, define per-VM disk and NIC mappings, and run migrations in parallel.</p>
+        <div className="topbar-left">
+          <div className="brandmark" aria-hidden>
+            <div className="brandmark-ring">
+              <div className="brandmark-dot" />
+            </div>
+          </div>
+          <div className="topbar-title-block">
+            <h1>VMware to CloudStack Migrator</h1>
+            <p>Select multiple VMs, define per-VM disk and NIC mappings, and run migrations in parallel.</p>
+          </div>
         </div>
-        <div className="tab-buttons">
+        <div className="tab-buttons" role="tablist" aria-label="Main Views">
           <button className={tab === "new" ? "active" : ""} onClick={() => setTab("new")}>New Migration</button>
           <button className={tab === "progress" ? "active" : ""} onClick={() => setTab("progress")}>Progress</button>
         </div>
@@ -1216,8 +1223,9 @@ export default function App() {
         ))}
       </div>
 
-      {tab === "new" ? (
-        <>
+      <main className="page-shell">
+        {tab === "new" ? (
+          <div className="section-stack">
           <EnvironmentManager envState={envState} onChange={setEnvState} onToast={pushToast} />
 
           <VMSelector
@@ -1236,15 +1244,15 @@ export default function App() {
             loading={vmDisksLoading}
           />
 
-          {activeDraft ? (
-            <>
-              <section className="panel">
-                <div className="subsection-title-row">
-                  <h2>Target and Strategy ({activeDraft.vm_name})</h2>
-                  <button className="secondary" onClick={loadInventory} disabled={inventoryBusy}>
-                    {inventoryBusy ? "Loading..." : "Reload Inventory"}
-                  </button>
-                </div>
+            {activeDraft ? (
+              <>
+                <section className="panel">
+                  <div className="panel-header">
+                    <h2>Target and Strategy ({activeDraft.vm_name})</h2>
+                    <button className="secondary" onClick={loadInventory} disabled={inventoryBusy}>
+                      {inventoryBusy ? "Loading..." : "Reload Inventory"}
+                    </button>
+                  </div>
                 <div className="form-grid">
                   <label>VM MoRef<input value={activeDraft.vm_moref} onChange={(e) => updateField("vm_moref", e.target.value)} placeholder="vm-123" /></label>
                   <label>Zone<select value={activeDraft.zoneid} onChange={(e) => updateField("zoneid", e.target.value)}><option value="">Select zone</option>{zones.map((item) => <option key={item.id} value={item.id}>{optionLabel(item)}</option>)}</select></label>
@@ -1306,8 +1314,10 @@ export default function App() {
               />
 
               <section className="panel">
-                <h3>Selected VM Settings Summary</h3>
-                <p className="hint">Review these values before generating spec or starting migration.</p>
+                <div className="panel-header">
+                  <h3>Selected VM Settings Summary</h3>
+                  <p className="hint">Review these values before generating spec or starting migration.</p>
+                </div>
                 <div className="table-wrap">
                   <table>
                     <thead>
@@ -1384,45 +1394,46 @@ export default function App() {
                 {lastSpecFile ? <p className="hint">Last generated spec(s):<br /><code className="inline-block">{lastSpecFile}</code></p> : null}
               </section>
             </>
-          ) : (
-            <section className="panel">
-              <p className="hint">Select one or more VMs to define per-VM migration specs.</p>
-            </section>
-          )}
-        </>
-      ) : (
-        <MigrationProgress
-          jobs={jobs}
-          statusByJob={statusByJob}
-          showJobHistory={showJobHistory}
-          onToggleShowJobHistory={setShowJobHistory}
-          selectedJobId={selectedJob?.job_id || ""}
-          onSelectJob={(job) => {
-            setSelectedJob(job);
-            loadLogsForJob(job);
-          }}
-          onFinalize={finalizeVm}
-          onFinalizeNow={(vmName) => finalizeVm(vmName, true)}
-          onShutdownForce={(vmName) => shutdownVm(vmName, "force")}
-          onShutdownManual={(vmName) => shutdownVm(vmName, "manual")}
-          onRetry={retryVm}
-          logsSection={
-            <div className="logs-pane">
-              <div className="subsection-title-row">
-                <h3>Logs</h3>
-                {logsBusy ? <span className="hint">Loading...</span> : null}
+            ) : (
+              <section className="panel">
+                <p className="hint">Select one or more VMs to define per-VM migration specs.</p>
+              </section>
+            )}
+          </div>
+        ) : (
+          <MigrationProgress
+            jobs={jobs}
+            statusByJob={statusByJob}
+            showJobHistory={showJobHistory}
+            onToggleShowJobHistory={setShowJobHistory}
+            selectedJobId={selectedJob?.job_id || ""}
+            onSelectJob={(job) => {
+              setSelectedJob(job);
+              loadLogsForJob(job);
+            }}
+            onFinalize={finalizeVm}
+            onFinalizeNow={(vmName) => finalizeVm(vmName, true)}
+            onShutdownForce={(vmName) => shutdownVm(vmName, "force")}
+            onShutdownManual={(vmName) => shutdownVm(vmName, "manual")}
+            onRetry={retryVm}
+            logsSection={
+              <div className="logs-pane">
+                <div className="subsection-title-row">
+                  <h3>Logs</h3>
+                  {logsBusy ? <span className="hint">Loading...</span> : null}
+                </div>
+                {selectedJob ? <p className="hint">Job <code>{selectedJob.job_id}</code> | VM <strong>{selectedJob.vm_name}</strong></p> : null}
+                <div className="logs-grid">
+                  <div><h4>STDOUT</h4><pre>{logs.stdout || "No stdout logs available."}</pre></div>
+                  <div><h4>STDERR</h4><pre>{logs.stderr || "No stderr logs available."}</pre></div>
+                </div>
+                {selectedVmStatus?.shutdown_reason ? <p className="field-error">{selectedVmStatus.shutdown_reason}</p> : null}
+                {selectedVmStatus?.job_error ? <p className="field-error">{selectedVmStatus.job_error}</p> : null}
               </div>
-              {selectedJob ? <p className="hint">Job <code>{selectedJob.job_id}</code> | VM <strong>{selectedJob.vm_name}</strong></p> : null}
-              <div className="logs-grid">
-                <div><h4>STDOUT</h4><pre>{logs.stdout || "No stdout logs available."}</pre></div>
-                <div><h4>STDERR</h4><pre>{logs.stderr || "No stderr logs available."}</pre></div>
-              </div>
-              {selectedVmStatus?.shutdown_reason ? <p className="field-error">{selectedVmStatus.shutdown_reason}</p> : null}
-              {selectedVmStatus?.job_error ? <p className="field-error">{selectedVmStatus.job_error}</p> : null}
-            </div>
-          }
-        />
-      )}
+            }
+          />
+        )}
+      </main>
     </div>
   );
 }

@@ -11,7 +11,10 @@ export default function DiskTable({
 }) {
   return (
     <section className="panel">
-      <h2>Detected Disks</h2>
+      <div className="panel-header">
+        <h2>Detected Disks</h2>
+        <p className="hint">Boot disk inherits selected boot storage and service offering behavior.</p>
+      </div>
       <div className="table-wrap">
         <table>
           <thead>
