@@ -54,7 +54,7 @@ command_exists() { command -v "$1" >/dev/null 2>&1; }
 
 install_dnf_packages() {
   local base=(gcc make git tar curl ca-certificates golang)
-  local tools=(qemu-img qemu-kvm-core virt-v2v libguestfs-tools-c)
+  local tools=(qemu-img qemu-kvm-core virt-v2v libguestfs-tools-c libguestfs-winsupport)
   local ui=(nodejs npm)
   run_root dnf -y makecache
   run_root dnf -y install "${base[@]}"
@@ -71,7 +71,7 @@ install_dnf_packages() {
 
 install_apt_packages() {
   local base=(build-essential git tar curl ca-certificates golang-go)
-  local tools=(qemu-utils qemu-system-x86 virt-v2v libguestfs-tools)
+  local tools=(qemu-utils qemu-system-x86 virt-v2v libguestfs-tools libguestfs-winsupport)
   local ui=(nodejs npm)
   run_root apt-get update
   run_root apt-get install -y "${base[@]}"

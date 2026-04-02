@@ -811,11 +811,24 @@ func runVirtV2VInPlace(paths []string, virtioISO string) error {
 		err := cmd.Run()
 		return buf.String(), err
 	}
+	wrapV2VErr := func(runErr error, out string) error {
+		if runErr == nil {
+			return nil
+		}
+		msg := strings.ToLower(out)
+		if strings.Contains(msg, "rhsrvany.exe") || strings.Contains(msg, "pvvxsvc.exe") {
+			return fmt.Errorf(
+				"virt-v2v-in-place host is missing Windows helper files (rhsrvany.exe/pvvxsvc.exe under /usr/share/virt-tools). Install libguestfs-winsupport (or distro equivalent) and retry: %w",
+				runErr,
+			)
+		}
+		return runErr
+	}
 
 	baseArgs := append([]string{"-i", "disk"}, paths...)
 	if strings.TrimSpace(virtioISO) == "" {
-		_, err := runCmd(baseArgs)
-		return err
+		out, err := runCmd(baseArgs)
+		return wrapV2VErr(err, out)
 	}
 
 	withInject := append(append([]string{}, baseArgs...), "--inject-virtio-win", virtioISO)
@@ -831,10 +844,10 @@ func runVirtV2VInPlace(paths []string, virtioISO string) error {
 			os.Stderr,
 			"[virt-v2v] warning: --inject-virtio-win unsupported by this virt-v2v-in-place version, retrying without it\n",
 		)
-		_, retryErr := runCmd(baseArgs)
-		return retryErr
+		retryOut, retryErr := runCmd(baseArgs)
+		return wrapV2VErr(retryErr, retryOut)
 	}
-	return err
+	return wrapV2VErr(err, out)
 }
 
 func resolveVirtV2VInPlacePath() (string, error) {
