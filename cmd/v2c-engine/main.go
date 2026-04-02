@@ -4712,16 +4712,20 @@ func runVMWorkflow(ctx context.Context, cfg *appConfig, spec *runSpec, opts runO
 				ds := st.Disks[unitKey]
 				prevChangeID := ""
 				targetQCOW2 := ""
-				// Delta data must be read from the current snapshot's backing path.
-				// Using an older persisted path can read stale blocks even when CBT
-				// correctly reports changed ranges.
-				sourcePath := strings.TrimSpace(meta.Path)
+				// Prefer the VM disk's stable backing path for VDDK reads.
+				// Snapshot child VMDK paths (eg: *-0000xx.vmdk) can be transient
+				// and may fail to open with VDDK in some environments.
+				stableSourcePath := strings.TrimSpace(d.SourcePath)
 				if ds != nil {
 					prevChangeID = ds.ChangeID
 					targetQCOW2 = ds.TargetQCOW2
-					if sourcePath == "" && strings.TrimSpace(ds.SourceDiskPath) != "" {
-						sourcePath = strings.TrimSpace(ds.SourceDiskPath)
+					if stableSourcePath == "" && strings.TrimSpace(ds.SourceDiskPath) != "" {
+						stableSourcePath = strings.TrimSpace(ds.SourceDiskPath)
 					}
+				}
+				sourcePath := stableSourcePath
+				if sourcePath == "" {
+					sourcePath = strings.TrimSpace(meta.Path)
 				}
 				stateMu.Unlock()
 				if ds == nil {
@@ -4741,9 +4745,6 @@ func runVMWorkflow(ctx context.Context, cfg *appConfig, spec *runSpec, opts runO
 					}
 					errMu.Unlock()
 					return
-				}
-				if sourcePath == "" {
-					sourcePath = strings.TrimSpace(d.SourcePath)
 				}
 				if sourcePath == "" {
 					errMu.Lock()
@@ -4773,12 +4774,13 @@ func runVMWorkflow(ctx context.Context, cfg *appConfig, spec *runSpec, opts runO
 					return
 				}
 				log.Printf(
-					"[disk%d] %s cbt ranges=%d changed_bytes=%d source=%s",
+					"[disk%d] %s cbt ranges=%d changed_bytes=%d source=%s snapshot_path=%s",
 					d.Unit,
 					stageName,
 					len(ranges),
 					changedBytes(ranges),
 					sourcePath,
+					meta.Path,
 				)
 				if len(ranges) > 0 {
 					rangesPath, err := writeRangesTempFile(ranges, d.Unit)
@@ -4827,7 +4829,11 @@ func runVMWorkflow(ctx context.Context, cfg *appConfig, spec *runSpec, opts runO
 				stateMu.Lock()
 				ds = st.Disks[unitKey]
 				ds.ChangeID = meta.ChangeID
-				ds.SourceDiskPath = sourcePath
+				if stableSourcePath != "" {
+					ds.SourceDiskPath = stableSourcePath
+				} else {
+					ds.SourceDiskPath = sourcePath
+				}
 				ds.Stage = stageName
 				ds.Progress = 100
 				ds.EtaSeconds = 0
