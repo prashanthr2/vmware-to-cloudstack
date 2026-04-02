@@ -4285,6 +4285,14 @@ func runVMWorkflow(ctx context.Context, cfg *appConfig, spec *runSpec, opts runO
 	}); err != nil {
 		return err
 	}
+	log.Printf("Discovered VMware disks: count=%d boot_unit=%d", len(disks), bootUnit)
+	for _, d := range disks {
+		backing := strings.TrimSpace(d.SourcePath)
+		if backing == "" {
+			backing = "<empty>"
+		}
+		log.Printf("[pre-snapshot][disk%d] key=%d vm_backing=%s capacity_bytes=%d", d.Unit, d.Key, backing, d.Capacity)
+	}
 
 	readers := spec.Migration.Readers
 	if readers <= 0 {
