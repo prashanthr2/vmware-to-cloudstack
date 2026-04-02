@@ -4720,16 +4720,17 @@ func runVMWorkflow(ctx context.Context, cfg *appConfig, spec *runSpec, opts runO
 				ds := st.Disks[unitKey]
 				prevChangeID := ""
 				targetQCOW2 := ""
-				// Prefer the VM disk's stable backing path for VDDK reads.
-				// Snapshot child VMDK paths (eg: *-0000xx.vmdk) can be transient
-				// and may fail to open with VDDK in some environments.
-				stableSourcePath := strings.TrimSpace(d.SourcePath)
+				// Prefer persisted disk source path from successful prior copy/sync.
+				// This avoids drifting to newer snapshot-child filenames between
+				// rounds (eg: *-0000xx.vmdk), which can be transient and fail open.
+				stableSourcePath := ""
 				if ds != nil {
 					prevChangeID = ds.ChangeID
 					targetQCOW2 = ds.TargetQCOW2
-					if stableSourcePath == "" && strings.TrimSpace(ds.SourceDiskPath) != "" {
-						stableSourcePath = strings.TrimSpace(ds.SourceDiskPath)
-					}
+					stableSourcePath = strings.TrimSpace(ds.SourceDiskPath)
+				}
+				if stableSourcePath == "" {
+					stableSourcePath = strings.TrimSpace(d.SourcePath)
 				}
 				sourcePath := stableSourcePath
 				if sourcePath == "" {
@@ -4837,9 +4838,7 @@ func runVMWorkflow(ctx context.Context, cfg *appConfig, spec *runSpec, opts runO
 				stateMu.Lock()
 				ds = st.Disks[unitKey]
 				ds.ChangeID = meta.ChangeID
-				if stableSourcePath != "" {
-					ds.SourceDiskPath = stableSourcePath
-				} else {
+				if strings.TrimSpace(ds.SourceDiskPath) == "" {
 					ds.SourceDiskPath = sourcePath
 				}
 				ds.Stage = stageName
