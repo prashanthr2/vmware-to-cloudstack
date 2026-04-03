@@ -943,6 +943,27 @@ func runVirtV2VInPlace(plan virtV2VPlan, virtioISO string) error {
 		return wrapV2VErr(err, out)
 	}
 
+	supportsInject, detectErr := virtV2VSupportsInjectVirtioWin(v2vPath)
+	if detectErr != nil {
+		fmt.Fprintf(
+			os.Stderr,
+			"[virt-v2v] warning: could not detect --inject-virtio-win support for %s, running without it: %v\n",
+			v2vPath,
+			detectErr,
+		)
+		out, err := runCmd(baseArgs)
+		return wrapV2VErr(err, out)
+	}
+	if !supportsInject {
+		fmt.Fprintf(
+			os.Stderr,
+			"[virt-v2v] info: %s does not support --inject-virtio-win, running without it\n",
+			v2vPath,
+		)
+		out, err := runCmd(baseArgs)
+		return wrapV2VErr(err, out)
+	}
+
 	withInject := append(append([]string{}, baseArgs...), "--inject-virtio-win", virtioISO)
 	out, err := runCmd(withInject)
 	if err == nil {
@@ -990,6 +1011,16 @@ func resolveVirtV2VInPlacePath() (string, error) {
 	return "", fmt.Errorf(
 		"virt-v2v-in-place not found in PATH and not present at known locations (/usr/libexec/virt-v2v-in-place, /usr/bin/virt-v2v-in-place)",
 	)
+}
+
+func virtV2VSupportsInjectVirtioWin(v2vPath string) (bool, error) {
+	cmd := exec.Command(v2vPath, "--help")
+	cmd.Env = sanitizedChildEnv()
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return false, fmt.Errorf("help probe failed: %w", err)
+	}
+	return strings.Contains(string(out), "--inject-virtio-win"), nil
 }
 
 func isExecutableFile(path string) bool {
