@@ -938,7 +938,7 @@ func runVirtV2VInPlace(plan virtV2VPlan, virtioISO string) error {
 		return runErr
 	}
 
-	if strings.TrimSpace(virtioISO) == "" {
+	if !plan.IsWindows || strings.TrimSpace(virtioISO) == "" {
 		out, err := runCmd(baseArgs)
 		return wrapV2VErr(err, out)
 	}
