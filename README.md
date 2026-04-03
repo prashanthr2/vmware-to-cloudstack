@@ -10,7 +10,7 @@ How warm migration is achieved:
 
 - A base snapshot is taken and copied to QCOW2 on CloudStack primary storage.
 - Incremental delta rounds are continuously synced using VMware CBT (`QueryChangedDiskAreas`).
-- At cutover (`Finalize`/`Finalize Now`/`finalize_at`), the source VM is shut down, one final delta sync is applied, then import is completed.
+- At cutover (`Finalize`/`Finalize Now`/`finalize_at`), the source VM is shut down, a short settle delay is applied, one final delta sync is performed, then import is completed.
 
 This design keeps source VM downtime mostly to the final sync + import boundary, not the full disk copy duration.
 
@@ -18,7 +18,7 @@ This design keeps source VM downtime mostly to the final sync + import boundary,
 
 - Disk copy path: VMware VDDK -> direct QCOW2 writes (no RAW intermediate).
 - Delta path: CBT ranges -> direct QCOW2 updates.
-- Conversion path: optional `virt-v2v-in-place` after final sync, passing the boot disk first and all remaining VM disks so multi-disk guests convert correctly.
+- Conversion path: optional `virt-v2v-in-place` after final sync. Single-disk guests use boot-disk-only conversion; multi-disk guests are inspected and can switch to `libvirtxml` mode when the OS spans multiple disks.
 - State machine + resume: per-VM runtime state under `/var/lib/vm-migrator/<vm>_<moref>/`.
 - Control actions: `Finalize` and `Finalize Now` markers, plus CLI/API/UI triggers.
 
@@ -219,8 +219,8 @@ At a high level, each VM migration follows this model:
 1. The engine connects to vCenter, finds the VM, verifies disks/NICs, and ensures CBT is enabled.
 2. It creates a base snapshot and copies each VMware disk directly into QCOW2 on the selected CloudStack primary storage mount.
 3. It enters delta mode and repeatedly uses VMware CBT to fetch only changed blocks since the previous snapshot.
-4. When finalize is requested, or when `finalize_at` time is reached, the engine shuts down the source VM according to policy and performs one final delta sync.
-5. If enabled, it runs `virt-v2v-in-place` on the boot QCOW2 plus any additional VM disks.
+4. When finalize is requested, or when `finalize_at` time is reached, the engine shuts down the source VM according to policy, waits a short settle delay, and performs one final delta sync.
+5. If enabled, it runs `virt-v2v-in-place` using either boot-disk-only mode or temporary `libvirtxml` mode depending on detected guest disk layout.
 6. It imports the root disk into CloudStack, then imports and attaches data disks, and finally attaches additional NICs.
 
 Important behavior:
@@ -281,6 +281,13 @@ Parameters:
   - Unit: seconds.
   - Default: `600`
   - If current time is within `finalize_window` seconds of `finalize_at`, the engine reduces the sleep interval to `finalize_delta_interval`.
+- `finalize_settle_seconds`
+  - Optional.
+  - Unit: seconds.
+  - Delay after source VM shutdown/power-off and before the final snapshot is taken.
+  - Default if omitted/`0`:
+    - Windows guests: `30`
+    - Linux/other guests: `15`
 
 Behavior:
 
@@ -289,7 +296,7 @@ Behavior:
   - `delta_interval` normally
   - `finalize_delta_interval` once the engine is inside the finalize window
 - Once the current time passes `finalize_at`, the engine treats that as a finalize request.
-- It then powers off the source VM according to `shutdown_mode`, performs `final_sync`, and continues import.
+- It then powers off the source VM according to `shutdown_mode`, waits `finalize_settle_seconds`, performs `final_sync`, and continues import.
 
 Example:
 
@@ -298,6 +305,7 @@ migration:
   delta_interval: 300
   finalize_at: "2026-03-12T23:30:00+00:00"
   finalize_delta_interval: 30
+  finalize_settle_seconds: 30
   finalize_window: 600
 ```
 
@@ -322,6 +330,7 @@ Behavior:
 - `Finalize Now` requests immediate cutover from the delta loop wait:
   - it interrupts delta sleep and moves to `final_sync` as soon as possible.
   - if currently in `base_copy`, base copy still completes first, then workflow moves directly into finalization path.
+- During finalization, the engine waits a short settle delay after shutdown before taking the final snapshot.
 - Both requests are idempotent.
 - If VM is already complete, finalize calls return success with completion status.
 

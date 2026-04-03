@@ -31,6 +31,14 @@ migration:
   shutdown_mode: auto
 
   # OPTIONAL:
+  # Delay in seconds after source VM shutdown/power-off and before the final snapshot is taken.
+  # Useful for Windows guests so pending writes settle before final_sync / virt-v2v.
+  # Default behavior if omitted/0:
+  # - Windows guests: 30 seconds
+  # - Linux/other guests: 15 seconds
+  finalize_settle_seconds: 0
+
+  # OPTIONAL:
   # Default max disks processed in parallel within one VM.
   # Default behavior in code if omitted/0: 4
   parallel_disks: 4

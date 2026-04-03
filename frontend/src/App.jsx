@@ -22,6 +22,7 @@ const DEFAULT_MIGRATION = {
   delta_interval: 300,
   finalize_at: "",
   finalize_delta_interval: "",
+  finalize_settle_seconds: "",
   finalize_window: "",
   shutdown_mode: "",
   snapshot_quiesce: "",
@@ -85,6 +86,7 @@ function normalizeMigration(input = {}) {
     delta_interval: input.delta_interval ?? DEFAULT_MIGRATION.delta_interval,
     finalize_at: input.finalize_at ?? DEFAULT_MIGRATION.finalize_at,
     finalize_delta_interval: input.finalize_delta_interval ?? DEFAULT_MIGRATION.finalize_delta_interval,
+    finalize_settle_seconds: input.finalize_settle_seconds ?? DEFAULT_MIGRATION.finalize_settle_seconds,
     finalize_window: input.finalize_window ?? DEFAULT_MIGRATION.finalize_window,
     shutdown_mode: input.shutdown_mode ?? DEFAULT_MIGRATION.shutdown_mode,
     snapshot_quiesce: input.snapshot_quiesce ?? DEFAULT_MIGRATION.snapshot_quiesce,
@@ -881,6 +883,7 @@ export default function App() {
     };
     if (draft.migration?.finalize_at) migration.finalize_at = draft.migration.finalize_at;
     if (draft.migration?.finalize_delta_interval) migration.finalize_delta_interval = Number(draft.migration.finalize_delta_interval);
+    if (draft.migration?.finalize_settle_seconds) migration.finalize_settle_seconds = Number(draft.migration.finalize_settle_seconds);
     if (draft.migration?.finalize_window) migration.finalize_window = Number(draft.migration.finalize_window);
     if (draft.migration?.shutdown_mode) migration.shutdown_mode = draft.migration.shutdown_mode;
     if (draft.migration?.snapshot_quiesce) migration.snapshot_quiesce = draft.migration.snapshot_quiesce;
@@ -1041,6 +1044,7 @@ export default function App() {
           startVmAfterImport: Boolean(draft?.migration?.start_vm_after_import),
           delta_interval: draft?.migration?.delta_interval || "",
           finalize_at: draft?.migration?.finalize_at || "",
+          finalize_settle_seconds: draft?.migration?.finalize_settle_seconds || "",
           dataDiskDetails,
           nicDetails,
         };
@@ -1110,6 +1114,7 @@ export default function App() {
                   <label>Delta Interval (sec)<input type="number" min="1" value={activeDraft.migration.delta_interval} onChange={(e) => updateMigrationField("delta_interval", e.target.value)} /></label>
                   <label>Finalize At (ISO)<input value={activeDraft.migration.finalize_at} onChange={(e) => updateMigrationField("finalize_at", e.target.value)} placeholder="2026-03-12T23:30:00+00:00" /></label>
                   <label>Finalize Delta Interval<input type="number" min="1" value={activeDraft.migration.finalize_delta_interval} onChange={(e) => updateMigrationField("finalize_delta_interval", e.target.value)} /></label>
+                  <label>Finalize Settle Delay (sec)<input type="number" min="1" value={activeDraft.migration.finalize_settle_seconds} onChange={(e) => updateMigrationField("finalize_settle_seconds", e.target.value)} placeholder="Default: 30 Windows / 15 Linux" /></label>
                   <label>Finalize Window<input type="number" min="1" value={activeDraft.migration.finalize_window} onChange={(e) => updateMigrationField("finalize_window", e.target.value)} /></label>
                   <label>Shutdown Mode<input value={activeDraft.migration.shutdown_mode} onChange={(e) => updateMigrationField("shutdown_mode", e.target.value)} placeholder="auto" /></label>
                   <label>Snapshot Quiesce<input value={activeDraft.migration.snapshot_quiesce} onChange={(e) => updateMigrationField("snapshot_quiesce", e.target.value)} placeholder="auto" /></label>
@@ -1147,6 +1152,7 @@ export default function App() {
                         <th>Imported VM Settings</th>
                         <th>Delta (sec)</th>
                         <th>Finalize At</th>
+                        <th>Finalize Settle (sec)</th>
                         <th>Data Disk Mapping</th>
                         <th>NIC Mapping</th>
                       </tr>
@@ -1154,7 +1160,7 @@ export default function App() {
                     <tbody>
                       {selectedSettingsRows.length === 0 ? (
                         <tr>
-                          <td colSpan={10}>No VM selected.</td>
+                          <td colSpan={11}>No VM selected.</td>
                         </tr>
                       ) : (
                         selectedSettingsRows.map((row) => (
@@ -1174,6 +1180,7 @@ export default function App() {
                             </td>
                             <td>{row.delta_interval || "-"}</td>
                             <td>{row.finalize_at || "-"}</td>
+                            <td>{row.finalize_settle_seconds || "auto"}</td>
                             <td>
                               {row.dataDiskDetails.length ? (
                                 row.dataDiskDetails.map((disk) => (

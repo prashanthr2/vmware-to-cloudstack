@@ -42,6 +42,9 @@ migration:
   # Working directory for API-launched run jobs. Must exist.
   workdir: /var/lib/vm-migrator
   shutdown_mode: auto # auto | force | manual
+  # Optional final settle delay before taking the final snapshot after shutdown.
+  # If omitted/0, the engine defaults to 30s for Windows guests and 15s for Linux/other guests.
+  finalize_settle_seconds: 0
   parallel_disks: 4
   parallel_vms: 3
 

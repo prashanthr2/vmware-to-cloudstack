@@ -1453,6 +1453,7 @@ type appConfig struct {
 		VDDKPath        string `yaml:"vddk_path"`
 		SnapshotQuiesce string `yaml:"snapshot_quiesce"`
 		ShutdownMode    string `yaml:"shutdown_mode"`
+		FinalizeSettleSeconds int `yaml:"finalize_settle_seconds"`
 		ParallelDisks   int    `yaml:"parallel_disks"`
 		ParallelVMs     int    `yaml:"parallel_vms"`
 		ControlDir      string `yaml:"control_dir"`
@@ -1492,6 +1493,7 @@ type runSpec struct {
 		FinalizeDeltaInterval int   `yaml:"finalize_delta_interval"`
 		FinalizeWindow       int    `yaml:"finalize_window"`
 		FinalizeAt           string `yaml:"finalize_at"`
+		FinalizeSettleSeconds int   `yaml:"finalize_settle_seconds"`
 		Readers              int    `yaml:"readers"`
 		RunVirtV2V           *bool  `yaml:"run_virt_v2v"`
 		SnapshotQuiesce      string `yaml:"snapshot_quiesce"`
@@ -2686,6 +2688,52 @@ func findVM(ctx context.Context, client *govmomi.Client, vmName string) (*object
 	}
 	finder.SetDatacenter(dc)
 	return finder.VirtualMachine(ctx, vmName)
+}
+
+func getVMGuestID(ctx context.Context, client *govmomi.Client, vm *object.VirtualMachine) (string, error) {
+	pc := property.DefaultCollector(client.Client)
+	var vmMo mo.VirtualMachine
+	if err := pc.RetrieveOne(ctx, vm.Reference(), []string{"config.guestId"}, &vmMo); err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(vmMo.Config.GuestId), nil
+}
+
+func classifyGuestFamily(guestID string) string {
+	id := strings.ToLower(strings.TrimSpace(guestID))
+	switch {
+	case id == "":
+		return ""
+	case strings.Contains(id, "win"):
+		return "windows"
+	case strings.Contains(id, "linux"), strings.Contains(id, "ubuntu"), strings.Contains(id, "centos"),
+		strings.Contains(id, "rhel"), strings.Contains(id, "debian"), strings.Contains(id, "sles"),
+		strings.Contains(id, "oracle"):
+		return "linux"
+	default:
+		return "other"
+	}
+}
+
+func defaultFinalizeSettleSeconds(guestFamily string) int {
+	if guestFamily == "windows" {
+		return 30
+	}
+	return 15
+}
+
+func waitWithContext(ctx context.Context, d time.Duration) error {
+	if d <= 0 {
+		return nil
+	}
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-t.C:
+		return nil
+	}
 }
 
 func listVMDisksAndBootUnit(ctx context.Context, client *govmomi.Client, vm *object.VirtualMachine) ([]vmDisk, int, error) {
@@ -4639,6 +4687,7 @@ func runVMWorkflow(ctx context.Context, cfg *appConfig, spec *runSpec, opts runO
 
 	var disks []vmDisk
 	bootUnit := 0
+	guestID := ""
 	if err := withVCenterRetry("list VM disks", func(c *govmomi.Client, v *object.VirtualMachine) error {
 		var callErr error
 		disks, bootUnit, callErr = listVMDisksAndBootUnit(ctx, c, v)
@@ -4646,6 +4695,14 @@ func runVMWorkflow(ctx context.Context, cfg *appConfig, spec *runSpec, opts runO
 	}); err != nil {
 		return err
 	}
+	if err := withVCenterRetry("read VM guest id", func(c *govmomi.Client, v *object.VirtualMachine) error {
+		var callErr error
+		guestID, callErr = getVMGuestID(ctx, c, v)
+		return callErr
+	}); err != nil {
+		log.Printf("Warning: failed to read source guestId: %v", err)
+	}
+	guestFamily := classifyGuestFamily(guestID)
 	log.Printf("Discovered VMware disks: count=%d boot_unit=%d", len(disks), bootUnit)
 	for _, d := range disks {
 		backing := strings.TrimSpace(d.SourcePath)
@@ -4654,6 +4711,7 @@ func runVMWorkflow(ctx context.Context, cfg *appConfig, spec *runSpec, opts runO
 		}
 		log.Printf("[pre-snapshot][disk%d] key=%d vm_backing=%s capacity_bytes=%d", d.Unit, d.Key, backing, d.Capacity)
 	}
+	log.Printf("Source VM guest_id=%s guest_family=%s", guestID, guestFamily)
 
 	readers := spec.Migration.Readers
 	if readers <= 0 {
@@ -5019,6 +5077,14 @@ func runVMWorkflow(ctx context.Context, cfg *appConfig, spec *runSpec, opts runO
 	if finalizeDeltaInterval <= 0 {
 		finalizeDeltaInterval = 30
 	}
+	finalizeSettleSeconds := spec.Migration.FinalizeSettleSeconds
+	if finalizeSettleSeconds <= 0 {
+		finalizeSettleSeconds = cfg.Migration.FinalizeSettleSeconds
+	}
+	if finalizeSettleSeconds <= 0 {
+		finalizeSettleSeconds = defaultFinalizeSettleSeconds(guestFamily)
+	}
+	log.Printf("Finalize settle delay=%ds guest_family=%s", finalizeSettleSeconds, guestFamily)
 	finalizeWindow := spec.Migration.FinalizeWindow
 	if finalizeWindow <= 0 {
 		finalizeWindow = 600
@@ -5338,6 +5404,12 @@ func runVMWorkflow(ctx context.Context, cfg *appConfig, spec *runSpec, opts runO
 					return shutdownVMForFinalize(ctx, c, v, shutdownMode, log)
 				}); err != nil {
 					return fmt.Errorf("failed to shutdown source VM before final sync: %w", err)
+				}
+				if finalizeSettleSeconds > 0 {
+					log.Printf("Waiting %ds finalize settle delay before final snapshot (guest_family=%s)", finalizeSettleSeconds, guestFamily)
+					if err := waitWithContext(ctx, time.Duration(finalizeSettleSeconds)*time.Second); err != nil {
+						return fmt.Errorf("finalize settle delay interrupted: %w", err)
+					}
 				}
 				if err := setStage(stageFinalSync); err != nil {
 					return err
