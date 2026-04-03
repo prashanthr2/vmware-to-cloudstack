@@ -71,7 +71,7 @@ install_dnf_packages() {
 
 install_apt_packages() {
   local base=(build-essential git tar curl ca-certificates golang-go)
-  local tools=(qemu-utils qemu-system-x86 virt-v2v libguestfs-tools libguestfs-winsupport)
+  local tools=(qemu-utils qemu-system-x86 virt-v2v libguestfs-tools rhsrvany)
   local ui=(nodejs npm)
   run_root apt-get update
   run_root apt-get install -y "${base[@]}"

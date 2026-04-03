@@ -818,7 +818,7 @@ func runVirtV2VInPlace(paths []string, virtioISO string) error {
 		msg := strings.ToLower(out)
 		if strings.Contains(msg, "rhsrvany.exe") || strings.Contains(msg, "pvvxsvc.exe") {
 			return fmt.Errorf(
-				"virt-v2v-in-place host is missing Windows helper files (rhsrvany.exe/pvvxsvc.exe under /usr/share/virt-tools). Install libguestfs-winsupport (or distro equivalent) and retry: %w",
+				"virt-v2v-in-place host is missing Windows helper files (rhsrvany.exe/pvvxsvc.exe under /usr/share/virt-tools). Install the distro package that provides them (Ubuntu/Debian: rhsrvany; RHEL-family: libguestfs-winsupport) and retry: %w",
 				runErr,
 			)
 		}
