@@ -1009,7 +1009,8 @@ type virtInspectorOS struct {
 }
 
 type virtInspectorMount struct {
-	Dev string `xml:"dev,attr"`
+	Dev  string `xml:"dev,attr"`
+	Path string `xml:",chardata"`
 }
 
 type virtInspectorFilesystem struct {
@@ -1073,6 +1074,16 @@ func usesSecondaryDiskDevice(dev string) bool {
 	return false
 }
 
+func isCriticalLinuxMount(path string) bool {
+	p := strings.TrimSpace(path)
+	switch p {
+	case "/", "/boot", "/boot/efi", "/usr", "/var":
+		return true
+	default:
+		return false
+	}
+}
+
 func planVirtV2V(paths []string) (virtV2VPlan, error) {
 	if len(paths) == 0 {
 		return virtV2VPlan{}, errors.New("no VM disks available for virt-v2v-in-place")
@@ -1115,6 +1126,7 @@ func planVirtV2V(paths []string) (virtV2VPlan, error) {
 	guestOS := strings.TrimSpace(osr.Name)
 	isWindows := strings.EqualFold(guestOS, "windows")
 	secondaryRefs := 0
+	criticalLinuxSecondary := false
 	checkDev := func(dev string) {
 		if usesSecondaryDiskDevice(dev) {
 			secondaryRefs++
@@ -1123,6 +1135,9 @@ func planVirtV2V(paths []string) (virtV2VPlan, error) {
 	checkDev(osr.Root)
 	for _, mp := range osr.Mountpoints {
 		checkDev(mp.Dev)
+		if strings.EqualFold(guestOS, "linux") && isCriticalLinuxMount(mp.Path) && usesSecondaryDiskDevice(mp.Dev) {
+			criticalLinuxSecondary = true
+		}
 	}
 	for _, fs := range osr.Filesystems {
 		checkDev(fs.Dev)
@@ -1131,21 +1146,30 @@ func planVirtV2V(paths []string) (virtV2VPlan, error) {
 		checkDev(dm.Dev)
 	}
 
-	if secondaryRefs > 0 {
+	if isWindows && secondaryRefs > 0 {
 		return virtV2VPlan{
 			Mode:      virtV2VInputLibvirtXML,
 			Paths:     paths,
-			Reason:    "guest OS references secondary disks",
+			Reason:    "Windows guest references secondary disks",
 			GuestOS:   guestOS,
 			IsWindows: isWindows,
 		}, nil
 	}
 
 	if strings.EqualFold(guestOS, "linux") {
+		if usesSecondaryDiskDevice(osr.Root) || criticalLinuxSecondary {
+			return virtV2VPlan{
+				Mode:      virtV2VInputLibvirtXML,
+				Paths:     paths,
+				Reason:    "Linux guest root or critical mountpoints span secondary disks",
+				GuestOS:   guestOS,
+				IsWindows: isWindows,
+			}, nil
+		}
 		return virtV2VPlan{
-			Mode:      virtV2VInputLibvirtXML,
-			Paths:     paths,
-			Reason:    "multi-disk Linux guest uses libvirtxml conservatively",
+			Mode:      virtV2VInputDisk,
+			Paths:     []string{paths[0]},
+			Reason:    "Linux guest OS is on boot disk; secondary disks treated as data",
 			GuestOS:   guestOS,
 			IsWindows: isWindows,
 		}, nil
