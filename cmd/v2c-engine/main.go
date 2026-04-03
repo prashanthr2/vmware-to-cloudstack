@@ -402,7 +402,7 @@ func uniqueDiskPathCandidates(paths ...string) []string {
 	return out
 }
 
-func chooseReadableVDDKDiskPath(cfg vddkConnCfg, candidates []string) (string, error) {
+func chooseReadableVDDKDiskPath(cfg vddkConnCfg, candidates []string, expectedCapacity int64) (string, error) {
 	candidates = uniqueDiskPathCandidates(candidates...)
 	if len(candidates) == 0 {
 		return "", errors.New("no candidate disk paths")
@@ -417,7 +417,21 @@ func chooseReadableVDDKDiskPath(cfg vddkConnCfg, candidates []string) (string, e
 	for _, p := range candidates {
 		h, openErr := openVDDKWithRetry(conn, p, 2, 300*time.Millisecond)
 		if openErr == nil {
+			if expectedCapacity > 0 {
+				capBytes, capErr := h.capacityBytes()
+				if capErr != nil {
+					h.close()
+					failures = append(failures, fmt.Sprintf("%s (capacity probe failed: %v)", p, capErr))
+					continue
+				}
+				if capBytes != expectedCapacity {
+					h.close()
+					failures = append(failures, fmt.Sprintf("%s (capacity mismatch expected=%d got=%d)", p, expectedCapacity, capBytes))
+					continue
+				}
+			}
 			h.close()
+			log.Printf("[vddk-path-probe] selected source path=%s", p)
 			return p, nil
 		}
 		failures = append(failures, fmt.Sprintf("%s (%v)", p, openErr))
@@ -4845,7 +4859,7 @@ func runVMWorkflow(ctx context.Context, cfg *appConfig, spec *runSpec, opts runO
 					VMMoref:       vmMoref,
 					SnapshotMoref: newSnap.Value,
 				}
-				sourcePath, err := chooseReadableVDDKDiskPath(pathCfg, candidates)
+				sourcePath, err := chooseReadableVDDKDiskPath(pathCfg, candidates, d.Capacity)
 				if err != nil {
 					errMu.Lock()
 					if firstErr == nil {
@@ -4855,6 +4869,7 @@ func runVMWorkflow(ctx context.Context, cfg *appConfig, spec *runSpec, opts runO
 					errMu.Unlock()
 					return
 				}
+				log.Printf("[disk%d] %s selected VDDK source path=%s", d.Unit, stageName, sourcePath)
 				var ranges []changedRange
 				err = withVCenterRetry(
 					fmt.Sprintf("query changed ranges unit=%d", d.Unit),
