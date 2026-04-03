@@ -134,6 +134,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"reflect"
 	"sort"
 	"strconv"
@@ -207,6 +208,8 @@ var (
 
 	hostOSReleaseOnce sync.Once
 	hostOSRelease     map[string]string
+
+	snapshotChildVMDKRe = regexp.MustCompile(`(?i)-\d{6}(\.vmdk)$`)
 )
 
 func vddkMaxOpenHandles() int {
@@ -360,6 +363,66 @@ func (h *vddkHandle) close() {
 		h.release()
 		h.release = nil
 	}
+}
+
+func baseDescriptorPath(path string) string {
+	p := strings.TrimSpace(path)
+	if p == "" {
+		return ""
+	}
+	if !strings.HasSuffix(strings.ToLower(p), ".vmdk") {
+		return ""
+	}
+	base := snapshotChildVMDKRe.ReplaceAllString(p, "$1")
+	if strings.EqualFold(base, p) {
+		return ""
+	}
+	return base
+}
+
+func uniqueDiskPathCandidates(paths ...string) []string {
+	out := make([]string, 0, len(paths)*2)
+	seen := map[string]struct{}{}
+	push := func(p string) {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			return
+		}
+		key := strings.ToLower(p)
+		if _, ok := seen[key]; ok {
+			return
+		}
+		seen[key] = struct{}{}
+		out = append(out, p)
+	}
+	for _, p := range paths {
+		push(p)
+		push(baseDescriptorPath(p))
+	}
+	return out
+}
+
+func chooseReadableVDDKDiskPath(cfg vddkConnCfg, candidates []string) (string, error) {
+	candidates = uniqueDiskPathCandidates(candidates...)
+	if len(candidates) == 0 {
+		return "", errors.New("no candidate disk paths")
+	}
+	conn, err := connectVDDKWithRetry(cfg, 3, 750*time.Millisecond)
+	if err != nil {
+		return "", err
+	}
+	defer conn.close()
+
+	failures := make([]string, 0, len(candidates))
+	for _, p := range candidates {
+		h, openErr := openVDDKWithRetry(conn, p, 2, 300*time.Millisecond)
+		if openErr == nil {
+			h.close()
+			return p, nil
+		}
+		failures = append(failures, fmt.Sprintf("%s (%v)", p, openErr))
+	}
+	return "", fmt.Errorf("no readable VDDK disk path found; tried: %s", strings.Join(failures, "; "))
 }
 
 func (h *vddkHandle) readAt(offset int64, length int) ([]byte, error) {
@@ -4733,21 +4796,15 @@ func runVMWorkflow(ctx context.Context, cfg *appConfig, spec *runSpec, opts runO
 				ds := st.Disks[unitKey]
 				prevChangeID := ""
 				targetQCOW2 := ""
-				// Prefer persisted disk source path from successful prior copy/sync.
-				// This avoids drifting to newer snapshot-child filenames between
-				// rounds (eg: *-0000xx.vmdk), which can be transient and fail open.
-				stableSourcePath := ""
+				// Build path candidates from persisted, discovered and snapshot
+				// metadata, then probe for an actually openable VDDK path.
+				persistedPath := ""
+				discoveredPath := strings.TrimSpace(d.SourcePath)
+				snapshotPath := strings.TrimSpace(meta.Path)
 				if ds != nil {
 					prevChangeID = ds.ChangeID
 					targetQCOW2 = ds.TargetQCOW2
-					stableSourcePath = strings.TrimSpace(ds.SourceDiskPath)
-				}
-				if stableSourcePath == "" {
-					stableSourcePath = strings.TrimSpace(d.SourcePath)
-				}
-				sourcePath := stableSourcePath
-				if sourcePath == "" {
-					sourcePath = strings.TrimSpace(meta.Path)
+					persistedPath = strings.TrimSpace(ds.SourceDiskPath)
 				}
 				stateMu.Unlock()
 				if ds == nil {
@@ -4768,7 +4825,8 @@ func runVMWorkflow(ctx context.Context, cfg *appConfig, spec *runSpec, opts runO
 					errMu.Unlock()
 					return
 				}
-				if sourcePath == "" {
+				candidates := uniqueDiskPathCandidates(persistedPath, discoveredPath, snapshotPath)
+				if len(candidates) == 0 {
 					errMu.Lock()
 					if firstErr == nil {
 						firstErr = fmt.Errorf("source disk path missing for delta unit=%d key=%d", d.Unit, d.Key)
@@ -4777,8 +4835,28 @@ func runVMWorkflow(ctx context.Context, cfg *appConfig, spec *runSpec, opts runO
 					errMu.Unlock()
 					return
 				}
+				log.Printf("[disk%d] %s path probe candidates=%s", d.Unit, stageName, strings.Join(candidates, ", "))
+				pathCfg := vddkConnCfg{
+					LibDir:        cfg.Migration.VDDKPath,
+					Server:        cfg.VCenter.Host,
+					User:          cfg.VCenter.User,
+					Password:      cfg.VCenter.Password,
+					Thumbprint:    thumb,
+					VMMoref:       vmMoref,
+					SnapshotMoref: newSnap.Value,
+				}
+				sourcePath, err := chooseReadableVDDKDiskPath(pathCfg, candidates)
+				if err != nil {
+					errMu.Lock()
+					if firstErr == nil {
+						firstErr = fmt.Errorf("delta source path probe failed for unit=%d: %w", d.Unit, err)
+						deltaCancel()
+					}
+					errMu.Unlock()
+					return
+				}
 				var ranges []changedRange
-				err := withVCenterRetry(
+				err = withVCenterRetry(
 					fmt.Sprintf("query changed ranges unit=%d", d.Unit),
 					func(c *govmomi.Client, v *object.VirtualMachine) error {
 						var callErr error
@@ -4851,9 +4929,7 @@ func runVMWorkflow(ctx context.Context, cfg *appConfig, spec *runSpec, opts runO
 				stateMu.Lock()
 				ds = st.Disks[unitKey]
 				ds.ChangeID = meta.ChangeID
-				if strings.TrimSpace(ds.SourceDiskPath) == "" {
-					ds.SourceDiskPath = sourcePath
-				}
+				ds.SourceDiskPath = sourcePath
 				ds.Stage = stageName
 				ds.Progress = 100
 				ds.EtaSeconds = 0
