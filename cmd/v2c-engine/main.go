@@ -122,6 +122,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"encoding/xml"
 	"errors"
 	"flag"
 	"fmt"
@@ -865,18 +866,34 @@ func createSparseQCOW2(path string, sizeBytes int64) error {
 	return cmd.Run()
 }
 
-func runVirtV2VInPlace(paths []string, virtioISO string) error {
-	if len(paths) == 0 {
+func runVirtV2VInPlace(plan virtV2VPlan, virtioISO string) error {
+	if len(plan.Paths) == 0 {
 		return errors.New("no disk paths provided to virt-v2v-in-place")
 	}
 
-	if err := verifyImageBeforeV2V(paths[0], len(paths)); err != nil {
+	if err := verifyImagesBeforeV2V(plan.Paths, plan.Mode); err != nil {
 		return fmt.Errorf("pre-v2v integrity check failed: %w", err)
 	}
 
 	v2vPath, err := resolveVirtV2VInPlacePath()
 	if err != nil {
 		return err
+	}
+
+	var tempXML string
+	var baseArgs []string
+	switch plan.Mode {
+	case virtV2VInputDisk:
+		baseArgs = append([]string{"-i", "disk"}, plan.Paths...)
+	case virtV2VInputLibvirtXML:
+		tempXML, err = writeVirtV2VLibvirtXML(plan.Paths)
+		if err != nil {
+			return fmt.Errorf("failed to build temporary libvirt XML for virt-v2v-in-place: %w", err)
+		}
+		defer os.Remove(tempXML)
+		baseArgs = []string{"-i", "libvirtxml", tempXML}
+	default:
+		return fmt.Errorf("unsupported virt-v2v input mode: %s", plan.Mode)
 	}
 
 	runCmd := func(args []string) (string, error) {
@@ -902,7 +919,6 @@ func runVirtV2VInPlace(paths []string, virtioISO string) error {
 		return runErr
 	}
 
-	baseArgs := append([]string{"-i", "disk"}, paths...)
 	if strings.TrimSpace(virtioISO) == "" {
 		out, err := runCmd(baseArgs)
 		return wrapV2VErr(err, out)
@@ -968,47 +984,249 @@ func isExecutableFile(path string) bool {
 	return info.Mode()&0o111 != 0
 }
 
-func verifyImageBeforeV2V(path string, totalDisks int) error {
+type virtV2VInputMode string
+
+const (
+	virtV2VInputDisk      virtV2VInputMode = "disk"
+	virtV2VInputLibvirtXML virtV2VInputMode = "libvirtxml"
+)
+
+type virtInspectorReport struct {
+	OperatingSystems []virtInspectorOS `xml:"operatingsystem"`
+}
+
+type virtInspectorOS struct {
+	Name         string                   `xml:"name"`
+	Root         string                   `xml:"root"`
+	Mountpoints  []virtInspectorMount     `xml:"mountpoints>mountpoint"`
+	Filesystems  []virtInspectorFilesystem `xml:"filesystems>filesystem"`
+	DriveMappings []virtInspectorDriveMap `xml:"drive_mappings>drive_mapping"`
+}
+
+type virtInspectorMount struct {
+	Dev string `xml:"dev,attr"`
+}
+
+type virtInspectorFilesystem struct {
+	Dev string `xml:"dev,attr"`
+}
+
+type virtInspectorDriveMap struct {
+	Dev string `xml:",chardata"`
+}
+
+type virtV2VPlan struct {
+	Mode   virtV2VInputMode
+	Paths  []string
+	Reason string
+}
+
+func runCommandCaptureWithEnv(env []string, name string, args ...string) (string, error) {
+	cmd := exec.Command(name, args...)
+	cmd.Env = env
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return string(out), fmt.Errorf("%s %v failed: %w\n%s", name, args, err, string(out))
+	}
+	return string(out), nil
+}
+
+func inspectGuestXML(paths []string) (*virtInspectorReport, error) {
+	if len(paths) == 0 {
+		return nil, errors.New("no disk paths provided to virt-inspector")
+	}
+	args := make([]string, 0, len(paths)*2)
+	for _, p := range paths {
+		args = append(args, "-a", p)
+	}
+	out, err := runCommandCaptureWithEnv(guestfsChildEnv(), "virt-inspector", args...)
+	if err != nil {
+		return nil, err
+	}
+	var report virtInspectorReport
+	if err := xml.Unmarshal([]byte(out), &report); err != nil {
+		return nil, fmt.Errorf("virt-inspector xml parse failed: %w", err)
+	}
+	return &report, nil
+}
+
+func usesSecondaryDiskDevice(dev string) bool {
+	dev = strings.TrimSpace(strings.ToLower(dev))
+	if dev == "" {
+		return false
+	}
+	prefixes := []string{"/dev/sd", "/dev/vd", "/dev/hd", "/dev/xvd"}
+	for _, p := range prefixes {
+		if strings.HasPrefix(dev, p+"b") || strings.HasPrefix(dev, p+"c") || strings.HasPrefix(dev, p+"d") ||
+			strings.HasPrefix(dev, p+"e") || strings.HasPrefix(dev, p+"f") || strings.HasPrefix(dev, p+"g") ||
+			strings.HasPrefix(dev, p+"h") || strings.HasPrefix(dev, p+"i") || strings.HasPrefix(dev, p+"j") {
+			return true
+		}
+	}
+	return false
+}
+
+func planVirtV2V(paths []string) (virtV2VPlan, error) {
+	if len(paths) == 0 {
+		return virtV2VPlan{}, errors.New("no VM disks available for virt-v2v-in-place")
+	}
+	if len(paths) == 1 {
+		return virtV2VPlan{
+			Mode:   virtV2VInputDisk,
+			Paths:  []string{paths[0]},
+			Reason: "single-disk VM",
+		}, nil
+	}
+
+	report, err := inspectGuestXML(paths)
+	if err != nil {
+		log.Printf("[virt-v2v] warning: multi-disk inspection failed, using libvirtxml for safety: %v", err)
+		return virtV2VPlan{
+			Mode:   virtV2VInputLibvirtXML,
+			Paths:  paths,
+			Reason: "multi-disk VM with inconclusive inspection",
+		}, nil
+	}
+	if len(report.OperatingSystems) == 0 {
+		return virtV2VPlan{
+			Mode:   virtV2VInputLibvirtXML,
+			Paths:  paths,
+			Reason: "multi-disk VM with no clear single-disk OS detection",
+		}, nil
+	}
+
+	osr := report.OperatingSystems[0]
+	secondaryRefs := 0
+	checkDev := func(dev string) {
+		if usesSecondaryDiskDevice(dev) {
+			secondaryRefs++
+		}
+	}
+	checkDev(osr.Root)
+	for _, mp := range osr.Mountpoints {
+		checkDev(mp.Dev)
+	}
+	for _, fs := range osr.Filesystems {
+		checkDev(fs.Dev)
+	}
+	for _, dm := range osr.DriveMappings {
+		checkDev(dm.Dev)
+	}
+
+	if secondaryRefs > 0 {
+		return virtV2VPlan{
+			Mode:   virtV2VInputLibvirtXML,
+			Paths:  paths,
+			Reason: "guest OS references secondary disks",
+		}, nil
+	}
+
+	if strings.EqualFold(strings.TrimSpace(osr.Name), "linux") {
+		return virtV2VPlan{
+			Mode:   virtV2VInputLibvirtXML,
+			Paths:  paths,
+			Reason: "multi-disk Linux guest uses libvirtxml conservatively",
+		}, nil
+	}
+
+	return virtV2VPlan{
+		Mode:   virtV2VInputDisk,
+		Paths:  []string{paths[0]},
+		Reason: "OS detected entirely on boot disk",
+	}, nil
+}
+
+func libvirtDiskDevName(idx int) string {
+	return fmt.Sprintf("sd%c", 'a'+idx)
+}
+
+func writeVirtV2VLibvirtXML(paths []string) (string, error) {
+	if len(paths) == 0 {
+		return "", errors.New("no disk paths provided for libvirtxml")
+	}
+	tmp, err := os.CreateTemp("", "v2c-v2v-*.xml")
+	if err != nil {
+		return "", err
+	}
+	defer tmp.Close()
+
+	var b strings.Builder
+	b.WriteString("<domain type='kvm'>\n")
+	b.WriteString("  <name>v2c-temp</name>\n")
+	b.WriteString("  <memory unit='MiB'>1024</memory>\n")
+	b.WriteString("  <vcpu>2</vcpu>\n")
+	b.WriteString("  <os>\n")
+	b.WriteString("    <type arch='x86_64'>hvm</type>\n")
+	b.WriteString("  </os>\n")
+	b.WriteString("  <devices>\n")
+	for i, p := range paths {
+		fmt.Fprintf(&b, "    <disk type='file' device='disk'>\n")
+		fmt.Fprintf(&b, "      <driver name='qemu' type='qcow2'/>\n")
+		fmt.Fprintf(&b, "      <source file='%s'/>\n", xmlEscape(p))
+		fmt.Fprintf(&b, "      <target dev='%s' bus='scsi'/>\n", libvirtDiskDevName(i))
+		b.WriteString("    </disk>\n")
+	}
+	b.WriteString("  </devices>\n")
+	b.WriteString("</domain>\n")
+
+	if _, err := tmp.WriteString(b.String()); err != nil {
+		_ = os.Remove(tmp.Name())
+		return "", err
+	}
+	return tmp.Name(), nil
+}
+
+func xmlEscape(s string) string {
+	var b bytes.Buffer
+	_ = xml.EscapeText(&b, []byte(s))
+	return b.String()
+}
+
+func verifyImagesBeforeV2V(paths []string, mode virtV2VInputMode) error {
+	if len(paths) == 0 {
+		return errors.New("no disk paths provided to verify before virt-v2v")
+	}
 	run := func(name string, args ...string) error {
-		cmd := exec.Command(name, args...)
 		env := sanitizedChildEnv()
 		if name == "virt-inspector" {
 			env = guestfsChildEnv()
 		}
-		cmd.Env = env
-		out, err := cmd.CombinedOutput()
-		if err != nil {
-			return fmt.Errorf("%s %v failed: %w\n%s", name, args, err, string(out))
+		_, err := runCommandCaptureWithEnv(env, name, args...)
+		return err
+	}
+
+	for _, path := range paths {
+		if err := run("qemu-img", "check", "-r", "none", path); err != nil {
+			msg := strings.ToLower(err.Error())
+			unsupportedNoRepair :=
+				strings.Contains(msg, "unknown option value for -r") ||
+					strings.Contains(msg, "invalid option") ||
+					strings.Contains(msg, "unrecognized option")
+			if unsupportedNoRepair {
+				if err2 := run("qemu-img", "check", path); err2 != nil {
+					return err2
+				}
+			} else {
+				return err
+			}
+		}
+	}
+
+	if mode == virtV2VInputLibvirtXML {
+		args := make([]string, 0, len(paths)*2)
+		for _, p := range paths {
+			args = append(args, "-a", p)
+		}
+		if err := run("virt-inspector", args...); err != nil {
+			return err
 		}
 		return nil
 	}
 
-	// Prefer explicit no-repair check when supported, but older qemu-img
-	// releases do not accept "-r none".
-	if err := run("qemu-img", "check", "-r", "none", path); err != nil {
-		msg := strings.ToLower(err.Error())
-		unsupportedNoRepair :=
-			strings.Contains(msg, "unknown option value for -r") ||
-				strings.Contains(msg, "invalid option") ||
-				strings.Contains(msg, "unrecognized option")
-		if unsupportedNoRepair {
-			if err2 := run("qemu-img", "check", path); err2 != nil {
-				return err2
-			}
-		} else {
-			return err
-		}
-	}
-	if err := run("virt-inspector", "-a", path); err != nil {
-		msg := strings.ToLower(err.Error())
-		osNotDetected := strings.Contains(msg, "inspection could not detect the source guest") ||
-			strings.Contains(msg, "no root device found")
-		if totalDisks > 1 && osNotDetected {
-			log.Printf("[virt-v2v] warning: virt-inspector could not detect an OS on %s before multi-disk conversion; continuing with all disks attached", filepath.Base(path))
-			return nil
-		}
+	if err := run("virt-inspector", "-a", paths[0]); err != nil {
 		return err
 	}
+
 	return nil
 }
 
@@ -1919,7 +2137,11 @@ func runBaseCopy(ctx context.Context, opts baseCopyOptions) (copyStats, error) {
 	report()
 
 	if opts.RunVirtV2V {
-		if err := runVirtV2VInPlace([]string{opts.TargetQCOW2}, opts.VirtioISO); err != nil {
+		if err := runVirtV2VInPlace(virtV2VPlan{
+			Mode:   virtV2VInputDisk,
+			Paths:  []string{opts.TargetQCOW2},
+			Reason: "single-disk base-copy conversion",
+		}, opts.VirtioISO); err != nil {
 			return copyStats{}, fmt.Errorf("virt-v2v-in-place failed: %w", err)
 		}
 	}
@@ -5116,11 +5338,15 @@ func runVMWorkflow(ctx context.Context, cfg *appConfig, spec *runSpec, opts runO
 			if err != nil {
 				return err
 			}
-			log.Printf("Running virt-v2v-in-place with %d disk(s); boot disk first: %s", len(v2vDiskPaths), v2vDiskPaths[0])
-			if err := runVirtV2VInPlace(v2vDiskPaths, virtioISO); err != nil {
+			plan, err := planVirtV2V(v2vDiskPaths)
+			if err != nil {
+				return err
+			}
+			log.Printf("Running virt-v2v-in-place mode=%s disks=%d boot_disk=%s reason=%s", plan.Mode, len(plan.Paths), v2vDiskPaths[0], plan.Reason)
+			if err := runVirtV2VInPlace(plan, virtioISO); err != nil {
 				return fmt.Errorf("virt-v2v-in-place failed: %w", err)
 			}
-			log.Printf("virt-v2v-in-place completed for %d disk(s)", len(v2vDiskPaths))
+			log.Printf("virt-v2v-in-place completed mode=%s disks=%d", plan.Mode, len(plan.Paths))
 			stateMu.Lock()
 			st.VirtV2VDone = true
 			stateMu.Unlock()
