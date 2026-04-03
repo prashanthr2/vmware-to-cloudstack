@@ -874,6 +874,11 @@ func runVirtV2VInPlace(plan virtV2VPlan, virtioISO string) error {
 	if err := verifyImagesBeforeV2V(plan.Paths, plan.Mode); err != nil {
 		return fmt.Errorf("pre-v2v integrity check failed: %w", err)
 	}
+	if plan.IsWindows {
+		if err := probeGuestWritable(plan.Paths); err != nil {
+			return fmt.Errorf("pre-v2v writable probe failed for Windows guest: %w", err)
+		}
+	}
 
 	v2vPath, err := resolveVirtV2VInPlacePath()
 	if err != nil {
@@ -1016,9 +1021,11 @@ type virtInspectorDriveMap struct {
 }
 
 type virtV2VPlan struct {
-	Mode   virtV2VInputMode
-	Paths  []string
-	Reason string
+	Mode       virtV2VInputMode
+	Paths      []string
+	Reason     string
+	GuestOS    string
+	IsWindows  bool
 }
 
 func runCommandCaptureWithEnv(env []string, name string, args ...string) (string, error) {
@@ -1071,10 +1078,19 @@ func planVirtV2V(paths []string) (virtV2VPlan, error) {
 		return virtV2VPlan{}, errors.New("no VM disks available for virt-v2v-in-place")
 	}
 	if len(paths) == 1 {
+		report, err := inspectGuestXML(paths)
+		guestOS := ""
+		isWindows := false
+		if err == nil && len(report.OperatingSystems) > 0 {
+			guestOS = strings.TrimSpace(report.OperatingSystems[0].Name)
+			isWindows = strings.EqualFold(guestOS, "windows")
+		}
 		return virtV2VPlan{
-			Mode:   virtV2VInputDisk,
-			Paths:  []string{paths[0]},
-			Reason: "single-disk VM",
+			Mode:      virtV2VInputDisk,
+			Paths:     []string{paths[0]},
+			Reason:    "single-disk VM",
+			GuestOS:   guestOS,
+			IsWindows: isWindows,
 		}, nil
 	}
 
@@ -1096,6 +1112,8 @@ func planVirtV2V(paths []string) (virtV2VPlan, error) {
 	}
 
 	osr := report.OperatingSystems[0]
+	guestOS := strings.TrimSpace(osr.Name)
+	isWindows := strings.EqualFold(guestOS, "windows")
 	secondaryRefs := 0
 	checkDev := func(dev string) {
 		if usesSecondaryDiskDevice(dev) {
@@ -1115,24 +1133,30 @@ func planVirtV2V(paths []string) (virtV2VPlan, error) {
 
 	if secondaryRefs > 0 {
 		return virtV2VPlan{
-			Mode:   virtV2VInputLibvirtXML,
-			Paths:  paths,
-			Reason: "guest OS references secondary disks",
+			Mode:      virtV2VInputLibvirtXML,
+			Paths:     paths,
+			Reason:    "guest OS references secondary disks",
+			GuestOS:   guestOS,
+			IsWindows: isWindows,
 		}, nil
 	}
 
-	if strings.EqualFold(strings.TrimSpace(osr.Name), "linux") {
+	if strings.EqualFold(guestOS, "linux") {
 		return virtV2VPlan{
-			Mode:   virtV2VInputLibvirtXML,
-			Paths:  paths,
-			Reason: "multi-disk Linux guest uses libvirtxml conservatively",
+			Mode:      virtV2VInputLibvirtXML,
+			Paths:     paths,
+			Reason:    "multi-disk Linux guest uses libvirtxml conservatively",
+			GuestOS:   guestOS,
+			IsWindows: isWindows,
 		}, nil
 	}
 
 	return virtV2VPlan{
-		Mode:   virtV2VInputDisk,
-		Paths:  []string{paths[0]},
-		Reason: "OS detected entirely on boot disk",
+		Mode:      virtV2VInputDisk,
+		Paths:     []string{paths[0]},
+		Reason:    "OS detected entirely on boot disk",
+		GuestOS:   guestOS,
+		IsWindows: isWindows,
 	}, nil
 }
 
@@ -1180,6 +1204,31 @@ func xmlEscape(s string) string {
 	var b bytes.Buffer
 	_ = xml.EscapeText(&b, []byte(s))
 	return b.String()
+}
+
+func probeGuestWritable(paths []string) error {
+	if len(paths) == 0 {
+		return errors.New("no disk paths provided for writable guest probe")
+	}
+	args := make([]string, 0, len(paths)*2+1)
+	for _, p := range paths {
+		args = append(args, "-a", p)
+	}
+	args = append(args, "-i")
+	cmd := exec.Command("guestfish", args...)
+	cmd.Env = guestfsChildEnv()
+	cmd.Stdin = strings.NewReader("touch /v2c-rw-probe\nrm /v2c-rw-probe\nexit\n")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		msg := strings.ToLower(string(out))
+		if strings.Contains(msg, "read-only file system") {
+			return fmt.Errorf(
+				"guest filesystem is read-only. On Windows this usually means the volume was not cleanly unmounted, Fast Startup/hibernation is enabled, or the migration used a non-quiesced snapshot. Ensure a clean shutdown before final sync and disable Fast Startup/hibernation, then retry",
+			)
+		}
+		return fmt.Errorf("guest writable probe failed: %w\n%s", err, string(out))
+	}
+	return nil
 }
 
 func verifyImagesBeforeV2V(paths []string, mode virtV2VInputMode) error {
@@ -5342,7 +5391,7 @@ func runVMWorkflow(ctx context.Context, cfg *appConfig, spec *runSpec, opts runO
 			if err != nil {
 				return err
 			}
-			log.Printf("Running virt-v2v-in-place mode=%s disks=%d boot_disk=%s reason=%s", plan.Mode, len(plan.Paths), v2vDiskPaths[0], plan.Reason)
+			log.Printf("Running virt-v2v-in-place mode=%s disks=%d boot_disk=%s guest_os=%s windows=%t reason=%s", plan.Mode, len(plan.Paths), v2vDiskPaths[0], plan.GuestOS, plan.IsWindows, plan.Reason)
 			if err := runVirtV2VInPlace(plan, virtioISO); err != nil {
 				return fmt.Errorf("virt-v2v-in-place failed: %w", err)
 			}
