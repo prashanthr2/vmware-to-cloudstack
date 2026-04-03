@@ -1088,18 +1088,71 @@ func planVirtV2V(paths []string) (virtV2VPlan, error) {
 	if len(paths) == 0 {
 		return virtV2VPlan{}, errors.New("no VM disks available for virt-v2v-in-place")
 	}
+	bootReport, bootErr := inspectGuestXML([]string{paths[0]})
+	guestOS := ""
+	isWindows := false
+	if bootErr == nil && len(bootReport.OperatingSystems) > 0 {
+		guestOS = strings.TrimSpace(bootReport.OperatingSystems[0].Name)
+		isWindows = strings.EqualFold(guestOS, "windows")
+	}
 	if len(paths) == 1 {
-		report, err := inspectGuestXML(paths)
-		guestOS := ""
-		isWindows := false
-		if err == nil && len(report.OperatingSystems) > 0 {
-			guestOS = strings.TrimSpace(report.OperatingSystems[0].Name)
-			isWindows = strings.EqualFold(guestOS, "windows")
-		}
 		return virtV2VPlan{
 			Mode:      virtV2VInputDisk,
 			Paths:     []string{paths[0]},
 			Reason:    "single-disk VM",
+			GuestOS:   guestOS,
+			IsWindows: isWindows,
+		}, nil
+	}
+
+	// If the boot disk alone already identifies a Windows guest, prefer the
+	// safer boot-disk-only path unless multi-disk inspection proves otherwise.
+	if isWindows {
+		report, err := inspectGuestXML(paths)
+		if err != nil || len(report.OperatingSystems) == 0 {
+			if err != nil {
+				log.Printf("[virt-v2v] warning: multi-disk Windows inspection failed, keeping boot-disk-only conversion: %v", err)
+			} else {
+				log.Printf("[virt-v2v] warning: multi-disk Windows inspection found no OS; keeping boot-disk-only conversion")
+			}
+			return virtV2VPlan{
+				Mode:      virtV2VInputDisk,
+				Paths:     []string{paths[0]},
+				Reason:    "Windows OS detected on boot disk; multi-disk inspection inconclusive",
+				GuestOS:   guestOS,
+				IsWindows: isWindows,
+			}, nil
+		}
+		osr := report.OperatingSystems[0]
+		secondaryRefs := 0
+		checkDev := func(dev string) {
+			if usesSecondaryDiskDevice(dev) {
+				secondaryRefs++
+			}
+		}
+		checkDev(osr.Root)
+		for _, mp := range osr.Mountpoints {
+			checkDev(mp.Dev)
+		}
+		for _, fs := range osr.Filesystems {
+			checkDev(fs.Dev)
+		}
+		for _, dm := range osr.DriveMappings {
+			checkDev(dm.Dev)
+		}
+		if secondaryRefs > 0 {
+			return virtV2VPlan{
+				Mode:      virtV2VInputLibvirtXML,
+				Paths:     paths,
+				Reason:    "Windows guest references secondary disks",
+				GuestOS:   guestOS,
+				IsWindows: isWindows,
+			}, nil
+		}
+		return virtV2VPlan{
+			Mode:      virtV2VInputDisk,
+			Paths:     []string{paths[0]},
+			Reason:    "Windows OS is on boot disk; secondary disks treated as data",
 			GuestOS:   guestOS,
 			IsWindows: isWindows,
 		}, nil
@@ -1123,8 +1176,8 @@ func planVirtV2V(paths []string) (virtV2VPlan, error) {
 	}
 
 	osr := report.OperatingSystems[0]
-	guestOS := strings.TrimSpace(osr.Name)
-	isWindows := strings.EqualFold(guestOS, "windows")
+	guestOS = strings.TrimSpace(osr.Name)
+	isWindows = strings.EqualFold(guestOS, "windows")
 	secondaryRefs := 0
 	criticalLinuxSecondary := false
 	checkDev := func(dev string) {
