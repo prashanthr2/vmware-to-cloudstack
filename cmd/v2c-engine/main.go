@@ -417,6 +417,15 @@ func uniqueDiskPathCandidates(paths ...string) []string {
 	return out
 }
 
+func firstDiskPath(paths ...string) string {
+	for _, p := range paths {
+		if strings.TrimSpace(p) != "" {
+			return strings.TrimSpace(p)
+		}
+	}
+	return ""
+}
+
 func chooseReadableVDDKDiskPath(cfg vddkConnCfg, candidates []string, expectedCapacity int64) (string, error) {
 	candidates = uniqueDiskPathCandidates(candidates...)
 	if len(candidates) == 0 {
@@ -5008,7 +5017,7 @@ func runVMWorkflow(ctx context.Context, cfg *appConfig, spec *runSpec, opts runO
 		ds.Unit = d.Unit
 		ds.Capacity = d.Capacity
 		if strings.TrimSpace(ds.SourceDiskPath) == "" && strings.TrimSpace(d.SourcePath) != "" {
-			ds.SourceDiskPath = canonicalDiskPath(d.SourcePath)
+			ds.SourceDiskPath = strings.TrimSpace(d.SourcePath)
 		}
 
 		storageID, err := resolveStorageID(spec, d.Unit, bootUnit)
@@ -5114,11 +5123,12 @@ func runVMWorkflow(ctx context.Context, cfg *appConfig, spec *runSpec, opts runO
 				}
 				defer func() { <-sem }()
 
-				sourcePath := canonicalDiskPath(d.SourcePath, meta.Path)
-				if sourcePath == "" {
-					sourcePath = strings.TrimSpace(meta.Path)
+				persistedPath := ""
+				if existing := st.Disks[strconv.Itoa(d.Unit)]; existing != nil {
+					persistedPath = strings.TrimSpace(existing.SourceDiskPath)
 				}
-				if sourcePath == "" {
+				sourceCandidates := uniqueDiskPathCandidates(strings.TrimSpace(meta.Path), strings.TrimSpace(d.SourcePath), persistedPath)
+				if len(sourceCandidates) == 0 {
 					errMu.Lock()
 					if firstErr == nil {
 						firstErr = fmt.Errorf("source disk path missing for unit=%d key=%d", d.Unit, d.Key)
@@ -5127,19 +5137,31 @@ func runVMWorkflow(ctx context.Context, cfg *appConfig, spec *runSpec, opts runO
 					errMu.Unlock()
 					return
 				}
+				pathCfg := vddkConnCfg{
+					LibDir:        cfg.Migration.VDDKPath,
+					Server:        cfg.VCenter.Host,
+					User:          cfg.VCenter.User,
+					Password:      cfg.VCenter.Password,
+					Thumbprint:    thumb,
+					VMMoref:       vmMoref,
+					SnapshotMoref: st.ActiveSnapshot,
+				}
+				sourcePath, err := chooseReadableVDDKDiskPath(pathCfg, sourceCandidates, d.Capacity)
+				if err != nil {
+					errMu.Lock()
+					if firstErr == nil {
+						firstErr = fmt.Errorf("base source path probe failed for unit=%d: %w", d.Unit, err)
+						baseCancel()
+					}
+					errMu.Unlock()
+					return
+				}
 
 				progress := makeProgressUpdater(stateMu, statePath, st, log, d.Unit, d.Capacity, stageBaseCopy)
+				log.Printf("[disk%d] base path probe candidates=%s", d.Unit, strings.Join(sourceCandidates, ", "))
 				log.Printf("[disk%d] base copy started source=%s snapshot_path=%s target=%s", d.Unit, sourcePath, meta.Path, st.Disks[strconv.Itoa(d.Unit)].TargetQCOW2)
 				optsBase := baseCopyOptions{
-					VDDK: vddkConnCfg{
-						LibDir:        cfg.Migration.VDDKPath,
-						Server:        cfg.VCenter.Host,
-						User:          cfg.VCenter.User,
-						Password:      cfg.VCenter.Password,
-						Thumbprint:    thumb,
-						VMMoref:       vmMoref,
-						SnapshotMoref: st.ActiveSnapshot,
-					},
+					VDDK: pathCfg,
 					DiskPath:      sourcePath,
 					TargetQCOW2:   st.Disks[strconv.Itoa(d.Unit)].TargetQCOW2,
 					DiskSizeBytes: d.Capacity,
@@ -5160,7 +5182,7 @@ func runVMWorkflow(ctx context.Context, cfg *appConfig, spec *runSpec, opts runO
 
 				stateMu.Lock()
 				ds := st.Disks[strconv.Itoa(d.Unit)]
-				ds.SourceDiskPath = sourcePath
+				ds.SourceDiskPath = firstDiskPath(strings.TrimSpace(d.SourcePath), persistedPath, sourcePath)
 				ds.ChangeID = meta.ChangeID
 				ds.Stage = stageBaseCopy
 				ds.BaseCopied = true
@@ -5272,13 +5294,12 @@ func runVMWorkflow(ctx context.Context, cfg *appConfig, spec *runSpec, opts runO
 				// Build path candidates from persisted, discovered and snapshot
 				// metadata, then probe for an actually openable VDDK path.
 				persistedPath := ""
-				discoveredPath := canonicalDiskPath(d.SourcePath)
+				discoveredPath := strings.TrimSpace(d.SourcePath)
 				snapshotPath := strings.TrimSpace(meta.Path)
-				snapshotBasePath := canonicalDiskPath(meta.Path)
 				if ds != nil {
 					prevChangeID = ds.ChangeID
 					targetQCOW2 = ds.TargetQCOW2
-					persistedPath = canonicalDiskPath(ds.SourceDiskPath)
+					persistedPath = strings.TrimSpace(ds.SourceDiskPath)
 				}
 				stateMu.Unlock()
 				if ds == nil {
@@ -5299,7 +5320,7 @@ func runVMWorkflow(ctx context.Context, cfg *appConfig, spec *runSpec, opts runO
 					errMu.Unlock()
 					return
 				}
-				candidates := uniqueDiskPathCandidates(persistedPath, discoveredPath, snapshotBasePath, snapshotPath)
+				candidates := uniqueDiskPathCandidates(snapshotPath, discoveredPath, persistedPath)
 				if len(candidates) == 0 {
 					errMu.Lock()
 					if firstErr == nil {
@@ -5404,7 +5425,7 @@ func runVMWorkflow(ctx context.Context, cfg *appConfig, spec *runSpec, opts runO
 				stateMu.Lock()
 				ds = st.Disks[unitKey]
 				ds.ChangeID = meta.ChangeID
-				ds.SourceDiskPath = canonicalDiskPath(sourcePath, d.SourcePath, meta.Path)
+				ds.SourceDiskPath = firstDiskPath(discoveredPath, persistedPath, sourcePath)
 				ds.Stage = stageName
 				ds.Progress = 100
 				ds.EtaSeconds = 0
