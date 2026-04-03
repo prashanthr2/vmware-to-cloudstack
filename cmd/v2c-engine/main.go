@@ -417,6 +417,24 @@ func uniqueDiskPathCandidates(paths ...string) []string {
 	return out
 }
 
+func uniqueDiskPaths(paths ...string) []string {
+	out := make([]string, 0, len(paths))
+	seen := map[string]struct{}{}
+	for _, p := range paths {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		key := strings.ToLower(p)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, p)
+	}
+	return out
+}
+
 func firstDiskPath(paths ...string) string {
 	for _, p := range paths {
 		if strings.TrimSpace(p) != "" {
@@ -427,7 +445,7 @@ func firstDiskPath(paths ...string) string {
 }
 
 func chooseReadableVDDKDiskPath(cfg vddkConnCfg, candidates []string, expectedCapacity int64) (string, error) {
-	candidates = uniqueDiskPathCandidates(candidates...)
+	candidates = uniqueDiskPaths(candidates...)
 	if len(candidates) == 0 {
 		return "", errors.New("no candidate disk paths")
 	}
@@ -5127,7 +5145,7 @@ func runVMWorkflow(ctx context.Context, cfg *appConfig, spec *runSpec, opts runO
 				if existing := st.Disks[strconv.Itoa(d.Unit)]; existing != nil {
 					persistedPath = strings.TrimSpace(existing.SourceDiskPath)
 				}
-				sourceCandidates := uniqueDiskPathCandidates(strings.TrimSpace(meta.Path), strings.TrimSpace(d.SourcePath), persistedPath)
+				sourceCandidates := uniqueDiskPaths(strings.TrimSpace(meta.Path), strings.TrimSpace(d.SourcePath), persistedPath)
 				if len(sourceCandidates) == 0 {
 					errMu.Lock()
 					if firstErr == nil {
@@ -5320,7 +5338,7 @@ func runVMWorkflow(ctx context.Context, cfg *appConfig, spec *runSpec, opts runO
 					errMu.Unlock()
 					return
 				}
-				candidates := uniqueDiskPathCandidates(snapshotPath, discoveredPath, persistedPath)
+				candidates := uniqueDiskPaths(snapshotPath, discoveredPath, persistedPath)
 				if len(candidates) == 0 {
 					errMu.Lock()
 					if firstErr == nil {
