@@ -5525,6 +5525,7 @@ func runVMWorkflow(ctx context.Context, cfg *appConfig, spec *runSpec, opts runO
 			if sleepSec <= 0 {
 				continue
 			}
+			log.Printf("Delta round complete, entering wait state for %ds", sleepSec)
 			if waitDeltaSleep(sleepSec) {
 				log.Printf("FINALIZE NOW detected, interrupting delta wait")
 			}
