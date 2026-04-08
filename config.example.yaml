@@ -50,4 +50,6 @@ migration:
 
 virt:
   run_virt_v2v: true
+  # Path to virtio-win ISO or directory for Windows conversion.
+  # The engine passes this via VIRTIO_WIN when present.
   virtio_iso: /usr/share/virtio-win/virtio-win.iso

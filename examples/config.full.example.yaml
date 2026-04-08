@@ -99,6 +99,6 @@ virt:
   run_virt_v2v: true
 
   # OPTIONAL:
-  # Path to virtio-win ISO used when virt-v2v supports virtio injection flags.
+  # Path to virtio-win ISO or directory used via VIRTIO_WIN during Windows conversion.
   # Default behavior in code if omitted/empty: /usr/share/virtio-win/virtio-win.iso
   virtio_iso: /usr/share/virtio-win/virtio-win.iso

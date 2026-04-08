@@ -35,6 +35,7 @@ This design keeps source VM downtime mostly to the final sync + import boundary,
 
 The bootstrap script installs required OS packages (Go, qemu tools, virt-v2v, guestfs, and optional node/npm for UI).
 This project does not redistribute VDDK. Users must obtain VDDK directly from Broadcom and accept Broadcom licensing terms separately.
+For Windows conversions, `virt-v2v-in-place` expects virtio drivers to be available through `VIRTIO_WIN`, which this project resolves from `virt.virtio_iso`, `/usr/share/virtio-win/virtio-win.iso`, or `/usr/share/virtio-win`. Bootstrap will try to prepare that path when distro packages provide it, but on some hosts you may still need to place the virtio-win ISO or extracted driver tree there manually.
 
 ## Quick Start (Clone -> Bootstrap -> UI -> CLI)
 

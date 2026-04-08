@@ -52,6 +52,65 @@ run_root() {
 
 command_exists() { command -v "$1" >/dev/null 2>&1; }
 
+detect_virtio_win_path() {
+  local candidates=(
+    /usr/share/virtio-win/virtio-win.iso
+    /usr/share/virtio-win
+    /usr/share/virtio-win.iso
+    /usr/share/virtio-win/virtio-win*.iso
+  )
+  local p
+  for p in "${candidates[@]}"; do
+    for resolved in $p; do
+      [[ -e "$resolved" ]] || continue
+      printf '%s\n' "$resolved"
+      return 0
+    done
+  done
+  return 1
+}
+
+normalize_virtio_win_layout() {
+  local detected=""
+  detected="$(detect_virtio_win_path || true)"
+  [[ -n "$detected" ]] || return 1
+  if [[ "$detected" == /usr/share/virtio-win || "$detected" == /usr/share/virtio-win/virtio-win.iso ]]; then
+    return 0
+  fi
+  run_root mkdir -p /usr/share/virtio-win
+  if [[ -d "$detected" ]]; then
+    return 0
+  fi
+  if [[ ! -e /usr/share/virtio-win/virtio-win.iso ]]; then
+    run_root ln -sf "$detected" /usr/share/virtio-win/virtio-win.iso
+  fi
+  return 0
+}
+
+ensure_virtio_win_assets() {
+  local pkg_mgr="$1"
+  if normalize_virtio_win_layout; then
+    log "Found virtio-win assets under /usr/share/virtio-win"
+    return 0
+  fi
+
+  if [[ "$pkg_mgr" == "dnf" ]]; then
+    run_root dnf -y install virtio-win || warn "Package not installed: virtio-win"
+  elif [[ "$pkg_mgr" == "apt" ]]; then
+    if ! run_root apt-get install -y virtio-win; then
+      warn "Package not installed: virtio-win"
+    fi
+  fi
+
+  if normalize_virtio_win_layout; then
+    log "Prepared virtio-win assets under /usr/share/virtio-win"
+    return 0
+  fi
+
+  warn "virtio-win drivers not found. Windows conversions may miss virtio drivers until /usr/share/virtio-win or /usr/share/virtio-win/virtio-win.iso is populated."
+  return 0
+}
+
 install_dnf_packages() {
   local base=(gcc make git tar curl ca-certificates golang)
   local tools=(qemu-img qemu-kvm-core virt-v2v libguestfs-tools-c libguestfs-winsupport)
@@ -67,6 +126,7 @@ install_dnf_packages() {
   if [[ "$WITH_UI" -eq 1 ]]; then
     run_root dnf -y install "${ui[@]}" || warn "UI packages nodejs/npm not fully installed."
   fi
+  ensure_virtio_win_assets dnf
 }
 
 install_apt_packages() {
@@ -84,6 +144,7 @@ install_apt_packages() {
   if [[ "$WITH_UI" -eq 1 ]]; then
     run_root apt-get install -y "${ui[@]}" || warn "UI packages nodejs/npm not fully installed."
   fi
+  ensure_virtio_win_assets apt
 }
 
 detect_and_install_packages() {

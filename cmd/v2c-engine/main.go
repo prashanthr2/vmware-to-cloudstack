@@ -886,6 +886,30 @@ func guestfsChildEnv() []string {
 	return env
 }
 
+func resolveVirtioWinPath(configuredPath string) string {
+	for _, candidate := range []string{
+		strings.TrimSpace(configuredPath),
+		"/usr/share/virtio-win/virtio-win.iso",
+		"/usr/share/virtio-win",
+	} {
+		if candidate == "" {
+			continue
+		}
+		if info, err := os.Stat(candidate); err == nil && (info.IsDir() || info.Mode().IsRegular()) {
+			return candidate
+		}
+	}
+	return ""
+}
+
+func virtV2VChildEnv(virtioISO string) []string {
+	env := guestfsChildEnv()
+	if virtioPath := resolveVirtioWinPath(virtioISO); virtioPath != "" {
+		env = setEnvKV(env, "VIRTIO_WIN", virtioPath)
+	}
+	return env
+}
+
 func createSparseQCOW2(path string, sizeBytes int64) error {
 	if sizeBytes <= 0 {
 		return fmt.Errorf("invalid qcow2 size: %d", sizeBytes)
@@ -944,7 +968,7 @@ func runVirtV2VInPlace(plan virtV2VPlan, virtioISO string) error {
 
 	runCmd := func(args []string) (string, error) {
 		cmd := exec.Command(v2vPath, args...)
-		cmd.Env = guestfsChildEnv()
+		cmd.Env = virtV2VChildEnv(virtioISO)
 		var buf bytes.Buffer
 		cmd.Stdout = io.MultiWriter(os.Stdout, &buf)
 		cmd.Stderr = io.MultiWriter(os.Stderr, &buf)
@@ -965,48 +989,14 @@ func runVirtV2VInPlace(plan virtV2VPlan, virtioISO string) error {
 		return runErr
 	}
 
-	if !plan.IsWindows || strings.TrimSpace(virtioISO) == "" {
-		out, err := runCmd(baseArgs)
-		return wrapV2VErr(err, out)
+	if plan.IsWindows {
+		if envPath := resolveVirtioWinPath(virtioISO); envPath != "" {
+			fmt.Fprintf(os.Stderr, "[virt-v2v] info: using VIRTIO_WIN=%s\n", envPath)
+		} else {
+			fmt.Fprintf(os.Stderr, "[virt-v2v] warning: virtio-win drivers not found; Windows conversion may miss virtio drivers\n")
+		}
 	}
-
-	supportsInject, detectErr := virtV2VSupportsInjectVirtioWin(v2vPath)
-	if detectErr != nil {
-		fmt.Fprintf(
-			os.Stderr,
-			"[virt-v2v] warning: could not detect --inject-virtio-win support for %s, running without it: %v\n",
-			v2vPath,
-			detectErr,
-		)
-		out, err := runCmd(baseArgs)
-		return wrapV2VErr(err, out)
-	}
-	if !supportsInject {
-		fmt.Fprintf(
-			os.Stderr,
-			"[virt-v2v] info: %s does not support --inject-virtio-win, running without it\n",
-			v2vPath,
-		)
-		out, err := runCmd(baseArgs)
-		return wrapV2VErr(err, out)
-	}
-
-	withInject := append(append([]string{}, baseArgs...), "--inject-virtio-win", virtioISO)
-	out, err := runCmd(withInject)
-	if err == nil {
-		return nil
-	}
-
-	msg := strings.ToLower(out)
-	if strings.Contains(msg, "unrecognized option '--inject-virtio-win'") ||
-		strings.Contains(msg, "unknown option '--inject-virtio-win'") {
-		fmt.Fprintf(
-			os.Stderr,
-			"[virt-v2v] warning: --inject-virtio-win unsupported by this virt-v2v-in-place version, retrying without it\n",
-		)
-		retryOut, retryErr := runCmd(baseArgs)
-		return wrapV2VErr(retryErr, retryOut)
-	}
+	out, err := runCmd(baseArgs)
 	return wrapV2VErr(err, out)
 }
 
@@ -1038,16 +1028,6 @@ func resolveVirtV2VInPlacePath() (string, error) {
 	return "", fmt.Errorf(
 		"virt-v2v-in-place not found in PATH and not present at known locations (/usr/libexec/virt-v2v-in-place, /usr/bin/virt-v2v-in-place)",
 	)
-}
-
-func virtV2VSupportsInjectVirtioWin(v2vPath string) (bool, error) {
-	cmd := exec.Command(v2vPath, "--help")
-	cmd.Env = sanitizedChildEnv()
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return false, fmt.Errorf("help probe failed: %w", err)
-	}
-	return strings.Contains(string(out), "--inject-virtio-win"), nil
 }
 
 func isExecutableFile(path string) bool {
@@ -6250,7 +6230,7 @@ func cmdBaseCopy(args []string) error {
 	fs.Float64Var(&o.FastMBps, "fast-mbps", o.FastMBps, "Throughput considered fast")
 	fs.Float64Var(&o.SlowMBps, "slow-mbps", o.SlowMBps, "Throughput considered slow")
 	fs.BoolVar(&o.RunVirtV2V, "run-virt-v2v", o.RunVirtV2V, "Run virt-v2v-in-place after base copy")
-	fs.StringVar(&o.VirtioISO, "virtio-iso", o.VirtioISO, "VirtIO ISO path for Windows injection")
+	fs.StringVar(&o.VirtioISO, "virtio-iso", o.VirtioISO, "Path to virtio-win ISO or directory used via VIRTIO_WIN for Windows conversion")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
