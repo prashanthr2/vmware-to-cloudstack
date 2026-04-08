@@ -52,6 +52,20 @@ run_root() {
 
 command_exists() { command -v "$1" >/dev/null 2>&1; }
 
+download_file() {
+  local url="$1"
+  local out="$2"
+  if command_exists curl; then
+    run_root curl -fsSL "$url" -o "$out"
+    return
+  fi
+  if command_exists wget; then
+    run_root wget -O "$out" "$url"
+    return
+  fi
+  die "Need curl or wget to download $url"
+}
+
 detect_virtio_win_path() {
   local candidates=(
     /usr/share/virtio-win/virtio-win.iso
@@ -95,11 +109,47 @@ ensure_virtio_win_assets() {
   fi
 
   if [[ "$pkg_mgr" == "dnf" ]]; then
-    run_root dnf -y install virtio-win || warn "Package not installed: virtio-win"
-  elif [[ "$pkg_mgr" == "apt" ]]; then
-    if ! run_root apt-get install -y virtio-win; then
+    local repo_url="https://fedorapeople.org/groups/virt/virtio-win/virtio-win.repo"
+    local repo_path="/etc/yum.repos.d/virtio-win.repo"
+    local tmp_repo
+    tmp_repo="$(mktemp)"
+    download_file "$repo_url" "$tmp_repo"
+    run_root install -m 0644 "$tmp_repo" "$repo_path"
+    rm -f "$tmp_repo"
+    run_root dnf -y makecache || true
+    if ! run_root dnf -y install virtio-win; then
       warn "Package not installed: virtio-win"
     fi
+  elif [[ "$pkg_mgr" == "apt" ]]; then
+    local workdir virtio_rpm virtio_deb srvany_rpm
+    workdir="$(mktemp -d)"
+    virtio_rpm="$workdir/virtio-win.noarch.rpm"
+    srvany_rpm="$workdir/srvany.rpm"
+    run_root apt-get install -y alien rpm2cpio cpio || warn "Package install incomplete: alien/rpm2cpio/cpio"
+    download_file "https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/stable-virtio/virtio-win.noarch.rpm" "$virtio_rpm"
+    (
+      cd "$workdir"
+      run_root alien -d "$virtio_rpm"
+    )
+    virtio_deb="$(find "$workdir" -maxdepth 1 -name 'virtio-win*.deb' | head -n1)"
+    if [[ -n "$virtio_deb" ]]; then
+      run_root dpkg -i "$virtio_deb" || warn "virtio-win DEB install returned non-zero"
+    else
+      warn "Converted virtio-win DEB not found after alien conversion"
+    fi
+
+    run_root mkdir -p /usr/share/virt-tools
+    download_file "https://kojipkgs.fedoraproject.org//packages/mingw-srvany/1.1/4.fc38/noarch/mingw32-srvany-1.1-4.fc38.noarch.rpm" "$srvany_rpm"
+    (
+      cd "$workdir"
+      run_root rpm2cpio "$srvany_rpm" | run_root cpio -idmv
+    ) || warn "Failed to extract srvany helper RPM"
+    if compgen -G "$workdir/usr/i686-w64-mingw32/sys-root/mingw/bin/*exe" >/dev/null; then
+      run_root cp "$workdir"/usr/i686-w64-mingw32/sys-root/mingw/bin/*exe /usr/share/virt-tools/ || warn "Failed to copy srvany helper executables"
+    else
+      warn "srvany helper executables not found in extracted RPM"
+    fi
+    run_root rm -rf "$workdir"
   fi
 
   if normalize_virtio_win_layout; then
@@ -131,7 +181,7 @@ install_dnf_packages() {
 
 install_apt_packages() {
   local base=(build-essential git tar curl ca-certificates golang-go)
-  local tools=(qemu-utils qemu-system-x86 virt-v2v libguestfs-tools rhsrvany)
+  local tools=(qemu-utils qemu-system-x86 virt-v2v libguestfs-tools)
   local ui=(nodejs npm)
   run_root apt-get update
   run_root apt-get install -y "${base[@]}"
