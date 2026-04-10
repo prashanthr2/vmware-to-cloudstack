@@ -37,6 +37,32 @@ The bootstrap script installs required OS packages (Go, qemu tools, virt-v2v, gu
 This project does not redistribute VDDK. Users must obtain VDDK directly from Broadcom and accept Broadcom licensing terms separately.
 For Windows conversions, `virt-v2v-in-place` expects virtio drivers to be available through `VIRTIO_WIN`, which this project resolves from `virt.virtio_iso`, `/usr/share/virtio-win/virtio-win.iso`, or `/usr/share/virtio-win`. Bootstrap prepares this on EL hosts by adding the `virtio-win` Fedora repo and installing `virtio-win`, and on Ubuntu hosts by converting the upstream `virtio-win.noarch.rpm` with `alien` and extracting `srvany` helpers into `/usr/share/virt-tools`.
 
+## Firewall And Connectivity Requirements
+
+Required network access for the current implementation:
+
+- Migration host -> vCenter: `443/TCP`
+  - Used for VMware SDK operations such as inventory, snapshots, CBT queries, shutdown, and CBT enablement.
+- Migration host -> ESXi hosts serving the source VM disks: `902/TCP` and `443/TCP`
+  - VDDK data access uses VMware NFC/VDDK paths and in practice typically requires access to the backing ESXi host, not only vCenter.
+- Migration host -> CloudStack management API: port depends on configured endpoint
+  - Common values:
+  - `80/TCP` for `http://<host>/client/api`
+  - `8080/TCP` for `http://<host>:8080/client/api`
+  - `443/TCP` for `https://<host>/client/api`
+- Migration host -> CloudStack primary storage (NFS): NFS access to the selected export
+  - Ubuntu engine-managed mounts default to NFSv3 over TCP and may require `2049/TCP`, `111/TCP`, and server-side mount/lock service ports.
+  - EL-family hosts often use NFSv4-style mounts by default and typically require at least `2049/TCP`.
+  - If you override mount options with `V2C_NFS_MOUNT_OPTS`, open the ports needed by those options.
+- Browser/admin workstation -> migration host:
+  - `5173/TCP` for the UI
+  - `8000/TCP` for the API if accessed directly
+
+Not required by this tool:
+
+- CloudStack management server -> VMware direct connectivity is not required by this code path.
+- `qemu-nbd` does not open a TCP listener; it uses a local Unix socket only.
+
 ## Quick Start (Clone -> Bootstrap -> UI -> CLI)
 
 1. Clone and enter the repository:
