@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/vmware/govmomi"
+	"github.com/vmware/govmomi/object"
 	"github.com/vmware/govmomi/view"
 	"github.com/vmware/govmomi/vim25/mo"
 	"github.com/vmware/govmomi/vim25/types"
@@ -312,6 +313,7 @@ func (s *apiServer) serve(listenAddr string) error {
 	mux.HandleFunc("/migration/jobs", s.handleMigrationJobs)
 	mux.HandleFunc("/migration/status/", s.handleMigrationStatus)
 	mux.HandleFunc("/migration/finalize/", s.handleMigrationFinalize)
+	mux.HandleFunc("/migration/shutdown/", s.handleMigrationShutdown)
 	mux.HandleFunc("/migration/logs/", s.handleMigrationLogs)
 
 	s.httpServer = &http.Server{
@@ -1024,6 +1026,120 @@ func (s *apiServer) handleMigrationFinalize(w http.ResponseWriter, r *http.Reque
 			}
 			return "Finalize marker created"
 		}(),
+	})
+}
+
+func (s *apiServer) handleMigrationShutdown(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	vmName := strings.TrimPrefix(r.URL.Path, "/migration/shutdown/")
+	vmName, _ = neturl.PathUnescape(vmName)
+	vmName = strings.TrimSpace(vmName)
+	if vmName == "" {
+		writeError(w, http.StatusBadRequest, "vm name is required")
+		return
+	}
+	action := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("action")))
+	if action == "" {
+		writeError(w, http.StatusBadRequest, "action is required")
+		return
+	}
+	if action != "force" && action != "manual" {
+		writeError(w, http.StatusBadRequest, "action must be one of: force, manual")
+		return
+	}
+
+	targetDir := ""
+	if job := s.latestJobForVM(vmName); job != nil {
+		targetDir = s.runtimeDirForJob(job)
+	}
+	if targetDir == "" {
+		dirs := s.candidateVMDirs(vmName)
+		if len(dirs) > 0 {
+			targetDir = dirs[0]
+		}
+	}
+	if targetDir == "" {
+		writeError(w, http.StatusNotFound, fmt.Sprintf("Control directory not found for VM '%s'.", vmName))
+		return
+	}
+
+	st := s.loadStateFromDir(targetDir)
+	if st == nil {
+		writeError(w, http.StatusNotFound, fmt.Sprintf("No migration state found for VM '%s'.", vmName))
+		return
+	}
+	if !st.ShutdownActionRequired && strings.TrimSpace(st.Stage) != stageAwaitingShutdown {
+		writeError(w, http.StatusConflict, fmt.Sprintf("VM '%s' is not waiting for a shutdown action.", vmName))
+		return
+	}
+	if strings.TrimSpace(st.VMMoref) == "" {
+		writeError(w, http.StatusConflict, fmt.Sprintf("VM '%s' does not have VMware runtime information available.", vmName))
+		return
+	}
+
+	forcePath := filepath.Join(targetDir, "SHUTDOWN_FORCE")
+	manualPath := filepath.Join(targetDir, "SHUTDOWN_MANUAL")
+	touchMarker := func(path string) error {
+		f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY, 0o644)
+		if err != nil {
+			return err
+		}
+		return f.Close()
+	}
+
+	if action == "force" {
+		if err := touchMarker(forcePath); err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"vm_name": vmName,
+			"action":  action,
+			"message": "Forced power-off requested. The engine will power off the source VM and continue once it is confirmed off.",
+		})
+		return
+	}
+
+	vc, err := s.vcenterFromRequest(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 45*time.Second)
+	defer cancel()
+	client, err := connectVCenterRuntime(ctx, vc)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, fmt.Sprintf("failed to connect VMware: %v", err))
+		return
+	}
+	defer func() {
+		_ = client.Logout(context.Background())
+	}()
+	vm := object.NewVirtualMachine(client.Client, types.ManagedObjectReference{
+		Type:  "VirtualMachine",
+		Value: strings.TrimSpace(st.VMMoref),
+	})
+	off, err := isVMPoweredOff(ctx, vm)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, fmt.Sprintf("failed to query VMware power state: %v", err))
+		return
+	}
+	if !off {
+		writeError(w, http.StatusConflict, "Source VM is still powered on. Shut it down manually first, then confirm again.")
+		return
+	}
+	if err := touchMarker(manualPath); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"vm_name":     vmName,
+		"action":      action,
+		"powered_off": true,
+		"message":     "Manual shutdown confirmed. The engine will continue with final sync.",
 	})
 }
 
@@ -2225,6 +2341,32 @@ func (s *apiServer) buildStatusPayload(vmName string, st *runState, job *apiJob,
 		"next_stage":          nextStage,
 		"finalize_requested":  finalizeRequested,
 		"finalize_now_requested": finalizeNowRequested,
+		"awaiting_user_action": st != nil && st.ShutdownActionRequired,
+		"required_action": func() any {
+			if st != nil && st.ShutdownActionRequired {
+				return "shutdown_choice"
+			}
+			return nil
+		}(),
+		"shutdown_reason": func() any {
+			if st == nil {
+				return nil
+			}
+			return emptyToNil(strings.TrimSpace(st.ShutdownReason))
+		}(),
+		"shutdown_tools_status": func() any {
+			if st == nil {
+				return nil
+			}
+			return emptyToNil(strings.TrimSpace(st.ShutdownToolsStatus))
+		}(),
+		"shutdown_acpi_attempted": st != nil && st.ShutdownACPIAttempted,
+		"available_actions": func() []string {
+			if st != nil && st.ShutdownActionRequired {
+				return []string{"force_poweroff", "manual_shutdown_done"}
+			}
+			return []string{}
+		}(),
 		"progress":            overall,
 		"overall_progress":    overall,
 		"transfer_speed_mbps": transfer,

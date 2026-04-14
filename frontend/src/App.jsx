@@ -986,6 +986,23 @@ export default function App() {
     [pollStatuses, pushToast, refreshJobs]
   );
 
+  const shutdownVm = useCallback(
+    async (vmName, action) => {
+      try {
+        const response = await apiRequest(
+          `/migration/shutdown/${encodeURIComponent(vmName)}?action=${encodeURIComponent(action)}`,
+          { method: "POST", headers: { ...vmwareHeaders } }
+        );
+        pushToast("success", response?.message || `${vmName}: shutdown action submitted.`);
+        await pollStatuses();
+        await refreshJobs();
+      } catch (err) {
+        pushToast("error", err.message || "Failed to submit shutdown action.");
+      }
+    },
+    [pollStatuses, pushToast, refreshJobs, vmwareHeaders]
+  );
+
   const retryVm = useCallback(
     async (job) => {
       if (!job?.vm_name) {
@@ -1235,6 +1252,8 @@ export default function App() {
           }}
           onFinalize={finalizeVm}
           onFinalizeNow={(vmName) => finalizeVm(vmName, true)}
+          onShutdownForce={(vmName) => shutdownVm(vmName, "force")}
+          onShutdownManual={(vmName) => shutdownVm(vmName, "manual")}
           onRetry={retryVm}
           logsSection={
             <div className="logs-pane">
@@ -1247,6 +1266,7 @@ export default function App() {
                 <div><h4>STDOUT</h4><pre>{logs.stdout || "No stdout logs available."}</pre></div>
                 <div><h4>STDERR</h4><pre>{logs.stderr || "No stderr logs available."}</pre></div>
               </div>
+              {selectedVmStatus?.shutdown_reason ? <p className="field-error">{selectedVmStatus.shutdown_reason}</p> : null}
               {selectedVmStatus?.job_error ? <p className="field-error">{selectedVmStatus.job_error}</p> : null}
             </div>
           }

@@ -1724,6 +1724,10 @@ type runState struct {
 	CloudStackConfigured bool                `json:"cloudstack_configured,omitempty"`
 	CloudStackStarted bool                   `json:"cloudstack_started,omitempty"`
 	VirtV2VDone     bool                     `json:"virt_v2v_done,omitempty"`
+	ShutdownActionRequired bool              `json:"shutdown_action_required,omitempty"`
+	ShutdownReason         string            `json:"shutdown_reason,omitempty"`
+	ShutdownToolsStatus    string            `json:"shutdown_tools_status,omitempty"`
+	ShutdownACPIAttempted  bool              `json:"shutdown_acpi_attempted,omitempty"`
 	Progress        float64                  `json:"progress,omitempty"`
 	TransferSpeedMB float64                  `json:"transfer_speed_mbps,omitempty"`
 	LastError       string                   `json:"last_error,omitempty"`
@@ -1734,12 +1738,21 @@ const (
 	stageInit          = "init"
 	stageBaseCopy      = "base_copy"
 	stageDelta         = "delta"
+	stageAwaitingShutdown = "awaiting_shutdown_action"
 	stageFinalSync     = "final_sync"
 	stageConverting    = "converting"
 	stageImportRoot    = "import_root_disk"
 	stageImportData    = "import_data_disk"
 	stageDone          = "done"
 )
+
+type shutdownFinalizeResult struct {
+	PoweredOff     bool
+	AwaitingAction bool
+	ToolsStatus    string
+	ACPIAttempted  bool
+	Message        string
+}
 
 type baseCopyOptions struct {
 	VDDK             vddkConnCfg
@@ -3116,18 +3129,81 @@ func waitForPowerOff(ctx context.Context, vm *object.VirtualMachine, timeout tim
 	}
 }
 
-func shutdownVMForFinalize(ctx context.Context, client *govmomi.Client, vm *object.VirtualMachine, mode string, log *runLogger) error {
+func clearShutdownWaitState(st *runState) {
+	if st == nil {
+		return
+	}
+	st.ShutdownActionRequired = false
+	st.ShutdownReason = ""
+	st.ShutdownToolsStatus = ""
+	st.ShutdownACPIAttempted = false
+}
+
+func waitForShutdownResolution(
+	ctx context.Context,
+	vm *object.VirtualMachine,
+	controlDir string,
+	stateMu *sync.Mutex,
+	statePath string,
+	st *runState,
+	log *runLogger,
+) error {
+	shutdownForceFile := filepath.Join(controlDir, "SHUTDOWN_FORCE")
+	shutdownManualFile := filepath.Join(controlDir, "SHUTDOWN_MANUAL")
+
+	log.Printf("Waiting for shutdown action. Available actions: force power off, or shut down manually and confirm.")
+	for {
+		off, err := isVMPoweredOff(ctx, vm)
+		if err != nil {
+			return err
+		}
+		if off {
+			log.Printf("Source VM is now powered off; resuming finalize flow")
+			stateMu.Lock()
+			clearShutdownWaitState(st)
+			_ = saveRunState(statePath, st)
+			stateMu.Unlock()
+			_ = os.Remove(shutdownForceFile)
+			_ = os.Remove(shutdownManualFile)
+			return nil
+		}
+
+		if fileExists(shutdownForceFile) {
+			log.Printf("User requested forced power off")
+			task, err := vm.PowerOff(ctx)
+			if err != nil {
+				return err
+			}
+			if _, err := task.WaitForResult(ctx, nil); err != nil {
+				return err
+			}
+			_ = os.Remove(shutdownForceFile)
+			continue
+		}
+
+		if fileExists(shutdownManualFile) {
+			_ = os.Remove(shutdownManualFile)
+			log.Printf("Manual shutdown confirmation received, checking VM power state")
+		}
+
+		if err := waitWithContext(ctx, 5*time.Second); err != nil {
+			return err
+		}
+	}
+}
+
+func shutdownVMForFinalize(ctx context.Context, client *govmomi.Client, vm *object.VirtualMachine, mode string, log *runLogger) (shutdownFinalizeResult, error) {
 	mode = strings.ToLower(strings.TrimSpace(mode))
 	if mode == "" {
 		mode = "auto"
 	}
 	off, err := isVMPoweredOff(ctx, vm)
 	if err != nil {
-		return err
+		return shutdownFinalizeResult{}, err
 	}
 	if off {
 		log.Printf("Source VM already powered off")
-		return nil
+		return shutdownFinalizeResult{PoweredOff: true}, nil
 	}
 
 	switch mode {
@@ -3140,41 +3216,60 @@ func shutdownVMForFinalize(ctx context.Context, client *govmomi.Client, vm *obje
 			}
 			if err := waitForPowerOff(ctx, vm, 5*time.Minute); err == nil {
 				log.Printf("Guest shutdown completed")
-				return nil
+				return shutdownFinalizeResult{PoweredOff: true, ToolsStatus: status}, nil
 			}
 			log.Printf("Graceful shutdown timed out; forcing power off")
-		} else {
-			log.Printf("VMware Tools not running (status=%s); forcing power off", status)
+			task, err := vm.PowerOff(ctx)
+			if err != nil {
+				return shutdownFinalizeResult{}, err
+			}
+			_, err = task.WaitForResult(ctx, nil)
+			return shutdownFinalizeResult{PoweredOff: err == nil, ToolsStatus: status}, err
 		}
-		task, err := vm.PowerOff(ctx)
-		if err != nil {
-			return err
+
+		log.Printf("VMware Tools not running (status=%s); attempting ACPI power button", status)
+		result := shutdownFinalizeResult{
+			ToolsStatus:   status,
+			ACPIAttempted: true,
 		}
-		_, err = task.WaitForResult(ctx, nil)
-		return err
+		if err := vm.PushPowerButton(ctx); err != nil {
+			log.Printf("ACPI power button request failed: %v", err)
+			result.AwaitingAction = true
+			result.Message = fmt.Sprintf("VMware Tools unavailable (status=%s) and ACPI shutdown request failed: %v", status, err)
+			return result, nil
+		}
+		if err := waitForPowerOff(ctx, vm, 2*time.Minute); err == nil {
+			log.Printf("ACPI power button shutdown completed")
+			result.PoweredOff = true
+			return result, nil
+		}
+		result.AwaitingAction = true
+		result.Message = fmt.Sprintf("VMware Tools unavailable (status=%s) and ACPI shutdown did not complete within timeout", status)
+		log.Printf(result.Message)
+		return result, nil
 	case "force":
 		log.Printf("Forcing source VM power off")
 		task, err := vm.PowerOff(ctx)
 		if err != nil {
-			return err
+			return shutdownFinalizeResult{}, err
 		}
 		_, err = task.WaitForResult(ctx, nil)
-		return err
+		return shutdownFinalizeResult{PoweredOff: err == nil}, err
 	case "manual":
 		log.Printf("Waiting for manual shutdown of source VM")
 		for {
 			off, err := isVMPoweredOff(ctx, vm)
 			if err != nil {
-				return err
+				return shutdownFinalizeResult{}, err
 			}
 			if off {
 				log.Printf("Manual shutdown detected")
-				return nil
+				return shutdownFinalizeResult{PoweredOff: true}, nil
 			}
 			time.Sleep(5 * time.Second)
 		}
 	default:
-		return fmt.Errorf("invalid shutdown_mode: %s (expected auto|force|manual)", mode)
+		return shutdownFinalizeResult{}, fmt.Errorf("invalid shutdown_mode: %s (expected auto|force|manual)", mode)
 	}
 }
 
@@ -4513,6 +4608,8 @@ func nextStageForStatus(currentStage string, runVirtV2V bool, finalizeRequested 
 			return "Finalize"
 		}
 		return stageDelta
+	case stageAwaitingShutdown:
+		return "Shutdown action"
 	case stageFinalSync:
 		if runVirtV2V {
 			return stageConverting
@@ -4727,6 +4824,8 @@ func runVMWorkflow(ctx context.Context, cfg *appConfig, spec *runSpec, opts runO
 	legacyStatePath := filepath.Join(controlDir, "state.engine.json")
 	finalizeFile := filepath.Join(controlDir, "FINALIZE")
 	finalizeNowFile := filepath.Join(controlDir, "FINALIZE_NOW")
+	shutdownForceFile := filepath.Join(controlDir, "SHUTDOWN_FORCE")
+	shutdownManualFile := filepath.Join(controlDir, "SHUTDOWN_MANUAL")
 	log.Printf("Starting workflow vm=%s moref=%s", spec.VM.Name, vmMoref)
 
 	vmRef := vmObj.Reference()
@@ -5542,10 +5641,47 @@ func runVMWorkflow(ctx context.Context, cfg *appConfig, spec *runSpec, opts runO
 
 			if finalizeNow {
 				log.Printf("FINALIZE detected, ensuring source VM is powered off (mode=%s)", shutdownMode)
-				if err := withVCenterRetry("shutdown source VM for finalize", func(c *govmomi.Client, v *object.VirtualMachine) error {
-					return shutdownVMForFinalize(ctx, c, v, shutdownMode, log)
-				}); err != nil {
-					return fmt.Errorf("failed to shutdown source VM before final sync: %w", err)
+				if st.Stage == stageAwaitingShutdown && st.ShutdownActionRequired {
+					log.Printf("Resuming wait for shutdown action")
+					if err := withVCenterRetry("wait for shutdown action", func(c *govmomi.Client, v *object.VirtualMachine) error {
+						return waitForShutdownResolution(ctx, v, controlDir, stateMu, statePath, st, log)
+					}); err != nil {
+						return fmt.Errorf("failed while waiting for shutdown action: %w", err)
+					}
+					_ = os.Remove(shutdownForceFile)
+					_ = os.Remove(shutdownManualFile)
+				} else {
+					var shutdownResult shutdownFinalizeResult
+					if err := withVCenterRetry("shutdown source VM for finalize", func(c *govmomi.Client, v *object.VirtualMachine) error {
+						var callErr error
+						shutdownResult, callErr = shutdownVMForFinalize(ctx, c, v, shutdownMode, log)
+						return callErr
+					}); err != nil {
+						return fmt.Errorf("failed to shutdown source VM before final sync: %w", err)
+					}
+					if shutdownResult.AwaitingAction {
+						stateMu.Lock()
+						st.Stage = stageAwaitingShutdown
+						st.ShutdownActionRequired = true
+						st.ShutdownReason = shutdownResult.Message
+						st.ShutdownToolsStatus = shutdownResult.ToolsStatus
+						st.ShutdownACPIAttempted = shutdownResult.ACPIAttempted
+						_ = saveRunState(statePath, st)
+						stateMu.Unlock()
+						log.Printf("Waiting for user shutdown action: %s", shutdownResult.Message)
+						if err := withVCenterRetry("wait for shutdown action", func(c *govmomi.Client, v *object.VirtualMachine) error {
+							return waitForShutdownResolution(ctx, v, controlDir, stateMu, statePath, st, log)
+						}); err != nil {
+							return fmt.Errorf("failed while waiting for shutdown action: %w", err)
+						}
+						_ = os.Remove(shutdownForceFile)
+						_ = os.Remove(shutdownManualFile)
+					} else {
+						stateMu.Lock()
+						clearShutdownWaitState(st)
+						_ = saveRunState(statePath, st)
+						stateMu.Unlock()
+					}
 				}
 				if finalizeSettleSeconds > 0 {
 					log.Printf("Waiting %ds finalize settle delay before final snapshot (guest_family=%s)", finalizeSettleSeconds, guestFamily)

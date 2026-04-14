@@ -27,6 +27,8 @@ export default function MigrationProgress({
   onSelectJob,
   onFinalize,
   onFinalizeNow,
+  onShutdownForce,
+  onShutdownManual,
   onRetry,
   logsSection,
 }) {
@@ -81,13 +83,14 @@ export default function MigrationProgress({
                   ((jobStatus === "completed" || jobStatus === "failed") ? status.updated_at : null);
                 const finalizeRequested = Boolean(status.finalize_requested);
                 const finalizeNowRequested = Boolean(status.finalize_now_requested);
+                const awaitingUserAction = Boolean(status.awaiting_user_action);
                 const stage = status.stage || job.stage || "-";
                 const nextStage = status.next_stage || "-";
                 const statusLower = typeof jobStatus === "string" ? jobStatus.toLowerCase() : "";
                 const finalizeButtonDisabled =
-                  finalizeRequested || stage === "done" || stage === "final_sync";
+                  finalizeRequested || stage === "done" || stage === "final_sync" || awaitingUserAction;
                 const finalizeNowButtonDisabled =
-                  finalizeNowRequested || stage === "done" || stage === "final_sync";
+                  finalizeNowRequested || stage === "done" || stage === "final_sync" || awaitingUserAction;
                 const retryDisabled = statusLower !== "failed";
 
                 return (
@@ -141,6 +144,24 @@ export default function MigrationProgress({
                       >
                         {finalizeNowRequested ? "Finalize Now Requested" : "Finalize Now"}
                       </button>
+                      {awaitingUserAction ? (
+                        <>
+                          <button
+                            className="secondary"
+                            onClick={() => onShutdownForce(job.vm_name)}
+                            title="Request forced power off so migration can continue"
+                          >
+                            Force Power Off
+                          </button>
+                          <button
+                            className="secondary"
+                            onClick={() => onShutdownManual(job.vm_name)}
+                            title="Confirm the VM has been shut down manually"
+                          >
+                            Manual Shutdown Done
+                          </button>
+                        </>
+                      ) : null}
                     </td>
                   </tr>
                 );
