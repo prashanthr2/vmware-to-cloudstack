@@ -3227,24 +3227,13 @@ func shutdownVMForFinalize(ctx context.Context, client *govmomi.Client, vm *obje
 			return shutdownFinalizeResult{PoweredOff: err == nil, ToolsStatus: status}, err
 		}
 
-		log.Printf("VMware Tools not running (status=%s); attempting ACPI power button", status)
+		log.Printf("VMware Tools not running (status=%s); awaiting user shutdown choice", status)
 		result := shutdownFinalizeResult{
 			ToolsStatus:   status,
-			ACPIAttempted: true,
-		}
-		if err := vm.PushPowerButton(ctx); err != nil {
-			log.Printf("ACPI power button request failed: %v", err)
-			result.AwaitingAction = true
-			result.Message = fmt.Sprintf("VMware Tools unavailable (status=%s) and ACPI shutdown request failed: %v", status, err)
-			return result, nil
-		}
-		if err := waitForPowerOff(ctx, vm, 2*time.Minute); err == nil {
-			log.Printf("ACPI power button shutdown completed")
-			result.PoweredOff = true
-			return result, nil
+			ACPIAttempted: false,
 		}
 		result.AwaitingAction = true
-		result.Message = fmt.Sprintf("VMware Tools unavailable (status=%s) and ACPI shutdown did not complete within timeout", status)
+		result.Message = fmt.Sprintf("VMware Tools unavailable (status=%s). Choose whether to force power off the source VM or shut it down manually, then confirm once it is powered off.", status)
 		log.Printf(result.Message)
 		return result, nil
 	case "force":
