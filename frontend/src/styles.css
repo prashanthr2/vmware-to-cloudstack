@@ -290,9 +290,78 @@ td {
   border-color: #5f7eb0;
 }
 
+.pill.attention {
+  background: #fff3d9;
+  border-color: #c98b1a;
+  color: #704500;
+}
+
 .row-actions {
   display: flex;
   gap: 6px;
+}
+
+.status-stack {
+  display: grid;
+  gap: 6px;
+}
+
+.pending-actions-panel {
+  display: grid;
+  gap: 12px;
+  margin-bottom: 14px;
+  padding: 14px;
+  border: 1px solid #e3bf77;
+  border-radius: 12px;
+  background: linear-gradient(135deg, #fff8ea 0%, #fff1d6 100%);
+}
+
+.pending-actions-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 12px;
+}
+
+.pending-actions-header h3 {
+  margin: 0 0 4px;
+}
+
+.pending-actions-header p {
+  margin: 0;
+  color: #6a5130;
+}
+
+.pending-actions-list {
+  display: grid;
+  gap: 10px;
+}
+
+.pending-action-card {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 12px;
+  border: 1px solid #ebcf9f;
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.78);
+  padding: 12px;
+}
+
+.pending-action-copy {
+  display: grid;
+  gap: 4px;
+}
+
+.pending-action-copy span {
+  color: #654f35;
+}
+
+.pending-action-buttons {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
 }
 
 .logs-pane {
@@ -363,6 +432,10 @@ pre {
   background: #edf8f3;
 }
 
+.pending-action-row {
+  background: #fffaf0;
+}
+
 .toast-stack {
   position: fixed;
   top: 16px;
@@ -398,5 +471,14 @@ pre {
 
   .progress-track {
     width: 130px;
+  }
+
+  .pending-actions-header,
+  .pending-action-card {
+    flex-direction: column;
+  }
+
+  .pending-action-buttons {
+    justify-content: flex-start;
   }
 }

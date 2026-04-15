@@ -32,6 +32,17 @@ export default function MigrationProgress({
   onRetry,
   logsSection,
 }) {
+  const pendingJobs = jobs
+    .map((job) => {
+      const status = statusByJob[job.job_id] || {};
+      return {
+        job,
+        status,
+        awaitingUserAction: Boolean(status.awaiting_user_action),
+      };
+    })
+    .filter((entry) => entry.awaitingUserAction);
+
   return (
     <section className="panel">
       <div className="subsection-title-row">
@@ -45,6 +56,55 @@ export default function MigrationProgress({
           Show History
         </label>
       </div>
+
+      {pendingJobs.length > 0 ? (
+        <div className="pending-actions-panel">
+          <div className="pending-actions-header">
+            <div>
+              <h3>Pending Actions</h3>
+              <p>
+                {pendingJobs.length === 1
+                  ? "One VM is waiting for operator input before migration can continue."
+                  : `${pendingJobs.length} VMs are waiting for operator input before migration can continue.`}
+              </p>
+            </div>
+            <span className="pill attention">Action Required</span>
+          </div>
+          <div className="pending-actions-list">
+            {pendingJobs.map(({ job, status }) => (
+              <div key={`pending-${job.job_id}`} className="pending-action-card">
+                <div className="pending-action-copy">
+                  <strong>{job.vm_name}</strong>
+                  <span>{status.shutdown_reason || "User confirmation is required to continue finalize."}</span>
+                </div>
+                <div className="pending-action-buttons">
+                  <button
+                    className="secondary"
+                    onClick={() => onSelectJob(job)}
+                    title="Open this migration in the details pane"
+                  >
+                    View Details
+                  </button>
+                  <button
+                    className="secondary"
+                    onClick={() => onShutdownForce(job.vm_name)}
+                    title="Request forced power off so migration can continue"
+                  >
+                    Force Power Off
+                  </button>
+                  <button
+                    className="secondary"
+                    onClick={() => onShutdownManual(job.vm_name)}
+                    title="Confirm the VM has been shut down manually"
+                  >
+                    Manual Shutdown Done
+                  </button>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      ) : null}
 
       <div className="table-wrap">
         <table>
@@ -85,7 +145,7 @@ export default function MigrationProgress({
                 const finalizeNowRequested = Boolean(status.finalize_now_requested);
                 const awaitingUserAction = Boolean(status.awaiting_user_action);
                 const stage = status.stage || job.stage || "-";
-                const nextStage = status.next_stage || "-";
+                const nextStage = awaitingUserAction ? "Operator action required" : (status.next_stage || "-");
                 const statusLower = typeof jobStatus === "string" ? jobStatus.toLowerCase() : "";
                 const finalizeButtonDisabled =
                   finalizeRequested || stage === "done" || stage === "final_sync" || awaitingUserAction;
@@ -94,10 +154,21 @@ export default function MigrationProgress({
                 const retryDisabled = statusLower !== "failed";
 
                 return (
-                  <tr key={job.job_id} className={selectedJobId === job.job_id ? "selected-row" : ""}>
+                  <tr
+                    key={job.job_id}
+                    className={[
+                      selectedJobId === job.job_id ? "selected-row" : "",
+                      awaitingUserAction ? "pending-action-row" : "",
+                    ].filter(Boolean).join(" ")}
+                  >
                     <td>{job.vm_name}</td>
                     <td><code>{job.job_id.slice(0, 8)}</code></td>
-                    <td><span className={`pill ${statusClass}`}>{jobStatus}</span></td>
+                    <td>
+                      <div className="status-stack">
+                        <span className={`pill ${statusClass}`}>{jobStatus}</span>
+                        {awaitingUserAction ? <span className="pill attention">Action Required</span> : null}
+                      </div>
+                    </td>
                     <td>{stage}</td>
                     <td>{nextStage}</td>
                     <td>
