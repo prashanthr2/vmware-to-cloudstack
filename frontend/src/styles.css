@@ -556,6 +556,18 @@ tbody tr:hover {
   margin-top: 4px;
 }
 
+.storage-warning {
+  margin-top: 12px;
+  padding: 10px 12px;
+  border: 1px solid #d4633d;
+  border-radius: 8px;
+  background: #fff4ef;
+}
+
+.storage-warning h4 {
+  margin: 0 0 6px 0;
+}
+
 .status-stack {
   display: grid;
   gap: 6px;
