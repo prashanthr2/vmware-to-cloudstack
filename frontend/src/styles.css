@@ -120,6 +120,60 @@ label {
   color: #1f2f2b;
 }
 
+.label-with-help {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.info-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  border-radius: 999px;
+  border: 1px solid #6d9489;
+  background: #f4faf8;
+  color: #1b5a4d;
+  font-size: 0.78rem;
+  font-weight: 700;
+  line-height: 1;
+}
+
+.info-button:hover {
+  background: #e6f4ef;
+}
+
+.field-help {
+  border: 1px solid #c9ddd6;
+  border-radius: 10px;
+  background: #f7fbfa;
+  padding: 10px 12px;
+  color: #29443e;
+  font-weight: 500;
+}
+
+.field-help strong {
+  display: block;
+  margin-bottom: 4px;
+  color: #173b34;
+}
+
+.field-help p {
+  margin: 0 0 8px;
+}
+
+.field-help ul {
+  margin: 0;
+  padding-left: 18px;
+}
+
+.field-help li + li {
+  margin-top: 4px;
+}
+
 .checkbox-field {
   flex-direction: row;
   align-items: center;
@@ -132,6 +186,16 @@ label {
   width: 16px;
   height: 16px;
   margin: 0;
+}
+
+.checkbox-field-with-help {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 8px;
+}
+
+.checkbox-field-with-help .label-with-help {
+  align-self: flex-start;
 }
 
 input,

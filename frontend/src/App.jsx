@@ -57,6 +57,133 @@ const NIC_ADAPTER_OPTIONS = [
   { value: "pcnet", label: "pcnet" },
 ];
 
+const SHUTDOWN_MODE_OPTIONS = [
+  { value: "", label: "Default (auto)" },
+  { value: "auto", label: "auto" },
+  { value: "manual", label: "manual" },
+  { value: "force", label: "force" },
+];
+
+const SNAPSHOT_QUIESCE_OPTIONS = [
+  { value: "", label: "Default (auto)" },
+  { value: "auto", label: "auto" },
+  { value: "true", label: "true" },
+  { value: "false", label: "false" },
+];
+
+const MIGRATION_FIELD_HELP = {
+  delta_interval: {
+    title: "Delta Interval",
+    description: "Controls how often the warm migration loop runs another CBT delta pass before cutover.",
+    bullets: [
+      "Unit: seconds.",
+      "Lower values reduce data drift but increase snapshot and sync activity.",
+      "Higher values reduce load but can increase cutover work at finalize time.",
+    ],
+  },
+  finalize_at: {
+    title: "Finalize At",
+    description: "Schedules automatic cutover at a specific time in ISO-8601 format.",
+    bullets: [
+      "Example: 2026-03-12T23:30:00+00:00.",
+      "Before that time, the engine continues normal delta syncs.",
+      "When the time arrives, the engine starts the finalize workflow automatically.",
+    ],
+  },
+  finalize_delta_interval: {
+    title: "Finalize Delta Interval",
+    description: "Shorter sync interval used when the engine is inside the finalize window before scheduled cutover.",
+    bullets: [
+      "Unit: seconds.",
+      "Leave empty to use the engine default.",
+      "Useful when you want tighter sync loops close to cutover.",
+    ],
+  },
+  finalize_settle_seconds: {
+    title: "Finalize Settle Delay",
+    description: "Wait time after the source VM is powered off and before the final snapshot is taken.",
+    bullets: [
+      "Unit: seconds.",
+      "Default is automatic: 30 seconds for Windows, 15 seconds for Linux/other.",
+      "Helps the guest and storage settle before final sync.",
+    ],
+  },
+  finalize_window: {
+    title: "Finalize Window",
+    description: "Window before the scheduled finalize time during which the engine uses the finalize delta interval.",
+    bullets: [
+      "Unit: seconds.",
+      "Only used together with Finalize At.",
+      "Lets the engine tighten sync cadence close to the planned cutover.",
+    ],
+  },
+  shutdown_mode: {
+    title: "Shutdown Mode",
+    description: "Controls how the engine handles source VM power-off during finalize.",
+    bullets: [
+      "auto: use VMware Tools guest shutdown when available; if Tools are unavailable, the migration pauses and asks for operator action.",
+      "manual: wait until the source VM is powered off manually, then continue.",
+      "force: issue a hard VMware power-off immediately during finalize.",
+    ],
+  },
+  snapshot_quiesce: {
+    title: "Snapshot Quiesce",
+    description: "Controls whether VMware snapshots should be requested as quiesced snapshots.",
+    bullets: [
+      "auto: try quiesced snapshots when VMware Tools are healthy; otherwise fall back to non-quiesced.",
+      "true: require quiesced snapshots and fail if VMware cannot create one.",
+      "false: always create non-quiesced snapshots.",
+    ],
+  },
+  start_vm_after_import: {
+    title: "Start Imported VM",
+    description: "Controls whether the imported CloudStack VM is started automatically after import finishes.",
+    bullets: [
+      "Enabled: start the VM automatically after import/configuration.",
+      "Disabled: leave the imported VM powered off for manual inspection first.",
+    ],
+  },
+};
+
+function StrategyField({ label, helpKey, openHelpKey, onToggleHelp, children, className = "" }) {
+  const help = helpKey ? MIGRATION_FIELD_HELP[helpKey] : null;
+  return (
+    <label className={className}>
+      <span className="label-with-help">
+        <span>{label}</span>
+        {help ? (
+          <button
+            type="button"
+            className="info-button"
+            aria-label={`Explain ${label}`}
+            aria-expanded={openHelpKey === helpKey}
+            onClick={(event) => {
+              event.preventDefault();
+              onToggleHelp(helpKey);
+            }}
+          >
+            i
+          </button>
+        ) : null}
+      </span>
+      {help && openHelpKey === helpKey ? (
+        <div className="field-help">
+          <strong>{help.title}</strong>
+          <p>{help.description}</p>
+          {help.bullets?.length ? (
+            <ul>
+              {help.bullets.map((item) => (
+                <li key={item}>{item}</li>
+              ))}
+            </ul>
+          ) : null}
+        </div>
+      ) : null}
+      {children}
+    </label>
+  );
+}
+
 function optionLabel(item) {
   return item.name || item.description || item.displaytext || item.id || "Unknown";
 }
@@ -241,6 +368,7 @@ export default function App() {
   const [busy, setBusy] = useState(false);
   const [inventoryBusy, setInventoryBusy] = useState(false);
   const [vmDisksLoading, setVmDisksLoading] = useState(false);
+  const [openHelpKey, setOpenHelpKey] = useState("");
 
   const [vmwareVms, setVmwareVms] = useState([]);
   const [showVmwareTemplates, setShowVmwareTemplates] = useState(false);
@@ -1128,14 +1256,37 @@ export default function App() {
                   <label>UEFI Boot Mode<select value={activeDraft.bootmode} onChange={(e) => updateField("bootmode", e.target.value)} disabled={activeDraft.boottype !== "UEFI"}>{UEFI_BOOT_MODE_OPTIONS.map((item) => <option key={item.value || "default"} value={item.value}>{item.label}</option>)}</select></label>
                   <label>Root Disk Controller<select value={activeDraft.rootdiskcontroller} onChange={(e) => updateField("rootdiskcontroller", e.target.value)}>{ROOT_DISK_CONTROLLER_OPTIONS.map((item) => <option key={item.value || "default"} value={item.value}>{item.label}</option>)}</select></label>
                   <label>NIC Adapter<select value={activeDraft.nicadapter} onChange={(e) => updateField("nicadapter", e.target.value)}>{NIC_ADAPTER_OPTIONS.map((item) => <option key={item.value || "default"} value={item.value}>{item.label}</option>)}</select></label>
-                  <label>Delta Interval (sec)<input type="number" min="1" value={activeDraft.migration.delta_interval} onChange={(e) => updateMigrationField("delta_interval", e.target.value)} /></label>
-                  <label>Finalize At (ISO)<input value={activeDraft.migration.finalize_at} onChange={(e) => updateMigrationField("finalize_at", e.target.value)} placeholder="2026-03-12T23:30:00+00:00" /></label>
-                  <label>Finalize Delta Interval<input type="number" min="1" value={activeDraft.migration.finalize_delta_interval} onChange={(e) => updateMigrationField("finalize_delta_interval", e.target.value)} /></label>
-                  <label>Finalize Settle Delay (sec)<input type="number" min="1" value={activeDraft.migration.finalize_settle_seconds} onChange={(e) => updateMigrationField("finalize_settle_seconds", e.target.value)} placeholder="Default: 30 Windows / 15 Linux" /></label>
-                  <label>Finalize Window<input type="number" min="1" value={activeDraft.migration.finalize_window} onChange={(e) => updateMigrationField("finalize_window", e.target.value)} /></label>
-                  <label>Shutdown Mode<input value={activeDraft.migration.shutdown_mode} onChange={(e) => updateMigrationField("shutdown_mode", e.target.value)} placeholder="auto" /></label>
-                  <label>Snapshot Quiesce<input value={activeDraft.migration.snapshot_quiesce} onChange={(e) => updateMigrationField("snapshot_quiesce", e.target.value)} placeholder="auto" /></label>
-                  <label className="checkbox-field"><input type="checkbox" checked={Boolean(activeDraft.migration.start_vm_after_import)} onChange={(e) => updateMigrationField("start_vm_after_import", e.target.checked)} />Start imported VM after CloudStack import</label>
+                  <StrategyField label="Delta Interval (sec)" helpKey="delta_interval" openHelpKey={openHelpKey} onToggleHelp={(key) => setOpenHelpKey((current) => current === key ? "" : key)}>
+                    <input type="number" min="1" value={activeDraft.migration.delta_interval} onChange={(e) => updateMigrationField("delta_interval", e.target.value)} />
+                  </StrategyField>
+                  <StrategyField label="Finalize At (ISO)" helpKey="finalize_at" openHelpKey={openHelpKey} onToggleHelp={(key) => setOpenHelpKey((current) => current === key ? "" : key)}>
+                    <input value={activeDraft.migration.finalize_at} onChange={(e) => updateMigrationField("finalize_at", e.target.value)} placeholder="2026-03-12T23:30:00+00:00" />
+                  </StrategyField>
+                  <StrategyField label="Finalize Delta Interval" helpKey="finalize_delta_interval" openHelpKey={openHelpKey} onToggleHelp={(key) => setOpenHelpKey((current) => current === key ? "" : key)}>
+                    <input type="number" min="1" value={activeDraft.migration.finalize_delta_interval} onChange={(e) => updateMigrationField("finalize_delta_interval", e.target.value)} />
+                  </StrategyField>
+                  <StrategyField label="Finalize Settle Delay (sec)" helpKey="finalize_settle_seconds" openHelpKey={openHelpKey} onToggleHelp={(key) => setOpenHelpKey((current) => current === key ? "" : key)}>
+                    <input type="number" min="1" value={activeDraft.migration.finalize_settle_seconds} onChange={(e) => updateMigrationField("finalize_settle_seconds", e.target.value)} placeholder="Default: 30 Windows / 15 Linux" />
+                  </StrategyField>
+                  <StrategyField label="Finalize Window" helpKey="finalize_window" openHelpKey={openHelpKey} onToggleHelp={(key) => setOpenHelpKey((current) => current === key ? "" : key)}>
+                    <input type="number" min="1" value={activeDraft.migration.finalize_window} onChange={(e) => updateMigrationField("finalize_window", e.target.value)} />
+                  </StrategyField>
+                  <StrategyField label="Shutdown Mode" helpKey="shutdown_mode" openHelpKey={openHelpKey} onToggleHelp={(key) => setOpenHelpKey((current) => current === key ? "" : key)}>
+                    <select value={activeDraft.migration.shutdown_mode} onChange={(e) => updateMigrationField("shutdown_mode", e.target.value)}>
+                      {SHUTDOWN_MODE_OPTIONS.map((item) => <option key={item.value || "default"} value={item.value}>{item.label}</option>)}
+                    </select>
+                  </StrategyField>
+                  <StrategyField label="Snapshot Quiesce" helpKey="snapshot_quiesce" openHelpKey={openHelpKey} onToggleHelp={(key) => setOpenHelpKey((current) => current === key ? "" : key)}>
+                    <select value={activeDraft.migration.snapshot_quiesce} onChange={(e) => updateMigrationField("snapshot_quiesce", e.target.value)}>
+                      {SNAPSHOT_QUIESCE_OPTIONS.map((item) => <option key={item.value || "default"} value={item.value}>{item.label}</option>)}
+                    </select>
+                  </StrategyField>
+                  <StrategyField label="Start Imported VM" helpKey="start_vm_after_import" openHelpKey={openHelpKey} onToggleHelp={(key) => setOpenHelpKey((current) => current === key ? "" : key)} className="checkbox-field checkbox-field-with-help">
+                    <span className="checkbox-inline">
+                      <input type="checkbox" checked={Boolean(activeDraft.migration.start_vm_after_import)} onChange={(e) => updateMigrationField("start_vm_after_import", e.target.checked)} />
+                      <span>Start imported VM after CloudStack import</span>
+                    </span>
+                  </StrategyField>
                 </div>
               </section>
 
