@@ -1763,15 +1763,21 @@ type runState struct {
 }
 
 const (
-	stageInit          = "init"
-	stageBaseCopy      = "base_copy"
-	stageDelta         = "delta"
-	stageAwaitingShutdown = "awaiting_shutdown_action"
-	stageFinalSync     = "final_sync"
-	stageConverting    = "converting"
-	stageImportRoot    = "import_root_disk"
-	stageImportData    = "import_data_disk"
-	stageDone          = "done"
+	stageInit               = "init"
+	stageConnectVCenter     = "connecting_vcenter"
+	stageFindVM             = "finding_vm"
+	stageDiscoverDisks      = "discovering_vmware_disks"
+	stagePrepareStorage     = "preparing_target_storage"
+	stageEnableCBT          = "enabling_cbt"
+	stageCreateBaseSnapshot = "creating_base_snapshot"
+	stageBaseCopy           = "base_copy"
+	stageDelta              = "delta"
+	stageAwaitingShutdown   = "awaiting_shutdown_action"
+	stageFinalSync          = "final_sync"
+	stageConverting         = "converting"
+	stageImportRoot         = "import_root_disk"
+	stageImportData         = "import_data_disk"
+	stageDone               = "done"
 )
 
 type shutdownFinalizeResult struct {
@@ -4695,10 +4701,22 @@ func effectiveRunVirtV2V(cfg *appConfig, spec *runSpec) bool {
 func nextStageForStatus(currentStage string, runVirtV2V bool, finalizeRequested bool) string {
 	switch strings.TrimSpace(currentStage) {
 	case "":
-		return stageInit
+		return stageConnectVCenter
 	case "not_started":
-		return stageInit
+		return stageConnectVCenter
 	case stageInit:
+		return stageDiscoverDisks
+	case stageConnectVCenter:
+		return stageFindVM
+	case stageFindVM:
+		return stageDiscoverDisks
+	case stageDiscoverDisks:
+		return stagePrepareStorage
+	case stagePrepareStorage:
+		return stageEnableCBT
+	case stageEnableCBT:
+		return stageCreateBaseSnapshot
+	case stageCreateBaseSnapshot:
 		return stageBaseCopy
 	case stageBaseCopy:
 		return stageDelta
@@ -4724,6 +4742,15 @@ func nextStageForStatus(currentStage string, runVirtV2V bool, finalizeRequested 
 		return "none"
 	default:
 		return "unknown"
+	}
+}
+
+func isPreBaseCopyStage(stage string) bool {
+	switch strings.TrimSpace(stage) {
+	case "", stageInit, stageDiscoverDisks, stagePrepareStorage, stageEnableCBT, stageCreateBaseSnapshot:
+		return true
+	default:
+		return false
 	}
 }
 
@@ -4927,6 +4954,64 @@ func runVMWorkflow(ctx context.Context, cfg *appConfig, spec *runSpec, opts runO
 	shutdownManualFile := filepath.Join(controlDir, "SHUTDOWN_MANUAL")
 	log.Printf("Starting workflow vm=%s moref=%s", spec.VM.Name, vmMoref)
 
+	st, err := loadRunState(statePath)
+	if err != nil {
+		return err
+	}
+	if st == nil {
+		st, err = loadRunState(legacyStatePath)
+		if err != nil {
+			return err
+		}
+	}
+	if st == nil {
+		st = &runState{
+			VMName:       spec.VM.Name,
+			VMMoref:      vmMoref,
+			MigrationID:  migrationID,
+			Stage:        stageInit,
+			Disks:        map[string]*runDiskState{},
+			AttachedNICs: map[string]string{},
+		}
+	}
+	if st.VMName != "" && st.VMName != spec.VM.Name {
+		return fmt.Errorf("state vm mismatch: state=%s spec=%s", st.VMName, spec.VM.Name)
+	}
+	if st.Disks == nil {
+		st.Disks = map[string]*runDiskState{}
+	}
+	if st.AttachedNICs == nil {
+		st.AttachedNICs = map[string]string{}
+	}
+	st.VMName = spec.VM.Name
+	st.VMMoref = vmMoref
+	st.MigrationID = migrationID
+	if st.Stage == "" {
+		st.Stage = stageInit
+	}
+	log.Printf("Resuming from stage: %s", st.Stage)
+
+	stateMu := &sync.Mutex{}
+	saveState := func() error {
+		recomputeStateProgress(st)
+		return saveRunState(statePath, st)
+	}
+	saveStateLocked := func() error {
+		stateMu.Lock()
+		defer stateMu.Unlock()
+		return saveState()
+	}
+	setStage := func(next string) error {
+		stateMu.Lock()
+		st.Stage = next
+		stateMu.Unlock()
+		log.Printf("Stage: %s", next)
+		return saveStateLocked()
+	}
+	if err := saveStateLocked(); err != nil {
+		return err
+	}
+
 	vmRef := vmObj.Reference()
 	var vcMu sync.RWMutex
 	var reconnectMu sync.Mutex
@@ -5015,6 +5100,11 @@ func runVMWorkflow(ctx context.Context, cfg *appConfig, spec *runSpec, opts runO
 	var disks []vmDisk
 	bootUnit := 0
 	guestID := ""
+	if st.Stage == stageInit {
+		if err := setStage(stageDiscoverDisks); err != nil {
+			return err
+		}
+	}
 	if err := withVCenterRetry("list VM disks", func(c *govmomi.Client, v *object.VirtualMachine) error {
 		var callErr error
 		disks, bootUnit, callErr = listVMDisksAndBootUnit(ctx, c, v)
@@ -5113,61 +5203,6 @@ func runVMWorkflow(ctx context.Context, cfg *appConfig, spec *runSpec, opts runO
 	if err != nil {
 		return err
 	}
-
-	st, err := loadRunState(statePath)
-	if err != nil {
-		return err
-	}
-	if st == nil {
-		st, err = loadRunState(legacyStatePath)
-		if err != nil {
-			return err
-		}
-	}
-	if st == nil {
-		st = &runState{
-			VMName:      spec.VM.Name,
-			VMMoref:     vmMoref,
-			MigrationID: migrationID,
-			Stage:       stageInit,
-			Disks:       map[string]*runDiskState{},
-			AttachedNICs: map[string]string{},
-		}
-	}
-	if st.VMName != "" && st.VMName != spec.VM.Name {
-		return fmt.Errorf("state vm mismatch: state=%s spec=%s", st.VMName, spec.VM.Name)
-	}
-	if st.Disks == nil {
-		st.Disks = map[string]*runDiskState{}
-	}
-	if st.AttachedNICs == nil {
-		st.AttachedNICs = map[string]string{}
-	}
-	st.VMName = spec.VM.Name
-	st.VMMoref = vmMoref
-	st.MigrationID = migrationID
-	if st.Stage == "" {
-		st.Stage = stageInit
-	}
-	log.Printf("Resuming from stage: %s", st.Stage)
-
-	stateMu := &sync.Mutex{}
-	saveState := func() error {
-		recomputeStateProgress(st)
-		return saveRunState(statePath, st)
-	}
-	saveStateLocked := func() error {
-		stateMu.Lock()
-		defer stateMu.Unlock()
-		return saveState()
-	}
-	setStage := func(next string) error {
-		stateMu.Lock()
-		st.Stage = next
-		stateMu.Unlock()
-		log.Printf("Stage: %s", next)
-		return saveStateLocked()
-	}
 	ensureAdditionalNICsAttached := func(vmID string) error {
 		if len(additionalNICs) == 0 {
 			return nil
@@ -5209,6 +5244,11 @@ func runVMWorkflow(ctx context.Context, cfg *appConfig, spec *runSpec, opts runO
 	}
 
 	storageRootByID := map[string]string{}
+	if st.Stage == stageDiscoverDisks {
+		if err := setStage(stagePrepareStorage); err != nil {
+			return err
+		}
+	}
 	for _, d := range disks {
 		unitKey := strconv.Itoa(d.Unit)
 		ds := st.Disks[unitKey]
@@ -5251,7 +5291,13 @@ func runVMWorkflow(ctx context.Context, cfg *appConfig, spec *runSpec, opts runO
 		return nil
 	}
 
-	if st.Stage == stageInit || st.Stage == stageBaseCopy || st.Stage == stageDelta || st.Stage == stageFinalSync {
+	if st.Stage == stagePrepareStorage {
+		if err := setStage(stageEnableCBT); err != nil {
+			return err
+		}
+	}
+
+	if isPreBaseCopyStage(st.Stage) || st.Stage == stageBaseCopy || st.Stage == stageDelta || st.Stage == stageFinalSync {
 		if err := withVCenterRetry("ensure CBT enabled", func(c *govmomi.Client, v *object.VirtualMachine) error {
 			return ensureCBTEnabled(ctx, c, v, log)
 		}); err != nil {
@@ -5259,7 +5305,12 @@ func runVMWorkflow(ctx context.Context, cfg *appConfig, spec *runSpec, opts runO
 		}
 	}
 
-	if st.Stage == stageInit {
+	if isPreBaseCopyStage(st.Stage) {
+		if st.Stage != stageCreateBaseSnapshot {
+			if err := setStage(stageCreateBaseSnapshot); err != nil {
+				return err
+			}
+		}
 		var baseSnap types.ManagedObjectReference
 		if err := withVCenterRetry("create base snapshot", func(c *govmomi.Client, v *object.VirtualMachine) error {
 			var callErr error

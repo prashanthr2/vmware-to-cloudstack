@@ -7,6 +7,31 @@ function normalizeProgress(value) {
   return Math.max(0, Math.min(100, Number(value)));
 }
 
+const STAGE_LABELS = {
+  connecting_vcenter: "Connecting to vCenter",
+  finding_vm: "Finding VM",
+  init: "Initializing",
+  discovering_vmware_disks: "Discovering VMware disks",
+  preparing_target_storage: "Preparing target storage",
+  enabling_cbt: "Enabling CBT",
+  creating_base_snapshot: "Creating base snapshot",
+  base_copy: "Base copy",
+  delta: "Delta sync",
+  awaiting_shutdown_action: "Awaiting shutdown action",
+  final_sync: "Final sync",
+  converting: "Converting",
+  import_root_disk: "Importing root disk",
+  import_data_disk: "Importing data disks",
+  done: "Done",
+};
+
+function formatStageLabel(value) {
+  if (!value) {
+    return "-";
+  }
+  return STAGE_LABELS[value] || value;
+}
+
 function formatDate(value) {
   if (!value) {
     return "-";
@@ -145,13 +170,14 @@ export default function MigrationProgress({
                 const finalizeRequested = Boolean(status.finalize_requested);
                 const finalizeNowRequested = Boolean(status.finalize_now_requested);
                 const awaitingUserAction = Boolean(status.awaiting_user_action);
-                const stage = status.stage || job.stage || "-";
-                const nextStage = awaitingUserAction ? "Operator action required" : (status.next_stage || "-");
+                const rawStage = status.stage || job.stage || "-";
+                const stage = formatStageLabel(rawStage);
+                const nextStage = awaitingUserAction ? "Operator action required" : formatStageLabel(status.next_stage || "-");
                 const statusLower = typeof jobStatus === "string" ? jobStatus.toLowerCase() : "";
                 const finalizeButtonDisabled =
-                  finalizeRequested || stage === "done" || stage === "final_sync" || awaitingUserAction;
+                  finalizeRequested || rawStage === "done" || rawStage === "final_sync" || awaitingUserAction;
                 const finalizeNowButtonDisabled =
-                  finalizeNowRequested || stage === "done" || stage === "final_sync" || awaitingUserAction;
+                  finalizeNowRequested || rawStage === "done" || rawStage === "final_sync" || awaitingUserAction;
                 const retryDisabled = statusLower !== "failed";
 
                 return (

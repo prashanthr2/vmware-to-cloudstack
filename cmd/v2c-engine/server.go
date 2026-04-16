@@ -1275,8 +1275,10 @@ func (s *apiServer) startJob(vmName string, specFile string, overrides runEnvOve
 		Status:     "queued",
 		StartedAt:  time.Now().UTC(),
 		RuntimeDir: runtimeDir,
-		EnvOverrides: overrides,
-		DebugVirtV2V: overrides.VirtV2VDebug,
+		StageSnapshot:     stageConnectVCenter,
+		NextStageSnapshot: stageFindVM,
+		EnvOverrides:      overrides,
+		DebugVirtV2V:      overrides.VirtV2VDebug,
 	}
 
 	s.mu.Lock()
@@ -2249,6 +2251,15 @@ func (s *apiServer) buildStatusPayload(vmName string, st *runState, job *apiJob,
 			disksRaw = st.Disks
 		}
 	}
+	if stage == "" && job != nil && (strings.TrimSpace(job.Status) == "running" || strings.TrimSpace(job.Status) == "queued") {
+		stage = strings.TrimSpace(job.StageSnapshot)
+		if progress <= 0 {
+			progress = job.ProgressSnapshot
+		}
+		if transfer <= 0 {
+			transfer = job.TransferSpeedSnapshot
+		}
+	}
 
 	diskProgress := make([]map[string]any, 0, len(disksRaw))
 	totalBytes := int64(0)
@@ -2360,6 +2371,11 @@ func (s *apiServer) buildStatusPayload(vmName string, st *runState, job *apiJob,
 		currentStage = "not_started"
 	}
 	nextStage := nextStageForStatus(currentStage, s.runVirtSettingForVM(vmName), finalizeRequested)
+	if job != nil && (strings.TrimSpace(job.Status) == "running" || strings.TrimSpace(job.Status) == "queued") {
+		if strings.TrimSpace(stage) == strings.TrimSpace(job.StageSnapshot) && strings.TrimSpace(job.NextStageSnapshot) != "" {
+			nextStage = strings.TrimSpace(job.NextStageSnapshot)
+		}
+	}
 
 	payload := map[string]any{
 		"vm_name":             vmName,
