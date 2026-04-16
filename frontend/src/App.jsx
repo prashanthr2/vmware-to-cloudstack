@@ -1181,21 +1181,27 @@ export default function App() {
   );
 
   const retryVm = useCallback(
-    async (job) => {
+    async (job, debug = false) => {
       if (!job?.vm_name) {
         pushToast("error", "Invalid job selected for retry.");
         return;
       }
       try {
-        const specFile = job.spec_file ? `?spec_file=${encodeURIComponent(job.spec_file)}` : "";
-        const response = await apiRequest(`/migration/retry/${encodeURIComponent(job.vm_name)}${specFile}`, {
+        const params = new URLSearchParams();
+        if (job.spec_file) params.set("spec_file", job.spec_file);
+        if (debug) params.set("debug", "true");
+        const suffix = params.toString() ? `?${params.toString()}` : "";
+        const response = await apiRequest(`/migration/retry/${encodeURIComponent(job.vm_name)}${suffix}`, {
           method: "POST",
           headers: { ...vmwareHeaders, ...cloudstackHeaders },
         });
-        pushToast("success", `${job.vm_name}: retry started (job ${String(response?.job_id || "").slice(0, 8)}).`);
+        pushToast(
+          "success",
+          `${job.vm_name}: ${debug ? "debug retry" : "retry"} started (job ${String(response?.job_id || "").slice(0, 8)}).`
+        );
         await refreshJobs();
       } catch (err) {
-        pushToast("error", err.message || "Failed to retry migration.");
+        pushToast("error", err.message || `Failed to retry migration${debug ? " with debug" : ""}.`);
       }
     },
     [cloudstackHeaders, pushToast, refreshJobs, vmwareHeaders]
@@ -1486,6 +1492,7 @@ export default function App() {
             onShutdownForce={(vmName) => shutdownVm(vmName, "force")}
             onShutdownManual={(vmName) => shutdownVm(vmName, "manual")}
             onRetry={retryVm}
+            onRetryDebug={(job) => retryVm(job, true)}
             logsSection={
               <div className="logs-pane">
                 <div className="subsection-title-row">

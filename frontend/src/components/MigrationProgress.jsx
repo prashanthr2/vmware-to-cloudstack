@@ -30,6 +30,7 @@ export default function MigrationProgress({
   onShutdownForce,
   onShutdownManual,
   onRetry,
+  onRetryDebug,
   logsSection,
 }) {
   const pendingJobs = jobs
@@ -198,6 +199,14 @@ export default function MigrationProgress({
                         title={retryDisabled ? "Retry is available only for failed jobs" : "Retry failed migration"}
                       >
                         Retry
+                      </button>
+                      <button
+                        className="secondary"
+                        onClick={() => onRetryDebug(job)}
+                        disabled={retryDisabled}
+                        title={retryDisabled ? "Debug retry is available only for failed jobs" : "Retry failed migration with virt-v2v debug logging"}
+                      >
+                        Retry with Debug
                       </button>
                       <button
                         className="secondary"

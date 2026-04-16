@@ -996,8 +996,23 @@ func runVirtV2VInPlace(plan virtV2VPlan, virtioISO string) error {
 			fmt.Fprintf(os.Stderr, "[virt-v2v] warning: virtio-win drivers not found; Windows conversion may miss virtio drivers\n")
 		}
 	}
-	out, err := runCmd(baseArgs)
+	args := append([]string{}, baseArgs...)
+	if virtV2VDebugEnabled() {
+		fmt.Fprintf(os.Stderr, "[virt-v2v] info: debug logging enabled (-v -x)\n")
+		args = append([]string{"-v", "-x"}, args...)
+	}
+	out, err := runCmd(args)
 	return wrapV2VErr(err, out)
+}
+
+func virtV2VDebugEnabled() bool {
+	raw := strings.TrimSpace(os.Getenv("V2C_VIRT_V2V_DEBUG"))
+	switch strings.ToLower(raw) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
 }
 
 func resolveVirtV2VInPlacePath() (string, error) {
@@ -1148,6 +1163,19 @@ func planVirtV2V(paths []string) (virtV2VPlan, error) {
 		isWindows = strings.EqualFold(guestOS, "windows")
 	}
 	if len(paths) == 1 {
+		if bootErr != nil {
+			return virtV2VPlan{}, fmt.Errorf(
+				"single-disk pre-v2v inspection failed for boot disk %s: %w",
+				paths[0],
+				bootErr,
+			)
+		}
+		if len(bootReport.OperatingSystems) == 0 {
+			return virtV2VPlan{}, fmt.Errorf(
+				"single-disk pre-v2v inspection found no guest OS/root device on boot disk %s; refusing to run virt-v2v blindly",
+				paths[0],
+			)
+		}
 		return virtV2VPlan{
 			Mode:      virtV2VInputDisk,
 			Paths:     []string{paths[0]},

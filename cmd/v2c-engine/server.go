@@ -58,6 +58,7 @@ type apiJob struct {
 	FinalizeNowRequestedSnapshot bool     `json:"-"`
 	UpdatedAtSnapshot           time.Time `json:"-"`
 	EnvOverrides                runEnvOverrides `json:"-"`
+	DebugVirtV2V                bool      `json:"debug_virt_v2v,omitempty"`
 }
 
 type runEnvOverrides struct {
@@ -67,6 +68,7 @@ type runEnvOverrides struct {
 	CloudEndpoint    string
 	CloudAPIKey      string
 	CloudSecretKey   string
+	VirtV2VDebug     bool
 }
 
 type apiServer struct {
@@ -1218,6 +1220,10 @@ func (s *apiServer) handleMigrationRetry(w http.ResponseWriter, r *http.Request)
 		}
 	}
 
+	debugVirtV2V := strings.EqualFold(strings.TrimSpace(r.URL.Query().Get("debug")), "true") ||
+		strings.TrimSpace(r.URL.Query().Get("debug")) == "1"
+	overrides.VirtV2VDebug = debugVirtV2V
+
 	job := s.startJob(vmName, specPath, overrides)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"vm_name":   job.VMName,
@@ -1225,6 +1231,7 @@ func (s *apiServer) handleMigrationRetry(w http.ResponseWriter, r *http.Request)
 		"spec_file": job.SpecFile,
 		"status":    job.Status,
 		"retry_of":  emptyToNil(retryOf),
+		"debug_virt_v2v": debugVirtV2V,
 	})
 }
 
@@ -1269,6 +1276,7 @@ func (s *apiServer) startJob(vmName string, specFile string, overrides runEnvOve
 		StartedAt:  time.Now().UTC(),
 		RuntimeDir: runtimeDir,
 		EnvOverrides: overrides,
+		DebugVirtV2V: overrides.VirtV2VDebug,
 	}
 
 	s.mu.Lock()
@@ -1341,6 +1349,9 @@ func (s *apiServer) runJob(job *apiJob) {
 	defer stderrFile.Close()
 
 	_, _ = fmt.Fprintf(stdoutFile, "$ %s\n", strings.Join(command, " "))
+	if job.DebugVirtV2V {
+		_, _ = fmt.Fprintln(stdoutFile, "# virt-v2v debug enabled via V2C_VIRT_V2V_DEBUG=1")
+	}
 	cmd.Stdout = stdoutFile
 	cmd.Stderr = stderrFile
 	runErr := cmd.Run()
@@ -1443,6 +1454,11 @@ func withRunEnvOverrides(base []string, o runEnvOverrides) []string {
 	env = set(env, "V2C_CLOUDSTACK_ENDPOINT", o.CloudEndpoint)
 	env = set(env, "V2C_CLOUDSTACK_API_KEY", o.CloudAPIKey)
 	env = set(env, "V2C_CLOUDSTACK_SECRET_KEY", o.CloudSecretKey)
+	if o.VirtV2VDebug {
+		env = set(env, "V2C_VIRT_V2V_DEBUG", "1")
+	} else {
+		env = set(env, "V2C_VIRT_V2V_DEBUG", "")
+	}
 	return env
 }
 
