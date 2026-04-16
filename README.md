@@ -48,13 +48,47 @@ The source VM downtime is therefore limited to the final shutdown + final sync +
 
 ## Screenshots
 
-### Strategy and Target Mapping
+### Environment Profiles
 
-![Strategy UI](docs/images/ui-strategy.png)
+Use saved vCenter and CloudStack profiles to switch quickly between environments.
 
-### Migration Progress and Job Monitoring
+![Environment Manager](docs/images/ui-environment-manager.png)
 
-![Progress UI](docs/images/ui-progress.png)
+### VM Selection
+
+Select one or more source VMs, then choose which VM is currently active for editing.
+
+![VM Selection](docs/images/ui-vm-selection.png)
+
+### Target and Strategy
+
+Choose CloudStack placement, guest mapping, boot/storage behavior, and migration strategy settings such as finalize schedule, shutdown mode, and snapshot quiesce.
+
+![Target and Strategy](docs/images/ui-strategy-current.png)
+
+### NIC Mapping and Review Summary
+
+Review NIC mappings and the generated per-VM summary before generating specs or starting migration.
+
+![Summary and NIC Mapping](docs/images/ui-summary.png)
+
+### Progress Overview
+
+The Progress view shows job status, current stage, next stage, finalize state, throughput, and quick actions like retry, finalize, and finalize-now.
+
+![Progress Overview](docs/images/ui-progress-overview.png)
+
+### Progress Details
+
+Each job can be expanded to show disk progress and the live stdout/stderr logs from the engine.
+
+![Progress Details](docs/images/ui-progress-details.png)
+
+### Disk Progress and Logs
+
+Disk-level read progress, estimated used size, throughput, and logs help diagnose whether a migration is copying, converting, waiting on VMware, or blocked on a later stage.
+
+![Disk Progress and Logs](docs/images/ui-disk-progress-logs.png)
 
 ## Architecture Summary
 
