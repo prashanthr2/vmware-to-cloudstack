@@ -1,170 +1,256 @@
-# Go Engine: VMware -> CloudStack
+# VMware to CloudStack Migrator
 
-This repository is Go-first and provides a production migration engine + API/UI services for VMware to CloudStack migrations.
+Production-focused warm migration tooling for VMware to Apache CloudStack.
 
-## Project Purpose
+This repository contains:
 
-The goal of this project is to provide **near-live / warm migration** from VMware to CloudStack with minimal cutover downtime.
+- a Go migration engine
+- an HTTP API service
+- a web UI for batch migration planning and monitoring
 
-How warm migration is achieved:
+The project is designed around near-live migration:
 
-- A base snapshot is taken and copied to QCOW2 on CloudStack primary storage.
-- Incremental delta rounds are continuously synced using VMware CBT (`QueryChangedDiskAreas`).
-- At cutover (`Finalize`/`Finalize Now`/`finalize_at`), the source VM is shut down, a short settle delay is applied, one final delta sync is performed, then import is completed.
+- copy the base image once
+- keep the target updated with CBT-driven delta rounds
+- cut over only for the final sync and import boundary
 
-This design keeps source VM downtime mostly to the final sync + import boundary, not the full disk copy duration.
+## What It Does
 
-## Engine Internals (Summary)
+For each VM, the engine:
 
-- Disk copy path: VMware VDDK -> direct QCOW2 writes (no RAW intermediate).
-- Delta path: CBT ranges -> direct QCOW2 updates.
-- Conversion path: optional `virt-v2v-in-place` after final sync. Single-disk guests use boot-disk-only conversion; multi-disk guests are inspected and can switch to `libvirtxml` mode when the OS spans multiple disks.
-- State machine + resume: per-VM runtime state under `/var/lib/vm-migrator/<vm>_<moref>/`.
-- Control actions: `Finalize` and `Finalize Now` markers, plus CLI/API/UI triggers.
+1. Connects to vCenter and discovers the source VM, disks, and NICs.
+2. Ensures VMware CBT is enabled.
+3. Creates a base snapshot.
+4. Copies VMware disks directly into QCOW2 on CloudStack primary storage.
+5. Runs repeated CBT-native delta rounds.
+6. At finalize time, powers off or waits for shutdown according to policy.
+7. Runs a final delta sync.
+8. Optionally runs `virt-v2v-in-place`.
+9. Imports the root disk into CloudStack, then imports and attaches data disks and NICs.
+
+The source VM downtime is therefore limited to the final shutdown + final sync + import window, not the full disk copy time.
+
+## Highlights
+
+- Warm migration using VMware CBT (`QueryChangedDiskAreas`)
+- Direct QCOW2 target writes, no RAW intermediate
+- Parallel VM and parallel disk execution
+- Resume-safe workflow with per-VM state under `/var/lib/vm-migrator`
+- Optional `virt-v2v-in-place`
+- Multi-disk aware import and conversion planning
+- UI, API, and CLI control for `Finalize` / `Finalize Now`
+- Pending-action workflow for shutdown decisions when VMware Tools are unavailable
+- Retry failed jobs from the UI or API
+- Retry failed conversions with `virt-v2v` debug enabled
+- CloudStack primary storage support for:
+  - NFS
+  - Shared Mountpoint
+
+## Screenshots
+
+### Strategy and Target Mapping
+
+![Strategy UI](docs/images/ui-strategy.png)
+
+### Migration Progress and Job Monitoring
+
+![Progress UI](docs/images/ui-progress.png)
+
+## Architecture Summary
+
+- Source read path: VMware VDDK
+- Base copy path: VDDK -> QCOW2
+- Delta path: VMware CBT ranges -> targeted QCOW2 updates
+- Conversion path: optional `virt-v2v-in-place`
+- Import path:
+  - `importVm` for root disk
+  - `importVolume` for additional data disks
+  - `attachVolume` for imported data disks
+
+The engine persists workflow state and disk progress to:
+
+- `/var/lib/vm-migrator/<vm>_<moref>/state.json`
+
+Control markers and logs also live in that same runtime directory.
+
+## Current Workflow Stages
+
+The UI/API can now surface early stages before copy begins:
+
+- `connecting_vcenter`
+- `finding_vm`
+- `discovering_vmware_disks`
+- `preparing_target_storage`
+- `enabling_cbt`
+- `creating_base_snapshot`
+- `base_copy`
+- `delta`
+- `awaiting_shutdown_action`
+- `final_sync`
+- `converting`
+- `import_root_disk`
+- `import_data_disk`
+- `done`
+
+This helps distinguish “not started copying yet” from “slow copy”.
+
+## Supported Storage
+
+This release supports:
+
+- NFS primary storage
+- Shared Mountpoint primary storage
+
+### NFS
+
+- The engine mounts the pool path when needed.
+- On Ubuntu, engine-managed mounts default to NFSv3-style options to avoid QCOW2 flush issues observed on some NFSv4 environments.
+- You can override mount options with:
+  - `V2C_NFS_MOUNT_OPTS`
+
+### Shared Mountpoint
+
+- The engine uses the CloudStack path directly.
+- No mount or unmount is attempted by the engine.
+- Preflight validation checks:
+  - path exists
+  - path is a directory
+  - path is writable
+  - write/delete works
+  - free-space check where possible
+
+### Not Supported in Current `main`
+
+- Ceph/RBD import flow is not enabled here because current CloudStack `importVm` support is not sufficient for that path.
 
 ## Prerequisites
 
 - Linux host
-- VMware VDDK installed (must include `include/vixDiskLib.h` and `lib64/libvixDiskLib.so*`)
-  - Official download: [Broadcom VDDK](https://developer.broadcom.com/sdks/vmware-virtual-disk-development-kit-vddk/latest/)
-- Root/sudo access (required for service install and storage preflight checks)
-- CloudStack API access
+- VMware VDDK installed
+  - must include `include/vixDiskLib.h`
+  - must include `lib64/libvixDiskLib.so*`
+  - official download: [Broadcom VDDK](https://developer.broadcom.com/sdks/vmware-virtual-disk-development-kit-vddk/latest/)
+- Root or sudo access
 - vCenter credentials
-- CloudStack primary storage support in this release: **NFS** and **Shared Mountpoint**
-- For NFS pools, the migration host must have network-level access and permission to mount the storage backend.
-- For Shared Mountpoint pools, the CloudStack path must already exist on the migration host and point to the correct shared storage.
+- CloudStack API access
+- Network connectivity from migration host to VMware and CloudStack endpoints
 
-The bootstrap script installs required OS packages (Go, qemu tools, virt-v2v, guestfs, and optional node/npm for UI).
-This project does not redistribute VDDK. Users must obtain VDDK directly from Broadcom and accept Broadcom licensing terms separately.
-For Windows conversions, `virt-v2v-in-place` expects virtio drivers to be available through `VIRTIO_WIN`, which this project resolves from `virt.virtio_iso`, `/usr/share/virtio-win/virtio-win.iso`, or `/usr/share/virtio-win`. Bootstrap prepares this on EL hosts by adding the `virtio-win` Fedora repo and installing `virtio-win`, and on Ubuntu hosts by converting the upstream `virtio-win.noarch.rpm` with `alien` and extracting `srvany` helpers into `/usr/share/virt-tools`.
+This repository does not redistribute VDDK. Users must obtain it directly from Broadcom and accept Broadcom licensing separately.
 
-## Firewall And Connectivity Requirements
+## Windows Conversion Requirements
 
-Required network access for the current implementation:
+For Windows conversions, `virt-v2v-in-place` needs virtio driver assets available through `VIRTIO_WIN`.
+
+This project resolves them from:
+
+- `virt.virtio_iso`
+- `/usr/share/virtio-win/virtio-win.iso`
+- `/usr/share/virtio-win`
+
+Bootstrap prepares this automatically:
+
+- EL-family hosts:
+  - adds the `virtio-win` repo
+  - installs `virtio-win`
+- Ubuntu hosts:
+  - converts upstream `virtio-win.noarch.rpm` with `alien`
+  - installs the resulting package
+  - extracts `srvany` helpers into `/usr/share/virt-tools`
+
+## Firewall and Connectivity Requirements
+
+Required access for the current implementation:
 
 - Migration host -> vCenter: `443/TCP`
-  - Used for VMware SDK operations such as inventory, snapshots, CBT queries, shutdown, and CBT enablement.
-- Migration host -> ESXi hosts serving the source VM disks: `902/TCP` and `443/TCP`
-  - VDDK data access uses VMware NFC/VDDK paths and in practice typically requires access to the backing ESXi host, not only vCenter.
-- Migration host -> CloudStack management API: port depends on configured endpoint
-  - Common values:
-  - `80/TCP` for `http://<host>/client/api`
-  - `8080/TCP` for `http://<host>:8080/client/api`
-  - `443/TCP` for `https://<host>/client/api`
-- Migration host -> CloudStack primary storage (NFS): NFS access to the selected export
-  - Ubuntu engine-managed mounts default to NFSv3 over TCP and may require `2049/TCP`, `111/TCP`, and server-side mount/lock service ports.
-  - EL-family hosts often use NFSv4-style mounts by default and typically require at least `2049/TCP`.
-  - If you override mount options with `V2C_NFS_MOUNT_OPTS`, open the ports needed by those options.
+- Migration host -> ESXi hosts serving source VM disks: `902/TCP` and `443/TCP`
+- Migration host -> CloudStack API:
+  - `80/TCP`, `8080/TCP`, or `443/TCP` depending on configured endpoint
+- Migration host -> NFS primary storage:
+  - at least the ports required by your NFS version and mount options
 - Browser/admin workstation -> migration host:
   - `5173/TCP` for the UI
-  - `8000/TCP` for the API if accessed directly
+  - `8000/TCP` for the API, if used directly
 
-Not required by this tool:
+Notes:
 
-- CloudStack management server -> VMware direct connectivity is not required by this code path.
-- `qemu-nbd` does not open a TCP listener; it uses a local Unix socket only.
+- CloudStack management server does not need direct VMware connectivity for this tool.
+- `qemu-nbd` is used locally via Unix socket, not as a network listener.
 
-## Quick Start (Clone -> Bootstrap -> UI -> CLI)
+## Quick Start
 
-1. Clone and enter the repository:
+### 1. Clone
 
 ```bash
 git clone https://github.com/prashanthr2/vmware-to-cloudstack.git
 cd vmware-to-cloudstack
 ```
 
-2. Bootstrap dependencies, build, and install services:
+### 2. Bootstrap
 
-Before running bootstrap, make sure one of these is already present on the host:
+Before bootstrap, make sure you have either:
 
-- Extracted VDDK directory (for `--vddk-dir`), for example `/opt/vmware-vddk/vmware-vix-disklib-distrib`
-- VDDK tarball file (for `--vddk-tar`)
+- an extracted VDDK directory, or
+- a VDDK tarball
+
+Example with extracted VDDK:
 
 ```bash
 chmod +x ./scripts/bootstrap.sh
 sudo ./scripts/bootstrap.sh --vddk-dir /opt/vmware-vddk/vmware-vix-disklib-distrib --install-service --with-ui
 ```
 
-If you have a VDDK tarball instead of an extracted directory:
+Example with VDDK tarball:
 
 ```bash
 chmod +x ./scripts/bootstrap.sh
-sudo ./scripts/bootstrap.sh --vddk-tar /tmp/VMware-vix-disklib-8.0.2-xxxxxxx.x86_64.tar.gz --install-service --with-ui
+sudo ./scripts/bootstrap.sh --vddk-tar /tmp/VMware-vix-disklib-*.tar.gz --install-service --with-ui
 ```
 
-3. Configure engine and UI endpoint:
+### 3. Configure
 
 ```bash
 sudo vi /etc/v2c-engine/config.yaml
 sudo vi /etc/v2c-ui/.env.local
 ```
 
-In `/etc/v2c-ui/.env.local`, set:
+Set the UI API base in `/etc/v2c-ui/.env.local`:
 
-- `VITE_API_BASE=http://<migration-host-ip>:8000`
+```env
+VITE_API_BASE=http://<migration-host-ip>:8000
+```
 
-Use the IP/hostname of the same host where `v2c-engine serve` is running (not `127.0.0.1` unless browser is on that same host).
-
-4. Start services:
+### 4. Start Services
 
 ```bash
 sudo systemctl enable --now v2c-engine v2c-ui
 systemctl status v2c-engine v2c-ui
 ```
 
-5. Access the UI:
+### 5. Open the UI
 
-- URL: `http://<migration-host-ip>:5173`
-- API health check: `curl -s http://<migration-host-ip>:8000/health`
-
-6. Use CLI (optional/advanced):
-
-```bash
-# check migration status for one or more specs
-/usr/local/bin/v2c-engine status --spec ./examples/spec.run.single-vm.single-disk.single-nic.yaml --config /etc/v2c-engine/config.yaml
-
-# request finalize (normal)
-/usr/local/bin/v2c-engine finalize --spec ./examples/spec.run.single-vm.single-disk.single-nic.yaml --vm Centos7 --config /etc/v2c-engine/config.yaml
-
-# request finalize-now (immediate delta wait interrupt)
-/usr/local/bin/v2c-engine finalize --spec ./examples/spec.run.single-vm.single-disk.single-nic.yaml --vm Centos7 --now --config /etc/v2c-engine/config.yaml
-```
-
-Note: use `--start-services` in bootstrap only when `/etc/v2c-engine/config.yaml` and `/etc/v2c-ui/.env.local` are already valid.
+- UI: `http://<migration-host-ip>:5173`
+- Health check: `curl -s http://<migration-host-ip>:8000/health`
 
 ## Bootstrap Script Options
 
-Use `scripts/bootstrap.sh` to install dependencies, build the engine, and install services.
-
-```bash
-chmod +x ./scripts/bootstrap.sh
-sudo ./scripts/bootstrap.sh --vddk-dir /opt/vmware-vddk/vmware-vix-disklib-distrib --install-service --with-ui
-```
-
-If you have a VDDK tarball:
-
-```bash
-sudo ./scripts/bootstrap.sh --vddk-tar /tmp/VMware-vix-disklib-*.tar.gz --install-service --with-ui
-```
-
-Supported bootstrap options:
+Supported options:
 
 - `--vddk-dir <path>`
 - `--vddk-tar <path>`
 - `--config <path>`
 - `--bin-path <path>`
-- `--listen <addr>` (API service listen, default `:8000`)
-- `--ui-listen <addr>` (UI service listen, default `0.0.0.0:5173`)
-- `--install-service` (installs `v2c-engine` and, with `--with-ui`, `v2c-ui`)
-- `--with-ui` (installs frontend dependencies and UI service unit)
-- `--start-services` (optional immediate start after setup; only use when config files are already valid)
+- `--listen <addr>`
+- `--ui-listen <addr>`
+- `--install-service`
+- `--with-ui`
+- `--start-services`
 - `--skip-build`
 
-Recommended bootstrap flow:
+Recommended flow:
 
-1. Install/build/services without auto-start.
-2. Edit config files.
-3. Enable/start services.
+1. bootstrap without auto-start
+2. edit config
+3. enable and start services
 
 ```bash
 sudo ./scripts/bootstrap.sh --vddk-dir /opt/vmware-vddk/vmware-vix-disklib-distrib --install-service --with-ui
@@ -173,370 +259,269 @@ sudo vi /etc/v2c-ui/.env.local
 sudo systemctl enable --now v2c-engine v2c-ui
 ```
 
-Use `--start-services` only if `/etc/v2c-engine/config.yaml` and `/etc/v2c-ui/.env.local` are already populated with real values (not placeholders).
+Use `--start-services` only when the config files already contain real values.
 
-## Enable API and UI Services
-
-Bootstrap installs service units by default without auto-start (unless `--start-services` is passed).  
-Configure first, then enable/start:
-
-```bash
-sudo vi /etc/v2c-engine/config.yaml
-sudo vi /etc/v2c-ui/.env.local
-sudo systemctl enable --now v2c-engine v2c-ui
-systemctl status v2c-engine v2c-ui
-journalctl -u v2c-engine -f
-```
-
-Installed paths:
+## Installed Paths
 
 - Engine binary: `/usr/local/bin/v2c-engine`
 - Engine config: `/etc/v2c-engine/config.yaml`
-- Optional manual build env helper: `/etc/v2c-engine/build.env` (not auto-sourced)
-- UI env config: `/etc/v2c-ui/.env.local`
-- Runtime state/log root: `/var/lib/vm-migrator`
+- Optional build env helper: `/etc/v2c-engine/build.env`
+- UI env file: `/etc/v2c-ui/.env.local`
+- Runtime state and logs: `/var/lib/vm-migrator`
 
-Environment note:
+Bootstrap intentionally does not install a global `LD_LIBRARY_PATH` profile script because VDDK libraries can interfere with unrelated host tools.
 
-- Bootstrap does not set global `LD_LIBRARY_PATH` in `/etc/profile.d`.
-- This avoids breaking host tools like `journalctl` / `dnf` with VDDK libraries.
+## Migration Strategy Settings
 
-Config notes:
-
-- `run`/`serve` use vCenter credentials from `vcenter` block in config (`VC_PASSWORD` env fallback).
-- `migration.vddk_path` is required for `run` (path to extracted VDDK root, for example `/opt/vmware-vddk/vmware-vix-disklib-distrib`).
-- You do not need a second vCenter credential block under `vddk`.
-- CloudStack endpoint input is flexible:
-  - `cloudstack-mgmt.example.com`
-  - `cloudstack-mgmt.example.com:8080`
-  - `http://cloudstack-mgmt.example.com:8080/client/api`
-  - `https://cloudstack.example.com`
-
-Sample references:
-
-- Engine config template with all fields: [examples/config.full.example.yaml](./examples/config.full.example.yaml)
-- UI env template: [frontend/.env.example](./frontend/.env.example)
-
-## What The Engine Does
-
-- `run` is the primary user command.
-- Internal base copy and delta sync are handled automatically inside `run`.
-- Base copy and delta write directly into QCOW2 (no RAW intermediate).
-- Delta sync uses VMware CBT (`QueryChangedDiskAreas` path).
-- Conversion (`virt-v2v-in-place`) runs in `converting` stage after final sync (when enabled).
-- Stateful/resumable workflow persists state and logs per VM under `/var/lib/vm-migrator/<vm>_<moref>/`.
-- Finalize is supported via:
-  - marker file (`FINALIZE`) internally
-  - immediate marker file (`FINALIZE_NOW`) internally
-  - CLI command `v2c-engine finalize` for operators
-  - API/UI finalize action
-
-Storage behavior:
-
-- NFS pools:
-  - Destination path pattern: `/mnt/<storageid>/<vm>_<vmMoref>_disk<unit>.qcow2`
-  - Engine ensures `/mnt/<storageid>` exists and is mounted before copy.
-  - If not mounted, engine attempts NFS mount using CloudStack storage pool details (`listStoragePools`).
-- Shared Mountpoint pools:
-  - Engine uses the CloudStack path directly as the destination root (no mount/unmount operations).
-  - Mandatory preflight validates path exists, is a directory, is writable, write+delete works, and free-space check is best-effort.
-- On Ubuntu hosts, engine-managed NFS mounts use explicit `vers=3` options to avoid QCOW2 flush I/O issues seen with some NFSv4 environments.
-  - Optional override: `V2C_NFS_MOUNT_OPTS="<mount-options>"`
-
-## How It Works
-
-At a high level, each VM migration follows this model:
-
-1. The engine connects to vCenter, finds the VM, verifies disks/NICs, and ensures CBT is enabled.
-2. It creates a base snapshot and copies each VMware disk directly into QCOW2 on the selected CloudStack primary storage mount.
-3. It enters delta mode and repeatedly uses VMware CBT to fetch only changed blocks since the previous snapshot.
-4. When finalize is requested, or when `finalize_at` time is reached, the engine shuts down the source VM according to policy, waits a short settle delay, and performs one final delta sync.
-5. If enabled, it runs `virt-v2v-in-place` using either boot-disk-only mode or temporary `libvirtxml` mode depending on detected guest disk layout.
-6. It imports the root disk into CloudStack, then imports and attaches data disks, and finally attaches additional NICs.
-
-Important behavior:
-
-- Base and delta both write directly into QCOW2.
-- Delta sync preserves QCOW2 metadata by writing through the qemu block path.
-- The workflow is resumable through `state.json`.
-- `status` reports current stage, next stage, and whether finalize has already been requested.
-
-## Migration Methods
-
-The main migration strategies are controlled by the `migration:` block in the VM spec.
+The main behavior is controlled by the `migration:` block in the VM spec.
 
 ### Continuous Delta Loop
 
-This is the default behavior when `delta_interval` is set.
-
-Parameters:
-
-- `delta_interval`
-  - Required for normal continuous sync behavior.
-  - Unit: seconds.
-  - Controls how often the engine performs a delta round during the pre-cutover phase.
-
-Behavior:
-
-- Base copy completes first.
-- The engine waits `delta_interval` seconds before the first delta round.
-- It then keeps running delta rounds every `delta_interval` seconds until finalize is triggered.
-- Finalize can be triggered manually from CLI/API/UI.
-
-Example:
+Use `delta_interval` to keep running incremental rounds before cutover:
 
 ```yaml
 migration:
   delta_interval: 300
 ```
 
-### Scheduled Finalize
-
-This is used when you want the tool to keep syncing until a planned cutover time.
-
-Parameters:
-
-- `finalize_at`
-  - Optional.
-  - Accepts ISO-like timestamps such as:
-    - `2026-03-12T23:30:00+00:00`
-    - `2026-03-12T23:30:00`
-    - `2026-03-12T23:30`
-- `finalize_delta_interval`
-  - Optional.
-  - Unit: seconds.
-  - Default: `30`
-  - Used when the engine is inside the finalize window and wants tighter sync frequency before cutover.
-- `finalize_window`
-  - Optional.
-  - Unit: seconds.
-  - Default: `600`
-  - If current time is within `finalize_window` seconds of `finalize_at`, the engine reduces the sleep interval to `finalize_delta_interval`.
-- `finalize_settle_seconds`
-  - Optional.
-  - Unit: seconds.
-  - Delay after source VM shutdown/power-off and before the final snapshot is taken.
-  - Default if omitted/`0`:
-    - Windows guests: `30`
-    - Linux/other guests: `15`
-
 Behavior:
 
-- The engine still does normal delta rounds after base copy.
-- Before the `finalize_at` time, it uses:
-  - `delta_interval` normally
-  - `finalize_delta_interval` once the engine is inside the finalize window
-- Once the current time passes `finalize_at`, the engine treats that as a finalize request.
-- It then powers off the source VM according to `shutdown_mode`, waits `finalize_settle_seconds`, performs `final_sync`, and continues import.
+- base copy completes first
+- engine waits `delta_interval`
+- repeated CBT-native delta rounds continue until finalize is requested
 
-Example:
+### Scheduled Finalize
+
+Use scheduled cutover:
 
 ```yaml
 migration:
   delta_interval: 300
   finalize_at: "2026-03-12T23:30:00+00:00"
   finalize_delta_interval: 30
-  finalize_settle_seconds: 30
   finalize_window: 600
+  finalize_settle_seconds: 30
 ```
 
-### Manual Finalize and Finalize Now
+Fields:
 
-You can trigger finalize explicitly even if `finalize_at` is not set.
+- `finalize_at`
+- `finalize_delta_interval`
+- `finalize_window`
+- `finalize_settle_seconds`
 
-Supported methods:
+Default settle delay when omitted or `0`:
 
-- CLI:
-  - `./v2c-engine finalize --spec ./spec.run.multi.example.yaml --vm Centos7 --config ./config.yaml`
-  - `./v2c-engine finalize --spec ./spec.run.multi.example.yaml --vm Centos7 --now --config ./config.yaml`
-- API:
-  - `POST /migration/finalize/{vm}`
-  - `POST /migration/finalize/{vm}?now=true`
-- UI:
-  - `Finalize` and `Finalize Now` actions from Progress tab
+- Windows: `30`
+- Linux/other: `15`
+
+### Finalize / Finalize Now
+
+Supported from:
+
+- CLI
+- API
+- UI
+
+`Finalize`:
+
+- requests cutover
+- workflow picks it up in normal delta loop
+
+`Finalize Now`:
+
+- interrupts delta wait
+- proceeds to finalization as soon as allowed
+
+If the workflow is still in `base_copy`, base copy completes first and then the engine goes directly into finalization.
+
+## Shutdown Behavior
+
+Shutdown policy is controlled by `migration.shutdown_mode`.
+
+Supported values:
+
+- `auto`
+- `manual`
+- `force`
+
+### `auto`
+
+- If VMware Tools are healthy, the engine uses guest shutdown.
+- If VMware Tools are unavailable, the engine pauses and asks for operator action instead of forcing power off immediately.
+
+In that case the UI/API exposes:
+
+- `Force Power Off`
+- `Manual Shutdown Done`
+
+The engine will also automatically continue if it observes that the source VM has been powered off manually before the user confirms.
+
+### `manual`
+
+- engine waits for the VM to be powered off externally
+- no forced shutdown is attempted
+
+### `force`
+
+- engine force powers off the source VM at finalize time
+
+## Snapshot Quiesce Behavior
+
+Snapshot quiesce policy is controlled by `migration.snapshot_quiesce`.
+
+Supported values:
+
+- `auto`
+- `true`
+- `false`
 
 Behavior:
 
-- `Finalize` creates a finalize request and the workflow picks it up in the delta loop.
-- `Finalize Now` requests immediate cutover from the delta loop wait:
-  - it interrupts delta sleep and moves to `final_sync` as soon as possible.
-  - if currently in `base_copy`, base copy still completes first, then workflow moves directly into finalization path.
-- During finalization, the engine waits a short settle delay after shutdown before taking the final snapshot.
-- Both requests are idempotent.
-- If VM is already complete, finalize calls return success with completion status.
+- `auto`
+  - tries quiesced snapshot when VMware Tools are healthy
+  - falls back to non-quiesced when tools are unavailable or quiesce cannot be used
+- `true`
+  - requests quiesced snapshots
+- `false`
+  - always uses non-quiesced snapshots
 
-### Retry Failed Migration
+## `virt-v2v-in-place` Behavior
 
-If a VM migration job fails, you can retry it from UI or API without regenerating all settings.
+`virt-v2v-in-place` runs after final sync when enabled.
 
-Supported methods:
+Planning behavior:
 
-- API:
-  - `POST /migration/retry/{vm}`
-  - Optional query: `?spec_file=/absolute/path/to/spec.yaml` to force a specific spec.
-  - If `spec_file` is not provided, server retries using the latest resolved spec for that VM.
-- UI:
-  - `Retry` action from Progress tab (enabled only for failed jobs).
+- single-disk guests use boot-disk-only mode
+- multi-disk guests are inspected and may use temporary `libvirtxml` mode when the guest OS spans multiple disks
 
-Behavior:
+Safety improvements in current `main`:
 
-- Retry creates a new job ID and keeps previous failed job history.
-- Retry is blocked (`409`) if a job for that VM is already `queued` or `running`.
+- single-disk conversion fails early if boot-disk inspection finds no guest OS or no root device
+- Windows guests get stricter pre-conversion checks
+- failed jobs can be retried with `virt-v2v` debug enabled
 
-## Workflow Diagram
+## Retry and Retry with Debug
 
-```text
-                  +----------------------+
-                  |   v2c-engine run     |
-                  +----------+-----------+
-                             |
-                             v
-                  +----------------------+
-                  | init                 |
-                  | - find VM            |
-                  | - ensure CBT         |
-                  | - create base snap   |
-                  +----------+-----------+
-                             |
-                             v
-                  +----------------------+
-                  | base_copy            |
-                  | - VDDK reads         |
-                  | - write QCOW2        |
-                  | - per-disk parallel  |
-                  +----------+-----------+
-                             |
-                             v
-                  +----------------------+
-                  | delta loop           |
-                  | - wait delta_interval|
-                  | - create delta snap  |
-                  | - QueryChanged...    |
-                  | - apply CBT blocks   |
-                  +----------+-----------+
-                             |
-              +--------------+---------------+
-              |                              |
-              | finalize requested?          | no
-              | finalize_at reached?         +------> back to delta loop
-              |
-              v
-   +---------------------------+
-   | final_sync                |
-   | - shutdown source VM      |
-   | - create final snapshot   |
-   | - apply last CBT changes  |
-   +-------------+-------------+
-                 |
-                 v
-   +---------------------------+
-   | converting                |
-   | - virt-v2v-in-place       |
-   |   (if enabled)            |
-   +-------------+-------------+
-                 |
-                 v
-   +---------------------------+
-   | import_root_disk          |
-   | - importVm                |
-   | - attach extra NICs       |
-   +-------------+-------------+
-                 |
-                 v
-   +---------------------------+
-   | import_data_disk          |
-   | - importVolume            |
-   | - attachVolume            |
-   +-------------+-------------+
-                 |
-                 v
-   +---------------------------+
-   | done                      |
-   +---------------------------+
-```
+Failed jobs can be retried from:
 
-## Primary Commands
+- UI
+- API
+
+Standard retry:
+
+- creates a new job
+- keeps job history
+
+Debug retry:
+
+- runs `virt-v2v-in-place` with `-v -x`
+- useful when conversion failures need upstream-quality diagnostics
+
+API examples:
 
 ```bash
-# Run one or more VM migrations
-./v2c-engine run --spec ./spec.run.example.yaml --config ./config.yaml
-./v2c-engine run --spec ./spec.run.example.yaml --spec ./another-vm.yaml --config ./config.yaml
-./v2c-engine run --spec ./spec.run.multi.example.yaml --parallel-vms 3 --config ./config.yaml
-
-# Check status (includes current stage, next stage, finalize_requested, finalize_now_requested)
-./v2c-engine status --spec ./spec.run.multi.example.yaml --config ./config.yaml
-./v2c-engine status --spec ./spec.run.multi.example.yaml --vm Centos7 --json --config ./config.yaml
-
-# Request finalize for selected VM(s) from a batch spec
-./v2c-engine finalize --spec ./spec.run.multi.example.yaml --vm Centos7 --config ./config.yaml
-./v2c-engine finalize --spec ./spec.run.multi.example.yaml --vm Centos7 --now --config ./config.yaml
-./v2c-engine finalize --spec ./spec.run.multi.example.yaml --vm Centos7 --vm-id vm-3312 --config ./config.yaml
-
-# API service
-./v2c-engine serve --config ./config.yaml --listen :8000
+POST /migration/retry/{vm}
+POST /migration/retry/{vm}?debug=true
 ```
 
-`finalize` is idempotent:
+## UI and API
 
-- If finalize already requested, command returns success and reports it.
-- If finalize-now already requested (`--now`), command returns success and reports it.
-- If VM is already done, command returns success and reports completion.
+The UI is served by `v2c-ui` and talks to `v2c-engine serve`.
 
-## Run Workflow Stages
+### API Endpoints
 
-Stage order:
-
-- `init`
-- `base_copy`
-- `delta` / `final_sync`
-- `converting`
-- `import_root_disk`
-- `import_data_disk`
-- `done`
-
-Highlights:
-
-- Snapshot quiesce policy: `auto` tries quiesced snapshots when VMware Tools are healthy, else fallback non-quiesced.
-- CBT auto-enable if not already enabled.
-- Parallel VM and parallel disk support.
-- CloudStack import of root + data disks; data disk attach handled in workflow.
-- Additional NIC mappings are attached after import VM creation.
-
-## UI/API
-
-UI runs as a service (`v2c-ui`) and talks to `v2c-engine serve`.
-
-API endpoints:
-
+- `GET /health`
 - `GET /vmware/vms`
-- `GET /cloudstack/{zones|clusters|storage|networks|diskofferings|serviceofferings}`
+- `GET /cloudstack/zones`
+- `GET /cloudstack/clusters`
+- `GET /cloudstack/storage`
+- `GET /cloudstack/networks`
+- `GET /cloudstack/diskofferings`
+- `GET /cloudstack/serviceofferings`
 - `POST /migration/spec`
 - `POST /migration/start`
-- `POST /migration/retry/{vm}`
-  - Optional query: `?spec_file=...`
-- `GET /migration/status/{vm}`
 - `GET /migration/jobs`
-- `POST /migration/finalize/{vm}`
-  - Optional query: `?now=true` for immediate finalize request
+- `GET /migration/status/{vm}`
 - `GET /migration/logs/{vm}`
-- `GET /health`
+- `POST /migration/finalize/{vm}`
+- `POST /migration/finalize/{vm}?now=true`
+- `POST /migration/retry/{vm}`
+- `POST /migration/retry/{vm}?debug=true`
+- `POST /migration/shutdown/{vm}?action=force`
+- `POST /migration/shutdown/{vm}?action=manual`
 
-Status payload includes:
+### Status Payload Highlights
 
 - `stage`
 - `next_stage`
-- `finalize_requested`
-- `finalize_now_requested`
 - `overall_progress`
 - `transfer_speed_mbps`
 - `disk_progress`
+- `finalize_requested`
+- `finalize_now_requested`
+- `awaiting_user_action`
+- `required_action`
+- `available_actions`
+
+### UI Highlights
+
+- batch VM selection
+- per-VM storage and NIC mapping
+- strategy settings including:
+  - delta interval
+  - finalize schedule
+  - settle delay
+  - shutdown mode
+  - snapshot quiesce
+- migration progress table
+- pending actions panel
+- failed-job retry and retry-with-debug
+- logs view
+
+## Import Sequence
+
+The import order is:
+
+1. optional `virt-v2v-in-place`
+2. `importVm` for root disk
+3. attach additional NICs
+4. `importVolume` for each non-root disk
+5. `attachVolume` for each imported data disk
+6. `updateVirtualMachine` for VM-level settings
+7. optional start of imported VM
+
+## Manual CLI Usage
+
+Run:
+
+```bash
+./v2c-engine run --spec ./examples/spec.run.single-vm.single-disk.single-nic.yaml --config /etc/v2c-engine/config.yaml
+```
+
+Status:
+
+```bash
+./v2c-engine status --spec ./examples/spec.run.multi.example.yaml --config /etc/v2c-engine/config.yaml
+./v2c-engine status --spec ./examples/spec.run.multi.example.yaml --vm Centos7 --json --config /etc/v2c-engine/config.yaml
+```
+
+Finalize:
+
+```bash
+./v2c-engine finalize --spec ./examples/spec.run.multi.example.yaml --vm Centos7 --config /etc/v2c-engine/config.yaml
+./v2c-engine finalize --spec ./examples/spec.run.multi.example.yaml --vm Centos7 --now --config /etc/v2c-engine/config.yaml
+```
+
+Serve API:
+
+```bash
+./v2c-engine serve --config ./config.yaml --listen :8000
+```
 
 ## Example Files
 
-Use [examples/README.md](./examples/README.md).
-
-Known limitations and platform-specific workarounds are tracked in
-[docs/KNOWN_ISSUES.md](./docs/KNOWN_ISSUES.md).
+See [examples/README.md](./examples/README.md).
 
 Common templates:
 
@@ -548,13 +533,24 @@ Common templates:
 - [examples/spec.run.multi-vm.multi-disk.multi-nic.yaml](./examples/spec.run.multi-vm.multi-disk.multi-nic.yaml)
 - [examples/spec.run.multi-vm.defaults-only.yaml](./examples/spec.run.multi-vm.defaults-only.yaml)
 
-## Build (Manual)
+## Known Issues and Workarounds
+
+Known limitations and platform-specific workarounds are tracked in:
+
+- [docs/KNOWN_ISSUES.md](./docs/KNOWN_ISSUES.md)
+
+Current documented issues include:
+
+- Ubuntu + some NFSv4 environments causing QCOW2 flush I/O errors
+- `virt-v2v-in-place` failures for CentOS 7 XFS v4 guests on EL10 guestfs stacks
+
+## Manual Build
 
 ```bash
 go build -o v2c-engine ./cmd/v2c-engine
 ```
 
-If VDDK is in non-default path:
+If VDDK is in a non-default path:
 
 ```bash
 export CGO_CFLAGS="-I/opt/vmware-vddk/include"
@@ -568,10 +564,7 @@ chmod +x ./scripts/uninstall.sh
 sudo ./scripts/uninstall.sh --purge-state
 ```
 
-`uninstall.sh` removes service/files/config artifacts created by bootstrap.  
-It does not auto-remove OS packages.
-
-To print the bootstrap package list for manual review/removal:
+To print the bootstrap package list for manual review:
 
 ```bash
 ./scripts/uninstall.sh --list-packages
