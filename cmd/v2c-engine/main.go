@@ -3861,6 +3861,13 @@ type cloudStackClient struct {
 	HTTP      *http.Client
 }
 
+func (c *cloudStackClient) timeout() time.Duration {
+	if c == nil || c.HTTP == nil {
+		return 0
+	}
+	return c.HTTP.Timeout
+}
+
 func newCloudStackClient(cfg *appConfig) (*cloudStackClient, error) {
 	if strings.TrimSpace(cfg.CloudStack.Endpoint) == "" ||
 		strings.TrimSpace(cfg.CloudStack.APIKey) == "" ||
@@ -3902,24 +3909,33 @@ func (c *cloudStackClient) request(command string, params map[string]string) (ma
 	signature := base64.StdEncoding.EncodeToString(mac.Sum(nil))
 
 	reqURL := fmt.Sprintf("%s?%s&signature=%s", c.Endpoint, query, neturl.QueryEscape(signature))
+	endpointHost := cloudStackEndpointName(c.Endpoint)
+	timeout := c.timeout()
+	start := time.Now()
+	log.Printf("CloudStack request command=%s endpoint=%s timeout=%s", command, endpointHost, timeout)
 	resp, err := c.HTTP.Get(reqURL)
 	if err != nil {
+		log.Printf("CloudStack request failed command=%s endpoint=%s timeout=%s elapsed=%s error=%v", command, endpointHost, timeout, time.Since(start).Round(time.Millisecond), err)
 		return nil, err
 	}
 	defer resp.Body.Close()
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
+		log.Printf("CloudStack response read failed command=%s endpoint=%s elapsed=%s error=%v", command, endpointHost, time.Since(start).Round(time.Millisecond), err)
 		return nil, err
 	}
 
 	var out map[string]any
 	if err := json.Unmarshal(body, &out); err != nil {
+		log.Printf("CloudStack response decode failed command=%s endpoint=%s elapsed=%s status=%d error=%v", command, endpointHost, time.Since(start).Round(time.Millisecond), resp.StatusCode, err)
 		return nil, fmt.Errorf("invalid cloudstack response: %w", err)
 	}
 	if e, ok := out["errorresponse"]; ok {
+		log.Printf("CloudStack request returned API error command=%s endpoint=%s elapsed=%s status=%d error=%v", command, endpointHost, time.Since(start).Round(time.Millisecond), resp.StatusCode, e)
 		return nil, fmt.Errorf("cloudstack error response: %v", e)
 	}
+	log.Printf("CloudStack request completed command=%s endpoint=%s elapsed=%s status=%d", command, endpointHost, time.Since(start).Round(time.Millisecond), resp.StatusCode)
 	return out, nil
 }
 
