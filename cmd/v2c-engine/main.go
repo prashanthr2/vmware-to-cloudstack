@@ -1618,9 +1618,10 @@ type appConfig struct {
 		Workdir         string `yaml:"workdir"`
 	} `yaml:"migration"`
 	CloudStack struct {
-		Endpoint  string `yaml:"endpoint"`
-		APIKey    string `yaml:"api_key"`
-		SecretKey string `yaml:"secret_key"`
+		Endpoint       string `yaml:"endpoint"`
+		APIKey         string `yaml:"api_key"`
+		SecretKey      string `yaml:"secret_key"`
+		TimeoutSeconds int    `yaml:"timeout_seconds"`
 	} `yaml:"cloudstack"`
 	CloudStackDefaults struct {
 		ZoneID            string `yaml:"zoneid"`
@@ -3874,12 +3875,16 @@ func newCloudStackClient(cfg *appConfig) (*cloudStackClient, error) {
 		strings.TrimSpace(cfg.CloudStack.SecretKey) == "" {
 		return nil, errors.New("cloudstack endpoint/api_key/secret_key are required in config.yaml")
 	}
+	timeout := 45 * time.Second
+	if cfg.CloudStack.TimeoutSeconds > 0 {
+		timeout = time.Duration(cfg.CloudStack.TimeoutSeconds) * time.Second
+	}
 	return &cloudStackClient{
 		Endpoint:  normalizeCloudStackEndpoint(cfg.CloudStack.Endpoint),
 		APIKey:    cfg.CloudStack.APIKey,
 		SecretKey: cfg.CloudStack.SecretKey,
 		HTTP: &http.Client{
-			Timeout: 45 * time.Second,
+			Timeout: timeout,
 		},
 	}, nil
 }

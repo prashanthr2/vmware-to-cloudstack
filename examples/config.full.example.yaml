@@ -80,6 +80,18 @@ cloudstack:
   api_key: "replace-me"
   # MANDATORY: CloudStack secret key.
   secret_key: "replace-me"
+  # OPTIONAL:
+  # Default timeout in seconds for CloudStack API requests used by:
+  # - run mode engine operations
+  # - serve/UI inventory calls such as listNetworks, listOsTypes, listStoragePools
+  #
+  # This is especially useful when the CloudStack management API is slow to
+  # return larger inventory responses.
+  #
+  # Default behavior if omitted/0:
+  # - run mode client: 45 seconds
+  # - serve/UI client: 30 seconds
+  timeout_seconds: 90
 
 cloudstack_defaults:
   # OPTIONAL BUT STRONGLY RECOMMENDED:

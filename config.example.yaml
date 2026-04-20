@@ -16,6 +16,9 @@ cloudstack:
   endpoint: "cloudstack.example.com:8080"
   api_key: "change-me"
   secret_key: "change-me"
+  # Optional default timeout in seconds for CloudStack API requests from both
+  # the engine and the UI/API backend. Useful for slow listNetworks/listOsTypes calls.
+  timeout_seconds: 90
 
 cloudstack_defaults:
   zoneid: ""

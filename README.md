@@ -210,6 +210,29 @@ Notes:
 - CloudStack management server does not need direct VMware connectivity for this tool.
 - `qemu-nbd` is used locally via Unix socket, not as a network listener.
 
+## CloudStack API Timeout
+
+If CloudStack inventory calls such as `listNetworks` or `listOsTypes` are slow in your environment, you can raise the default CloudStack API timeout in `config.yaml`:
+
+```yaml
+cloudstack:
+  endpoint: "cloudstack.example.com:8080"
+  api_key: "replace-me"
+  secret_key: "replace-me"
+  timeout_seconds: 90
+```
+
+This applies to:
+
+- UI/API inventory requests handled by `v2c-engine serve`
+- runtime engine calls such as `importVm`, `importVolume`, and `updateVirtualMachine`
+
+After changing it:
+
+```bash
+sudo systemctl restart v2c-engine
+```
+
 ## Quick Start
 
 ### 1. Clone

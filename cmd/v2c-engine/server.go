@@ -460,7 +460,11 @@ func (s *apiServer) handleCloudStackStorage(w http.ResponseWriter, r *http.Reque
 }
 
 func (s *apiServer) handleCloudStackNetworks(w http.ResponseWriter, r *http.Request) {
-	s.handleCloudStackList(w, r, "listNetworks", "network")
+	params := map[string]string{}
+	if zoneID := strings.TrimSpace(r.URL.Query().Get("zoneid")); zoneID != "" {
+		params["zoneid"] = zoneID
+	}
+	s.handleCloudStackListWithParams(w, r, "listNetworks", "network", params)
 }
 
 func (s *apiServer) handleCloudStackDiskOfferings(w http.ResponseWriter, r *http.Request) {
@@ -476,6 +480,10 @@ func (s *apiServer) handleCloudStackOSTypes(w http.ResponseWriter, r *http.Reque
 }
 
 func (s *apiServer) handleCloudStackList(w http.ResponseWriter, r *http.Request, command string, key string) {
+	s.handleCloudStackListWithParams(w, r, command, key, nil)
+}
+
+func (s *apiServer) handleCloudStackListWithParams(w http.ResponseWriter, r *http.Request, command string, key string, params map[string]string) {
 	if r.Method != http.MethodGet {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
@@ -485,7 +493,7 @@ func (s *apiServer) handleCloudStackList(w http.ResponseWriter, r *http.Request,
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	res, err := cs.request(command, nil)
+	res, err := cs.request(command, params)
 	if err != nil {
 		writeError(w, http.StatusBadGateway, fmt.Sprintf("CloudStack API request failed: %v", err))
 		return
@@ -1708,6 +1716,9 @@ func (s *apiServer) cloudStackClientFromRequest(r *http.Request) (*cloudStackCli
 	apiKey := strings.TrimSpace(r.Header.Get("x-cloudstack-api-key"))
 	secret := strings.TrimSpace(r.Header.Get("x-cloudstack-secret-key"))
 	timeout := 30 * time.Second
+	if s.cfg != nil && s.cfg.CloudStack.TimeoutSeconds > 0 {
+		timeout = time.Duration(s.cfg.CloudStack.TimeoutSeconds) * time.Second
+	}
 	if raw := strings.TrimSpace(r.Header.Get("x-cloudstack-timeout-seconds")); raw != "" {
 		n, err := strconv.Atoi(raw)
 		if err != nil {

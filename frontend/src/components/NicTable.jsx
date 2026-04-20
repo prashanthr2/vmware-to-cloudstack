@@ -2,12 +2,18 @@ function optionLabel(item) {
   return item.name || item.displaytext || item.id || "Unknown";
 }
 
-export default function NicTable({ nics, networks, onNicChange, validationByNic }) {
+export default function NicTable({ nics, networks, onNicChange, validationByNic, networksLoading = false, networksError = "" }) {
   return (
     <section className="panel">
       <div className="panel-header">
         <h2>NIC Mapping</h2>
-        <p className="hint">Each source NIC must map to a unique CloudStack network.</p>
+        <p className="hint">
+          {networksLoading
+            ? "Loading CloudStack networks for the selected zone..."
+            : networksError
+              ? `CloudStack network lookup failed for the selected zone: ${networksError}`
+              : "Each source NIC must map to a unique CloudStack network."}
+        </p>
       </div>
       <div className="table-wrap">
         <table>
@@ -42,7 +48,11 @@ export default function NicTable({ nics, networks, onNicChange, validationByNic 
                     <td>{nic.source_network || "-"}</td>
                     <td><code>{nic.source_mac || "-"}</code></td>
                     <td>
-                      <select value={nic.networkid || ""} onChange={(e) => onNicChange(nic.id, "networkid", e.target.value)}>
+                      <select
+                        value={nic.networkid || ""}
+                        onChange={(e) => onNicChange(nic.id, "networkid", e.target.value)}
+                        disabled={networksLoading && networks.length === 0}
+                      >
                         <option value="">Select network</option>
                         {networks.map((item) => (
                           <option

@@ -315,6 +315,18 @@ function dedupeByID(items) {
   });
 }
 
+function uniqueNonEmptyStrings(items) {
+  const seen = new Set();
+  const out = [];
+  (items || []).forEach((item) => {
+    const value = String(item || "").trim();
+    if (!value || seen.has(value)) return;
+    seen.add(value);
+    out.push(value);
+  });
+  return out;
+}
+
 function mergeConfigDefaultEnvironments(current, defaults) {
   const next = {
     ...DEFAULT_ENV_STATE,
@@ -403,7 +415,9 @@ export default function App() {
   const [zones, setZones] = useState([]);
   const [clusters, setClusters] = useState([]);
   const [storagePools, setStoragePools] = useState([]);
-  const [networks, setNetworks] = useState([]);
+  const [networksByZone, setNetworksByZone] = useState({});
+  const [networksLoadingByZone, setNetworksLoadingByZone] = useState({});
+  const [networkErrorsByZone, setNetworkErrorsByZone] = useState({});
   const [serviceOfferings, setServiceOfferings] = useState([]);
   const [diskOfferings, setDiskOfferings] = useState([]);
   const [osTypes, setOsTypes] = useState([]);
@@ -478,6 +492,12 @@ export default function App() {
     };
   }, [selectedCloudstack]);
 
+  useEffect(() => {
+    setNetworksByZone({});
+    setNetworksLoadingByZone({});
+    setNetworkErrorsByZone({});
+  }, [cloudstackHeaders]);
+
   const vmwareVmsPath = useMemo(() => {
     const params = new URLSearchParams();
     if (showVmwareTemplates) params.set("include_templates", "true");
@@ -503,6 +523,15 @@ export default function App() {
         nics: vm.nics || [],
       })),
     [vmwareVms]
+  );
+
+  const networksForZone = useCallback(
+    (zoneID) => {
+      const zone = String(zoneID || "").trim();
+      if (!zone) return [];
+      return networksByZone[zone] || [];
+    },
+    [networksByZone]
   );
 
   const defaultSelections = useMemo(
@@ -581,7 +610,7 @@ export default function App() {
       const zoneClusters = filterByZone(clusters, base.zoneid);
       const zoneServiceOfferings = filterByZone(serviceOfferings, base.zoneid);
       const zoneStorage = filterByZone(storagePools, base.zoneid);
-      const zoneNetworks = filterByZone(networks, base.zoneid);
+      const zoneNetworks = networksForZone(base.zoneid);
       const zoneDiskOfferings = filterByZone(diskOfferings, base.zoneid);
       base.clusterid = pickValidOrFirst(template?.clusterid || base.clusterid, zoneClusters);
       base.serviceofferingid = pickValidOrFirst(template?.serviceofferingid || base.serviceofferingid, zoneServiceOfferings);
@@ -613,7 +642,7 @@ export default function App() {
         })),
       };
     },
-    [clusters, defaultSelections, diskOfferings, mapInventoryDisks, mapInventoryNics, networks, serviceOfferings, storagePools]
+    [clusters, defaultSelections, diskOfferings, mapInventoryDisks, mapInventoryNics, networksForZone, serviceOfferings, storagePools]
   );
 
   useEffect(() => {
@@ -657,9 +686,20 @@ export default function App() {
   const activeZoneID = activeDraft?.zoneid || "";
   const clustersForActiveZone = useMemo(() => filterByZone(clusters, activeZoneID), [clusters, activeZoneID]);
   const storagePoolsForActiveZone = useMemo(() => filterByZone(storagePools, activeZoneID), [storagePools, activeZoneID]);
-  const networksForActiveZone = useMemo(() => filterByZone(networks, activeZoneID), [networks, activeZoneID]);
+  const networksForActiveZone = useMemo(() => networksForZone(activeZoneID), [activeZoneID, networksForZone]);
+  const activeZoneNetworksLoading = Boolean(activeZoneID && networksLoadingByZone[activeZoneID]);
+  const activeZoneNetworksError = activeZoneID ? networkErrorsByZone[activeZoneID] || "" : "";
   const serviceOfferingsForActiveZone = useMemo(() => filterByZone(serviceOfferings, activeZoneID), [serviceOfferings, activeZoneID]);
   const diskOfferingsForActiveZone = useMemo(() => filterByZone(diskOfferings, activeZoneID), [diskOfferings, activeZoneID]);
+  const requiredNetworkZoneIDs = useMemo(
+    () =>
+      uniqueNonEmptyStrings([
+        activeZoneID,
+        ...selectedVmNames.map((vmName) => vmSpecsByName[vmName]?.zoneid || ""),
+        zones[0]?.id || "",
+      ]),
+    [activeZoneID, selectedVmNames, vmSpecsByName, zones]
+  );
   const sharedMountpointSelectionsForActiveVm = useMemo(() => {
     if (!activeDraft) return [];
     const rows = [];
@@ -700,6 +740,66 @@ export default function App() {
     [activeVmName]
   );
 
+  const syncDraftNetworksForZone = useCallback((zoneID, networkList) => {
+    const zone = String(zoneID || "").trim();
+    if (!zone) return;
+    setVmSpecsByName((prev) => {
+      let changed = false;
+      const next = { ...prev };
+      Object.keys(next).forEach((name) => {
+        const draft = next[name];
+        if (!draft || String(draft.zoneid || "").trim() !== zone) return;
+        const updatedNics = (draft.nics || []).map((nic) => ({
+          ...nic,
+          networkid: pickValidOrFirst(nic.networkid, networkList),
+        }));
+        const same = updatedNics.every((nic, index) => nic.networkid === (draft.nics || [])[index]?.networkid);
+        if (same) return;
+        next[name] = { ...draft, nics: updatedNics };
+        changed = true;
+      });
+      return changed ? next : prev;
+    });
+  }, []);
+
+  const loadNetworksForZone = useCallback(
+    async (zoneID, options = {}) => {
+      const zone = String(zoneID || "").trim();
+      if (!zone) return [];
+      const force = options.force === true;
+      const silent = options.silent === true;
+      if (!force && Array.isArray(networksByZone[zone])) return networksByZone[zone];
+      if (networksLoadingByZone[zone]) return [];
+
+      setNetworksLoadingByZone((prev) => ({ ...prev, [zone]: true }));
+      setNetworkErrorsByZone((prev) => {
+        if (!prev[zone]) return prev;
+        const next = { ...prev };
+        delete next[zone];
+        return next;
+      });
+
+      try {
+        const query = new URLSearchParams({ zoneid: zone }).toString();
+        const data = await apiRequest(`/cloudstack/networks?${query}`, { headers: cloudstackHeaders });
+        const networks = Array.isArray(data) ? data : [];
+        setNetworksByZone((prev) => ({ ...prev, [zone]: networks }));
+        syncDraftNetworksForZone(zone, networks);
+        return networks;
+      } catch (err) {
+        const message = err?.message || "Failed to load CloudStack networks.";
+        setNetworkErrorsByZone((prev) => ({ ...prev, [zone]: message }));
+        if (!silent) {
+          pushToast("error", `CloudStack networks (${zone}): ${message}`);
+        }
+        throw err;
+      } finally {
+        setNetworksLoadingByZone((prev) => ({ ...prev, [zone]: false }));
+      }
+    },
+    [cloudstackHeaders, networksByZone, networksLoadingByZone, pushToast, syncDraftNetworksForZone]
+  );
+
   const loadInventory = useCallback(async () => {
     setInventoryBusy(true);
     try {
@@ -708,7 +808,6 @@ export default function App() {
         { key: "zones", label: "CloudStack zones", path: "/cloudstack/zones", headers: cloudstackHeaders },
         { key: "clusters", label: "CloudStack clusters", path: "/cloudstack/clusters", headers: cloudstackHeaders },
         { key: "storage", label: "CloudStack storage", path: "/cloudstack/storage", headers: cloudstackHeaders },
-        { key: "networks", label: "CloudStack networks", path: "/cloudstack/networks", headers: cloudstackHeaders },
         { key: "serviceOfferings", label: "CloudStack service offerings", path: "/cloudstack/serviceofferings", headers: cloudstackHeaders },
         { key: "diskOfferings", label: "CloudStack disk offerings", path: "/cloudstack/diskofferings", headers: cloudstackHeaders },
         { key: "osTypes", label: "CloudStack guest OS types", path: "/cloudstack/ostypes", headers: cloudstackHeaders },
@@ -728,7 +827,6 @@ export default function App() {
       const zoneList = byKey.zones?.data || [];
       const clusterList = byKey.clusters?.data || [];
       const storageList = byKey.storage?.data || [];
-      const networkList = byKey.networks?.data || [];
       const serviceList = byKey.serviceOfferings?.data || [];
       const diskOfferingList = byKey.diskOfferings?.data || [];
       const osTypeList = byKey.osTypes?.data || [];
@@ -737,7 +835,6 @@ export default function App() {
       setZones(zoneList);
       setClusters(clusterList);
       setStoragePools(storageList);
-      setNetworks(networkList);
       setServiceOfferings(serviceList);
       setDiskOfferings(diskOfferingList);
       setOsTypes(osTypeList);
@@ -752,7 +849,7 @@ export default function App() {
           const zoneid = pickValidOrFirst(draft.zoneid, zoneList);
           const zoneClusters = filterByZone(clusterList, zoneid);
           const zoneStorage = filterByZone(storageList, zoneid);
-          const zoneNetworks = filterByZone(networkList, zoneid);
+          const zoneNetworks = networksForZone(zoneid);
           const zoneServiceOfferings = filterByZone(serviceList, zoneid);
           const zoneDiskOfferings = filterByZone(diskOfferingList, zoneid);
           const updated = {
@@ -791,7 +888,7 @@ export default function App() {
     } finally {
       setInventoryBusy(false);
     }
-  }, [cloudstackHeaders, mapInventoryDisks, mapInventoryNics, pushToast, vmwareHeaders, vmwareVmsPath]);
+  }, [cloudstackHeaders, mapInventoryDisks, mapInventoryNics, networksForZone, pushToast, vmwareHeaders, vmwareVmsPath]);
 
   const refreshSelectedVmDetails = useCallback(async () => {
     if (selectedVmNames.length === 0) {
@@ -813,7 +910,7 @@ export default function App() {
           }
           const current = next[name] || buildDraftForVm(vm);
           const zoneStorage = filterByZone(storagePools, current.zoneid);
-          const zoneNetworks = filterByZone(networks, current.zoneid);
+          const zoneNetworks = networksForZone(current.zoneid);
           const zoneDiskOfferings = filterByZone(diskOfferings, current.zoneid);
           const updated = { ...current, vm_name: vm.name, vm_moref: vm.moref || current.vm_moref || "" };
           updated.disks = mapInventoryDisks(vm.disks || [], updated.boot_storageid, current.disks || []).map((disk) => {
@@ -838,7 +935,7 @@ export default function App() {
     } finally {
       setVmDisksLoading(false);
     }
-  }, [buildDraftForVm, diskOfferings, mapInventoryDisks, mapInventoryNics, networks, pushToast, selectedVmNames, storagePools, vmwareHeaders, vmwareVmsPath]);
+  }, [buildDraftForVm, diskOfferings, mapInventoryDisks, mapInventoryNics, networksForZone, pushToast, selectedVmNames, storagePools, vmwareHeaders, vmwareVmsPath]);
 
   const refreshJobs = useCallback(async () => {
     try {
@@ -902,6 +999,13 @@ export default function App() {
   }, [loadInventory]);
 
   useEffect(() => {
+    requiredNetworkZoneIDs.forEach((zoneID) => {
+      if (!zoneID || networksByZone[zoneID] || networksLoadingByZone[zoneID]) return;
+      loadNetworksForZone(zoneID, { silent: true }).catch(() => {});
+    });
+  }, [loadNetworksForZone, networksByZone, networksLoadingByZone, requiredNetworkZoneIDs]);
+
+  useEffect(() => {
     refreshJobs();
   }, [refreshJobs]);
 
@@ -947,12 +1051,15 @@ export default function App() {
 
   const updateField = useCallback(
     (field, value) => {
+      if (field === "zoneid" && value) {
+        loadNetworksForZone(value, { silent: true }).catch(() => {});
+      }
       updateActiveDraft((draft) => {
         const next = { ...draft, [field]: value };
         if (field === "zoneid") {
           const zoneClusters = filterByZone(clusters, value);
           const zoneStorage = filterByZone(storagePools, value);
-          const zoneNetworks = filterByZone(networks, value);
+          const zoneNetworks = networksForZone(value);
           const zoneServiceOfferings = filterByZone(serviceOfferings, value);
           const zoneDiskOfferings = filterByZone(diskOfferings, value);
           next.clusterid = pickValidOrFirst(draft.clusterid, zoneClusters);
@@ -984,7 +1091,7 @@ export default function App() {
         return next;
       });
     },
-    [clusters, diskOfferings, networks, serviceOfferings, storagePools, updateActiveDraft]
+    [clusters, diskOfferings, loadNetworksForZone, networksForZone, serviceOfferings, storagePools, updateActiveDraft]
   );
 
   const updateMigrationField = useCallback(
@@ -1230,10 +1337,11 @@ export default function App() {
           label: disk.label || `Disk ${disk.unit}`,
           storageName: resolveStorageName(disk.storageid),
         }));
+        const zoneNetworks = networksForZone(draft?.zoneid || "");
         const nicDetails = nics.map((nic, index) => ({
           id: nic.id || String(index),
           label: nic.source_label || `NIC ${index + 1}`,
-          networkName: resolveName(networks, nic.networkid || ""),
+          networkName: resolveName(zoneNetworks, nic.networkid || ""),
         }));
         return {
           vmName,
@@ -1254,7 +1362,7 @@ export default function App() {
           nicDetails,
         };
       }),
-    [clusters, networks, osTypes, selectedVmNames, serviceOfferings, storagePools, vmSpecsByName, zones]
+    [clusters, networksForZone, osTypes, selectedVmNames, serviceOfferings, storagePools, vmSpecsByName, zones]
   );
 
   return (
@@ -1382,12 +1490,14 @@ export default function App() {
                 validationByUnit={activeValidation.diskErrors}
               />
 
-              <NicTable
-                nics={activeDraft.nics || []}
-                networks={networksForActiveZone}
-                onNicChange={updateNic}
-                validationByNic={activeValidation.nicErrors}
-              />
+                <NicTable
+                  nics={activeDraft.nics || []}
+                  networks={networksForActiveZone}
+                  networksLoading={activeZoneNetworksLoading}
+                  networksError={activeZoneNetworksError}
+                  onNicChange={updateNic}
+                  validationByNic={activeValidation.nicErrors}
+                />
 
               <section className="panel">
                 <div className="panel-header">
