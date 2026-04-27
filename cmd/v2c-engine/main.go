@@ -1367,23 +1367,39 @@ func probeGuestWritable(paths []string) error {
 	if len(paths) == 0 {
 		return errors.New("no disk paths provided for writable guest probe")
 	}
+	rootDev := ""
+	if report, err := inspectGuestXML(paths); err == nil && len(report.OperatingSystems) > 0 {
+		rootDev = strings.TrimSpace(report.OperatingSystems[0].Root)
+	}
 	args := make([]string, 0, len(paths)*2+1)
 	for _, p := range paths {
 		args = append(args, "-a", p)
 	}
-	args = append(args, "-i")
+	if rootDev != "" {
+		args = append(args, "--rw")
+	} else {
+		args = append(args, "-i")
+	}
 	cmd := exec.Command("guestfish", args...)
 	cmd.Env = guestfsChildEnv()
-	cmd.Stdin = strings.NewReader("touch /v2c-rw-probe\nrm /v2c-rw-probe\nexit\n")
+	script := "touch /v2c-rw-probe\nrm /v2c-rw-probe\nexit\n"
+	if rootDev != "" {
+		script = fmt.Sprintf("run\nmount %s /\ntouch /v2c-rw-probe\nrm /v2c-rw-probe\nexit\n", rootDev)
+	}
+	cmd.Stdin = strings.NewReader(script)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		msg := strings.ToLower(string(out))
 		if strings.Contains(msg, "read-only file system") {
 			return fmt.Errorf(
 				"guest filesystem is read-only. On Windows this usually means the volume was not cleanly unmounted, Fast Startup/hibernation is enabled, or the migration used a non-quiesced snapshot. Ensure a clean shutdown before final sync and disable Fast Startup/hibernation, then retry",
-			)
+				)
 		}
-		return fmt.Errorf("guest writable probe failed: %w\n%s", err, string(out))
+		target := "guest"
+		if rootDev != "" {
+			target = rootDev
+		}
+		return fmt.Errorf("guest writable probe failed for %s: %w\n%s", target, err, string(out))
 	}
 	return nil
 }
