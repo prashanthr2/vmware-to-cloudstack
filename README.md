@@ -186,10 +186,13 @@ Bootstrap prepares this automatically:
 - EL-family hosts:
   - adds the `virtio-win` repo
   - installs `virtio-win`
+  - installs `ntfs-3g`/FUSE packages and adds `fuse-libs` to the libguestfs supermin package list when needed
 - Ubuntu hosts:
   - converts upstream `virtio-win.noarch.rpm` with `alien`
   - installs the resulting package
   - extracts `srvany` helpers into `/usr/share/virt-tools`
+
+On Oracle Linux 9 and similar EL9 hosts, Windows inspection can fail with `mount.ntfs: error while loading shared libraries: libfuse.so.2` if the libguestfs appliance does not include `fuse-libs`. Bootstrap now installs the required NTFS/FUSE packages, updates the supermin package list, and clears the cached guestfs appliance so `virt-inspector` can mount NTFS volumes.
 
 ## Firewall and Connectivity Requirements
 

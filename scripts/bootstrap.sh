@@ -161,6 +161,49 @@ ensure_virtio_win_assets() {
   return 0
 }
 
+ensure_guestfs_ntfs_support() {
+  local pkg_mgr="$1"
+  local packages=()
+  local supermin_packages=()
+
+  if [[ "$pkg_mgr" == "dnf" ]]; then
+    packages=(fuse fuse-libs ntfs-3g ntfs-3g-libs)
+    supermin_packages=(fuse-libs ntfs-3g ntfs-3g-libs)
+    for p in "${packages[@]}"; do
+      run_root dnf -y install "$p" || warn "Package not installed: $p"
+    done
+  elif [[ "$pkg_mgr" == "apt" ]]; then
+    packages=(ntfs-3g libfuse2)
+    supermin_packages=(ntfs-3g libfuse2)
+    for p in "${packages[@]}"; do
+      run_root apt-get install -y "$p" || warn "Package not installed: $p"
+    done
+  else
+    return 0
+  fi
+
+  local patched=0
+  local f p
+  for f in /usr/lib*/guestfs/supermin.d/packages; do
+    [[ -f "$f" ]] || continue
+    for p in "${supermin_packages[@]}"; do
+      if ! run_root grep -qx "$p" "$f"; then
+        run_root sh -c "printf '%s\n' '$p' >> '$f'"
+        patched=1
+      fi
+    done
+  done
+  if [[ "$patched" -eq 1 ]]; then
+    log "Added NTFS/FUSE runtime packages to libguestfs supermin package list"
+  fi
+
+  # Rebuild the appliance cache so virt-inspector can mount NTFS volumes.
+  run_root rm -rf /var/tmp/.guestfs-* /tmp/.guestfs-* 2>/dev/null || true
+  if command_exists libguestfs-test-tool; then
+    run_root libguestfs-test-tool >/dev/null || warn "libguestfs-test-tool reported an issue; Windows inspection may still fail"
+  fi
+}
+
 install_dnf_packages() {
   local base=(gcc make git tar curl ca-certificates golang)
   local tools=(qemu-img qemu-kvm-core virt-v2v libguestfs-tools-c libguestfs-winsupport)
@@ -176,6 +219,7 @@ install_dnf_packages() {
   if [[ "$WITH_UI" -eq 1 ]]; then
     run_root dnf -y install "${ui[@]}" || warn "UI packages nodejs/npm not fully installed."
   fi
+  ensure_guestfs_ntfs_support dnf
   ensure_virtio_win_assets dnf
 }
 
@@ -194,6 +238,7 @@ install_apt_packages() {
   if [[ "$WITH_UI" -eq 1 ]]; then
     run_root apt-get install -y "${ui[@]}" || warn "UI packages nodejs/npm not fully installed."
   fi
+  ensure_guestfs_ntfs_support apt
   ensure_virtio_win_assets apt
 }
 
