@@ -1363,43 +1363,98 @@ func xmlEscape(s string) string {
 	return b.String()
 }
 
+func windowsWritableProbeCandidates(report *virtInspectorReport) []string {
+	if report == nil || len(report.OperatingSystems) == 0 {
+		return nil
+	}
+	osr := report.OperatingSystems[0]
+	candidates := make([]string, 0, 1+len(osr.Mountpoints)+len(osr.DriveMappings)+len(osr.Filesystems))
+	seen := map[string]struct{}{}
+	push := func(dev string) {
+		dev = strings.TrimSpace(dev)
+		if dev == "" {
+			return
+		}
+		if _, ok := seen[dev]; ok {
+			return
+		}
+		seen[dev] = struct{}{}
+		candidates = append(candidates, dev)
+	}
+
+	push(osr.Root)
+	for _, dm := range osr.DriveMappings {
+		push(dm.Dev)
+	}
+	for _, mp := range osr.Mountpoints {
+		push(mp.Dev)
+	}
+	for _, fs := range osr.Filesystems {
+		push(fs.Dev)
+	}
+	return candidates
+}
+
+func runWindowsWritableProbe(paths []string, dev string) (string, error) {
+	args := make([]string, 0, len(paths)*2+1)
+	for _, p := range paths {
+		args = append(args, "-a", p)
+	}
+	args = append(args, "--rw")
+	cmd := exec.Command("guestfish", args...)
+	cmd.Env = guestfsChildEnv()
+	cmd.Stdin = strings.NewReader(fmt.Sprintf(
+		"run\nmount %s /\nstat /Windows/System32/config/SYSTEM\ntouch /v2c-rw-probe\nrm /v2c-rw-probe\nexit\n",
+		dev,
+	))
+	out, err := cmd.CombinedOutput()
+	return string(out), err
+}
+
 func probeGuestWritable(paths []string) error {
 	if len(paths) == 0 {
 		return errors.New("no disk paths provided for writable guest probe")
 	}
-	rootDev := ""
-	if report, err := inspectGuestXML(paths); err == nil && len(report.OperatingSystems) > 0 {
-		rootDev = strings.TrimSpace(report.OperatingSystems[0].Root)
+	if report, err := inspectGuestXML(paths); err == nil {
+		candidates := windowsWritableProbeCandidates(report)
+		var lastTarget string
+		var lastOut string
+		var lastErr error
+		for _, dev := range candidates {
+			out, err := runWindowsWritableProbe(paths, dev)
+			if err == nil {
+				return nil
+			}
+			lastTarget = dev
+			lastOut = out
+			lastErr = err
+			if strings.Contains(strings.ToLower(out), "read-only file system") {
+				return fmt.Errorf(
+					"guest filesystem is read-only. On Windows this usually means the volume was not cleanly unmounted, Fast Startup/hibernation is enabled, or the migration used a non-quiesced snapshot. Ensure a clean shutdown before final sync and disable Fast Startup/hibernation, then retry",
+				)
+			}
+		}
+		if lastErr != nil {
+			return fmt.Errorf("guest writable probe failed for Windows root candidates %v; last candidate=%s: %w\n%s", candidates, lastTarget, lastErr, lastOut)
+		}
 	}
 	args := make([]string, 0, len(paths)*2+1)
 	for _, p := range paths {
 		args = append(args, "-a", p)
 	}
-	if rootDev != "" {
-		args = append(args, "--rw")
-	} else {
-		args = append(args, "-i")
-	}
+	args = append(args, "-i")
 	cmd := exec.Command("guestfish", args...)
 	cmd.Env = guestfsChildEnv()
-	script := "touch /v2c-rw-probe\nrm /v2c-rw-probe\nexit\n"
-	if rootDev != "" {
-		script = fmt.Sprintf("run\nmount %s /\ntouch /v2c-rw-probe\nrm /v2c-rw-probe\nexit\n", rootDev)
-	}
-	cmd.Stdin = strings.NewReader(script)
+	cmd.Stdin = strings.NewReader("touch /v2c-rw-probe\nrm /v2c-rw-probe\nexit\n")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		msg := strings.ToLower(string(out))
 		if strings.Contains(msg, "read-only file system") {
 			return fmt.Errorf(
 				"guest filesystem is read-only. On Windows this usually means the volume was not cleanly unmounted, Fast Startup/hibernation is enabled, or the migration used a non-quiesced snapshot. Ensure a clean shutdown before final sync and disable Fast Startup/hibernation, then retry",
-				)
+			)
 		}
-		target := "guest"
-		if rootDev != "" {
-			target = rootDev
-		}
-		return fmt.Errorf("guest writable probe failed for %s: %w\n%s", target, err, string(out))
+		return fmt.Errorf("guest writable probe failed: %w\n%s", err, string(out))
 	}
 	return nil
 }
