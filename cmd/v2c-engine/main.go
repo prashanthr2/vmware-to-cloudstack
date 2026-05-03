@@ -1363,34 +1363,74 @@ func xmlEscape(s string) string {
 	return b.String()
 }
 
-func windowsWritableProbeCandidates(report *virtInspectorReport) []string {
-	if report == nil || len(report.OperatingSystems) == 0 {
+func appendUniqueDeviceCandidate(candidates []string, seen map[string]struct{}, dev string) []string {
+	dev = strings.TrimSpace(dev)
+	if dev == "" {
+		return candidates
+	}
+	if _, ok := seen[dev]; ok {
+		return candidates
+	}
+	seen[dev] = struct{}{}
+	return append(candidates, dev)
+}
+
+func windowsFilesystemCandidates(paths []string) []string {
+	args := make([]string, 0, len(paths)*2+1)
+	for _, p := range paths {
+		args = append(args, "-a", p)
+	}
+	cmd := exec.Command("guestfish", args...)
+	cmd.Env = guestfsChildEnv()
+	cmd.Stdin = strings.NewReader("run\nlist-filesystems\nexit\n")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
 		return nil
 	}
-	osr := report.OperatingSystems[0]
-	candidates := make([]string, 0, 1+len(osr.Mountpoints)+len(osr.DriveMappings)+len(osr.Filesystems))
-	seen := map[string]struct{}{}
-	push := func(dev string) {
-		dev = strings.TrimSpace(dev)
-		if dev == "" {
-			return
-		}
-		if _, ok := seen[dev]; ok {
-			return
-		}
-		seen[dev] = struct{}{}
-		candidates = append(candidates, dev)
-	}
 
-	push(osr.Root)
-	for _, dm := range osr.DriveMappings {
-		push(dm.Dev)
+	candidates := make([]string, 0)
+	seen := map[string]struct{}{}
+	for _, line := range strings.Split(string(out), "\n") {
+		parts := strings.SplitN(strings.TrimSpace(line), ":", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		fsType := strings.ToLower(strings.TrimSpace(parts[1]))
+		if fsType != "" && !strings.Contains(fsType, "ntfs") {
+			continue
+		}
+		candidates = appendUniqueDeviceCandidate(candidates, seen, parts[0])
 	}
-	for _, mp := range osr.Mountpoints {
-		push(mp.Dev)
+	return candidates
+}
+
+func windowsWritableProbeCandidates(paths []string, report *virtInspectorReport) []string {
+	candidates := make([]string, 0)
+	seen := map[string]struct{}{}
+	if report != nil && len(report.OperatingSystems) > 0 {
+		osr := report.OperatingSystems[0]
+		candidates = appendUniqueDeviceCandidate(candidates, seen, osr.Root)
+		for _, dm := range osr.DriveMappings {
+			candidates = appendUniqueDeviceCandidate(candidates, seen, dm.Dev)
+		}
+		for _, mp := range osr.Mountpoints {
+			candidates = appendUniqueDeviceCandidate(candidates, seen, mp.Dev)
+		}
+		for _, fs := range osr.Filesystems {
+			candidates = appendUniqueDeviceCandidate(candidates, seen, fs.Dev)
+		}
 	}
-	for _, fs := range osr.Filesystems {
-		push(fs.Dev)
+	for _, dev := range windowsFilesystemCandidates(paths) {
+		candidates = appendUniqueDeviceCandidate(candidates, seen, dev)
+	}
+	for diskIdx := range paths {
+		if diskIdx >= 26 {
+			break
+		}
+		for partIdx := 1; partIdx <= 32; partIdx++ {
+			dev := fmt.Sprintf("/dev/sd%c%d", 'a'+diskIdx, partIdx)
+			candidates = appendUniqueDeviceCandidate(candidates, seen, dev)
+		}
 	}
 	return candidates
 }
@@ -1404,7 +1444,7 @@ func runWindowsWritableProbe(paths []string, dev string) (string, error) {
 	cmd := exec.Command("guestfish", args...)
 	cmd.Env = guestfsChildEnv()
 	cmd.Stdin = strings.NewReader(fmt.Sprintf(
-		"run\nmount %s /\nstat /Windows/System32/config/SYSTEM\ntouch /v2c-rw-probe\nrm /v2c-rw-probe\nexit\n",
+		"run\ndebug sh \"mnt=/tmp/v2c-rw-probe-mnt; mkdir -p $mnt; trap 'umount $mnt >/dev/null 2>&1 || true' EXIT; /usr/bin/ntfs-3g -o rw %s $mnt; test -f $mnt/Windows/System32/config/SYSTEM; touch $mnt/v2c-rw-probe; rm -f $mnt/v2c-rw-probe\"\nexit\n",
 		dev,
 	))
 	out, err := cmd.CombinedOutput()
@@ -1416,7 +1456,7 @@ func probeGuestWritable(paths []string) error {
 		return errors.New("no disk paths provided for writable guest probe")
 	}
 	if report, err := inspectGuestXML(paths); err == nil {
-		candidates := windowsWritableProbeCandidates(report)
+		candidates := windowsWritableProbeCandidates(paths, report)
 		var lastTarget string
 		var lastOut string
 		var lastErr error
