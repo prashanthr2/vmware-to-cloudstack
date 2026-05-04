@@ -450,6 +450,39 @@ textarea:focus {
   margin-bottom: 12px;
 }
 
+.vm-pagination-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin: 10px 0 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--panel-alt);
+}
+
+.pagination-size-field {
+  flex-direction: row;
+  align-items: center;
+  gap: 8px;
+  min-height: 0;
+  white-space: nowrap;
+}
+
+.pagination-size-field select {
+  min-height: 32px;
+  width: 90px;
+}
+
+.pagination-actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
 .vm-select-card {
   display: grid;
   grid-template-columns: auto 1fr;
