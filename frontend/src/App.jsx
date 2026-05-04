@@ -29,6 +29,22 @@ const DEFAULT_MIGRATION = {
   start_vm_after_import: false,
 };
 
+const emptyBatchDraft = {
+  zoneid: "",
+  clusterid: "",
+  serviceofferingid: "",
+  boot_storageid: "",
+  data_storageid: "",
+  data_diskofferingid: "",
+  networkid: "",
+  ostypeid: "",
+  boottype: "",
+  bootmode: "",
+  rootdiskcontroller: "",
+  nicadapter: "",
+  migration: { ...DEFAULT_MIGRATION },
+};
+
 const BOOT_TYPE_OPTIONS = [
   { value: "", label: "Default (import-detected)" },
   { value: "BIOS", label: "BIOS" },
@@ -375,6 +391,22 @@ function mergeConfigDefaultEnvironments(current, defaults) {
   return next;
 }
 
+function stripConfigEnvironments(state) {
+  return {
+    ...DEFAULT_ENV_STATE,
+    ...state,
+    vcenters: (state?.vcenters || []).filter((item) => item?.source !== "config"),
+    cloudstacks: (state?.cloudstacks || []).filter((item) => item?.source !== "config"),
+  };
+}
+
+function hasUserEnvironments(state) {
+  return Boolean(
+    (state?.vcenters || []).some((item) => item?.source !== "config") ||
+      (state?.cloudstacks || []).some((item) => item?.source !== "config")
+  );
+}
+
 async function apiRequest(path, options = {}) {
   const { headers: customHeaders = {}, ...fetchOptions } = options;
   const response = await fetch(`${API_BASE}${path}`, {
@@ -434,6 +466,10 @@ export default function App() {
   const [logs, setLogs] = useState({ stdout: "", stderr: "", stdout_path: "", stderr_path: "", job_id: "" });
   const [logsBusy, setLogsBusy] = useState(false);
   const [toasts, setToasts] = useState([]);
+  const [envLoaded, setEnvLoaded] = useState(false);
+  const [envStorageMessage, setEnvStorageMessage] = useState("Loading shared profiles...");
+  const [batchMode, setBatchMode] = useState(false);
+  const [batchDraft, setBatchDraft] = useState(emptyBatchDraft);
 
   const [envState, setEnvState] = useState(() => {
     try {
@@ -447,17 +483,60 @@ export default function App() {
 
   useEffect(() => {
     localStorage.setItem(ENV_STORAGE_KEY, JSON.stringify(envState));
-  }, [envState]);
+    if (!envLoaded) return;
+    const serverState = stripConfigEnvironments(envState);
+    const timer = setTimeout(() => {
+      apiRequest("/environments", {
+        method: "PUT",
+        body: JSON.stringify(serverState),
+      })
+        .then(() => setEnvStorageMessage("Profiles are shared from the migration server."))
+        .catch(() => setEnvStorageMessage("Profiles are cached in this browser; server profile save failed."));
+    }, 350);
+    return () => clearTimeout(timer);
+  }, [envLoaded, envState]);
 
   useEffect(() => {
     let cancelled = false;
     (async () => {
+      const localState = (() => {
+        try {
+          const raw = localStorage.getItem(ENV_STORAGE_KEY);
+          if (!raw) return DEFAULT_ENV_STATE;
+          return { ...DEFAULT_ENV_STATE, ...JSON.parse(raw) };
+        } catch {
+          return DEFAULT_ENV_STATE;
+        }
+      })();
+      let nextState = localState;
+      let defaults = null;
+      let loadedFromServer = false;
       try {
-        const defaults = await apiRequest("/environments/defaults");
+        const [sharedResult, defaultsResult] = await Promise.allSettled([
+          apiRequest("/environments"),
+          apiRequest("/environments/defaults"),
+        ]);
         if (cancelled) return;
-        setEnvState((prev) => mergeConfigDefaultEnvironments(prev, defaults));
+        if (defaultsResult.status === "fulfilled") {
+          defaults = defaultsResult.value;
+        }
+        if (sharedResult.status === "fulfilled") {
+          loadedFromServer = true;
+          const sharedState = { ...DEFAULT_ENV_STATE, ...sharedResult.value };
+          nextState = hasUserEnvironments(sharedState) ? sharedState : localState;
+        }
+        setEnvState(mergeConfigDefaultEnvironments(nextState, defaults));
+        setEnvStorageMessage(
+          loadedFromServer
+            ? "Profiles are shared from the migration server."
+            : "Profiles are cached in this browser; shared profile endpoint is unavailable."
+        );
+        setEnvLoaded(true);
       } catch {
-        // Keep working with local env profiles if defaults endpoint is unavailable.
+        if (cancelled) return;
+        setEnvState(mergeConfigDefaultEnvironments(localState, defaults));
+        setEnvStorageMessage("Profiles are cached in this browser; shared profile endpoint is unavailable.");
+        setEnvLoaded(true);
       }
     })();
     return () => {
@@ -691,6 +770,12 @@ export default function App() {
   const activeZoneNetworksError = activeZoneID ? networkErrorsByZone[activeZoneID] || "" : "";
   const serviceOfferingsForActiveZone = useMemo(() => filterByZone(serviceOfferings, activeZoneID), [serviceOfferings, activeZoneID]);
   const diskOfferingsForActiveZone = useMemo(() => filterByZone(diskOfferings, activeZoneID), [diskOfferings, activeZoneID]);
+  const batchZoneID = batchDraft.zoneid || activeDraft?.zoneid || defaultSelections.zoneid || "";
+  const clustersForBatchZone = useMemo(() => filterByZone(clusters, batchZoneID), [clusters, batchZoneID]);
+  const storagePoolsForBatchZone = useMemo(() => filterByZone(storagePools, batchZoneID), [storagePools, batchZoneID]);
+  const networksForBatchZone = useMemo(() => networksForZone(batchZoneID), [batchZoneID, networksForZone]);
+  const serviceOfferingsForBatchZone = useMemo(() => filterByZone(serviceOfferings, batchZoneID), [serviceOfferings, batchZoneID]);
+  const diskOfferingsForBatchZone = useMemo(() => filterByZone(diskOfferings, batchZoneID), [diskOfferings, batchZoneID]);
   const requiredNetworkZoneIDs = useMemo(
     () =>
       uniqueNonEmptyStrings([
@@ -801,6 +886,9 @@ export default function App() {
   );
 
   const loadInventory = useCallback(async () => {
+    if (!selectedVcenter || !selectedCloudstack) {
+      return;
+    }
     setInventoryBusy(true);
     try {
       const requests = [
@@ -888,7 +976,7 @@ export default function App() {
     } finally {
       setInventoryBusy(false);
     }
-  }, [cloudstackHeaders, mapInventoryDisks, mapInventoryNics, networksForZone, pushToast, vmwareHeaders, vmwareVmsPath]);
+  }, [cloudstackHeaders, mapInventoryDisks, mapInventoryNics, networksForZone, pushToast, selectedCloudstack, selectedVcenter, vmwareHeaders, vmwareVmsPath]);
 
   const refreshSelectedVmDetails = useCallback(async () => {
     if (selectedVmNames.length === 0) {
@@ -1107,6 +1195,135 @@ export default function App() {
     [updateActiveDraft]
   );
 
+  const updateBatchField = useCallback(
+    (field, value) => {
+      if (field === "zoneid" && value) {
+        loadNetworksForZone(value, { silent: true }).catch(() => {});
+      }
+      setBatchDraft((prev) => {
+        const next = { ...prev, [field]: value };
+        if (field === "zoneid") {
+          next.clusterid = pickValidOrFirst("", filterByZone(clusters, value));
+          next.serviceofferingid = pickValidOrFirst("", filterByZone(serviceOfferings, value));
+          next.boot_storageid = pickValidOrFirst("", filterByZone(storagePools, value));
+          next.data_storageid = next.boot_storageid;
+          next.data_diskofferingid = pickValidOrFirst("", filterByZone(diskOfferings, value));
+          next.networkid = pickValidOrFirst("", networksForZone(value));
+        }
+        if (field === "boottype" && value !== "UEFI") {
+          next.bootmode = "";
+        }
+        return next;
+      });
+    },
+    [clusters, diskOfferings, loadNetworksForZone, networksForZone, serviceOfferings, storagePools]
+  );
+
+  const updateBatchMigrationField = useCallback((field, value) => {
+    setBatchDraft((prev) => ({
+      ...prev,
+      migration: {
+        ...normalizeMigration(prev.migration),
+        [field]: value,
+      },
+    }));
+  }, []);
+
+  const seedBatchFromActive = useCallback(() => {
+    if (!activeDraft) {
+      setBatchDraft(emptyBatchDraft);
+      return;
+    }
+    const firstDataDisk = (activeDraft.disks || []).find((disk) => disk.diskType !== "os");
+    const firstNIC = (activeDraft.nics || [])[0];
+    setBatchDraft({
+      zoneid: activeDraft.zoneid || "",
+      clusterid: activeDraft.clusterid || "",
+      serviceofferingid: activeDraft.serviceofferingid || "",
+      boot_storageid: activeDraft.boot_storageid || "",
+      data_storageid: firstDataDisk?.storageid || activeDraft.boot_storageid || "",
+      data_diskofferingid: firstDataDisk?.diskofferingid || "",
+      networkid: firstNIC?.networkid || "",
+      ostypeid: activeDraft.ostypeid || "",
+      boottype: activeDraft.boottype || "",
+      bootmode: activeDraft.boottype === "UEFI" ? activeDraft.bootmode || "" : "",
+      rootdiskcontroller: activeDraft.rootdiskcontroller || "",
+      nicadapter: activeDraft.nicadapter || "",
+      migration: normalizeMigration(activeDraft.migration),
+    });
+  }, [activeDraft]);
+
+  const applyBatchToSelected = useCallback(() => {
+    if (selectedVmNames.length === 0) {
+      pushToast("error", "Select at least one VM before applying batch settings.");
+      return;
+    }
+    const zoneid = batchDraft.zoneid || defaultSelections.zoneid || "";
+    const zoneClusters = filterByZone(clusters, zoneid);
+    const zoneStorage = filterByZone(storagePools, zoneid);
+    const zoneNetworks = networksForZone(zoneid);
+    const zoneServiceOfferings = filterByZone(serviceOfferings, zoneid);
+    const zoneDiskOfferings = filterByZone(diskOfferings, zoneid);
+    const clusterid = pickValidOrFirst(batchDraft.clusterid, zoneClusters);
+    const serviceofferingid = pickValidOrFirst(batchDraft.serviceofferingid, zoneServiceOfferings);
+    const bootStorageID = pickValidOrFirst(batchDraft.boot_storageid, zoneStorage);
+    const dataStorageID = pickValidOrFirst(batchDraft.data_storageid || bootStorageID, zoneStorage);
+    const dataDiskOfferingID = pickValidOrFirst(batchDraft.data_diskofferingid, zoneDiskOfferings);
+    const primaryNetworkID = pickValidOrFirst(batchDraft.networkid, zoneNetworks);
+    const migration = normalizeMigration(batchDraft.migration);
+
+    setVmSpecsByName((prev) => {
+      const next = { ...prev };
+      selectedVmNames.forEach((vmName) => {
+        const draft = next[vmName];
+        if (!draft) return;
+        next[vmName] = {
+          ...draft,
+          zoneid,
+          clusterid,
+          serviceofferingid,
+          boot_storageid: bootStorageID,
+          ostypeid: batchDraft.ostypeid || "",
+          boottype: batchDraft.boottype || "",
+          bootmode: batchDraft.boottype === "UEFI" ? batchDraft.bootmode || "" : "",
+          rootdiskcontroller: batchDraft.rootdiskcontroller || "",
+          nicadapter: batchDraft.nicadapter || "",
+          migration,
+          disks: (draft.disks || []).map((disk) => {
+            if (disk.diskType === "os") {
+              return { ...disk, storageid: bootStorageID };
+            }
+            return {
+              ...disk,
+              storageid: dataStorageID,
+              diskofferingid: dataDiskOfferingID || disk.diskofferingid || "",
+            };
+          }),
+          nics: (draft.nics || []).map((nic, index) => ({
+            ...nic,
+            networkid: index === 0 && primaryNetworkID ? primaryNetworkID : nic.networkid,
+          })),
+        };
+      });
+      return next;
+    });
+    if (zoneid) {
+      loadNetworksForZone(zoneid, { silent: true }).catch(() => {});
+    }
+    pushToast("success", `Applied batch settings to ${selectedVmNames.length} selected VM(s).`);
+  }, [
+    batchDraft,
+    clusters,
+    defaultSelections.zoneid,
+    diskOfferings,
+    loadNetworksForZone,
+    networksForZone,
+    pushToast,
+    selectedVmNames,
+    serviceOfferings,
+    storagePools,
+  ]);
+
   const updateDisk = useCallback(
     (unit, field, value) => {
       updateActiveDraft((draft) => ({
@@ -1314,6 +1531,18 @@ export default function App() {
     [cloudstackHeaders, pushToast, refreshJobs, vmwareHeaders]
   );
 
+  const clearJobHistory = useCallback(async () => {
+    try {
+      const response = await apiRequest("/migration/jobs/clear", { method: "POST" });
+      pushToast("success", response?.message || "Cleared finished job history.");
+      setStatusByJob({});
+      setSelectedJob(null);
+      await refreshJobs();
+    } catch (err) {
+      pushToast("error", err.message || "Failed to clear job history.");
+    }
+  }, [pushToast, refreshJobs]);
+
   const selectedVmStatus = selectedJob ? statusByJob[selectedJob.job_id] || null : null;
   const selectedSettingsRows = useMemo(
     () =>
@@ -1394,7 +1623,7 @@ export default function App() {
       <main className="page-shell">
         {tab === "new" ? (
           <div className="section-stack">
-          <EnvironmentManager envState={envState} onChange={setEnvState} onToast={pushToast} />
+          <EnvironmentManager envState={envState} onChange={setEnvState} onToast={pushToast} storageMessage={envStorageMessage} />
 
           <VMSelector
             vmOptions={vmOptions}
@@ -1411,6 +1640,82 @@ export default function App() {
             onRefreshSelected={refreshSelectedVmDetails}
             loading={vmDisksLoading}
           />
+
+            {selectedVmNames.length > 1 ? (
+              <section className="panel batch-panel">
+                <div className="panel-header">
+                  <div>
+                    <h2>Batch Migration Settings</h2>
+                    <p className="hint">Apply common CloudStack, controller, NIC, and cutover settings to all selected VMs.</p>
+                  </div>
+                  <label className="checkbox-field batch-toggle">
+                    <input
+                      type="checkbox"
+                      checked={batchMode}
+                      onChange={(e) => {
+                        setBatchMode(e.target.checked);
+                        if (e.target.checked) seedBatchFromActive();
+                      }}
+                    />
+                    Batch mode
+                  </label>
+                </div>
+                {batchMode ? (
+                  <>
+                    <div className="form-grid">
+                      <label>Zone<select value={batchDraft.zoneid} onChange={(e) => updateBatchField("zoneid", e.target.value)}><option value="">Select zone</option>{zones.map((item) => <option key={item.id} value={item.id}>{optionLabel(item)}</option>)}</select></label>
+                      <label>Cluster<select value={batchDraft.clusterid} onChange={(e) => updateBatchField("clusterid", e.target.value)}><option value="">Select cluster</option>{clustersForBatchZone.map((item) => <option key={item.id} value={item.id}>{optionLabel(item)}</option>)}</select></label>
+                      <label>Service Offering<select value={batchDraft.serviceofferingid} onChange={(e) => updateBatchField("serviceofferingid", e.target.value)}><option value="">Select service offering</option>{serviceOfferingsForBatchZone.map((item) => <option key={item.id} value={item.id}>{optionLabel(item)}</option>)}</select></label>
+                      <label>Boot Storage<select value={batchDraft.boot_storageid} onChange={(e) => updateBatchField("boot_storageid", e.target.value)}><option value="">Select boot storage</option>{storagePoolsForBatchZone.map((item) => <option key={item.id} value={item.id}>{storagePoolOptionLabel(item)}</option>)}</select></label>
+                      <label>Data Disk Storage<select value={batchDraft.data_storageid} onChange={(e) => updateBatchField("data_storageid", e.target.value)}><option value="">Use boot storage</option>{storagePoolsForBatchZone.map((item) => <option key={item.id} value={item.id}>{storagePoolOptionLabel(item)}</option>)}</select></label>
+                      <label>Data Disk Offering<select value={batchDraft.data_diskofferingid} onChange={(e) => updateBatchField("data_diskofferingid", e.target.value)}><option value="">Keep existing / none</option>{diskOfferingsForBatchZone.map((item) => <option key={item.id} value={item.id}>{optionLabel(item)}</option>)}</select></label>
+                      <label>Primary NIC Network<select value={batchDraft.networkid} onChange={(e) => updateBatchField("networkid", e.target.value)}><option value="">Keep existing</option>{networksForBatchZone.map((item) => <option key={item.id} value={item.id}>{optionLabel(item)}</option>)}</select></label>
+                      <label>Guest OS Mapping<select value={batchDraft.ostypeid} onChange={(e) => updateBatchField("ostypeid", e.target.value)}><option value="">Default / leave unchanged</option>{osTypes.map((item) => <option key={item.id} value={item.id}>{item.description || item.name || item.id}</option>)}</select></label>
+                      <label>Firmware / Boot Type<select value={batchDraft.boottype} onChange={(e) => updateBatchField("boottype", e.target.value)}>{BOOT_TYPE_OPTIONS.map((item) => <option key={item.value || "default"} value={item.value}>{item.label}</option>)}</select></label>
+                      <label>UEFI Boot Mode<select value={batchDraft.bootmode} onChange={(e) => updateBatchField("bootmode", e.target.value)} disabled={batchDraft.boottype !== "UEFI"}>{UEFI_BOOT_MODE_OPTIONS.map((item) => <option key={item.value || "default"} value={item.value}>{item.label}</option>)}</select></label>
+                      <label>Root Disk Controller<select value={batchDraft.rootdiskcontroller} onChange={(e) => updateBatchField("rootdiskcontroller", e.target.value)}>{ROOT_DISK_CONTROLLER_OPTIONS.map((item) => <option key={item.value || "default"} value={item.value}>{item.label}</option>)}</select></label>
+                      <label>NIC Adapter<select value={batchDraft.nicadapter} onChange={(e) => updateBatchField("nicadapter", e.target.value)}>{NIC_ADAPTER_OPTIONS.map((item) => <option key={item.value || "default"} value={item.value}>{item.label}</option>)}</select></label>
+                      <StrategyField label="Delta Interval (sec)" helpKey="delta_interval" openHelpKey={openHelpKey} onToggleHelp={(key) => setOpenHelpKey((current) => current === key ? "" : key)}>
+                        <input type="number" min="1" value={batchDraft.migration.delta_interval} onChange={(e) => updateBatchMigrationField("delta_interval", e.target.value)} />
+                      </StrategyField>
+                      <StrategyField label="Finalize At (ISO)" helpKey="finalize_at" openHelpKey={openHelpKey} onToggleHelp={(key) => setOpenHelpKey((current) => current === key ? "" : key)}>
+                        <input value={batchDraft.migration.finalize_at} onChange={(e) => updateBatchMigrationField("finalize_at", e.target.value)} placeholder="2026-03-12T23:30:00+00:00" />
+                      </StrategyField>
+                      <StrategyField label="Finalize Delta Interval" helpKey="finalize_delta_interval" openHelpKey={openHelpKey} onToggleHelp={(key) => setOpenHelpKey((current) => current === key ? "" : key)}>
+                        <input type="number" min="1" value={batchDraft.migration.finalize_delta_interval} onChange={(e) => updateBatchMigrationField("finalize_delta_interval", e.target.value)} />
+                      </StrategyField>
+                      <StrategyField label="Finalize Settle Delay (sec)" helpKey="finalize_settle_seconds" openHelpKey={openHelpKey} onToggleHelp={(key) => setOpenHelpKey((current) => current === key ? "" : key)}>
+                        <input type="number" min="1" value={batchDraft.migration.finalize_settle_seconds} onChange={(e) => updateBatchMigrationField("finalize_settle_seconds", e.target.value)} placeholder="Default: 30 Windows / 15 Linux" />
+                      </StrategyField>
+                      <StrategyField label="Finalize Window" helpKey="finalize_window" openHelpKey={openHelpKey} onToggleHelp={(key) => setOpenHelpKey((current) => current === key ? "" : key)}>
+                        <input type="number" min="1" value={batchDraft.migration.finalize_window} onChange={(e) => updateBatchMigrationField("finalize_window", e.target.value)} />
+                      </StrategyField>
+                      <StrategyField label="Shutdown Mode" helpKey="shutdown_mode" openHelpKey={openHelpKey} onToggleHelp={(key) => setOpenHelpKey((current) => current === key ? "" : key)}>
+                        <select value={batchDraft.migration.shutdown_mode} onChange={(e) => updateBatchMigrationField("shutdown_mode", e.target.value)}>
+                          {SHUTDOWN_MODE_OPTIONS.map((item) => <option key={item.value || "default"} value={item.value}>{item.label}</option>)}
+                        </select>
+                      </StrategyField>
+                      <StrategyField label="Snapshot Quiesce" helpKey="snapshot_quiesce" openHelpKey={openHelpKey} onToggleHelp={(key) => setOpenHelpKey((current) => current === key ? "" : key)}>
+                        <select value={batchDraft.migration.snapshot_quiesce} onChange={(e) => updateBatchMigrationField("snapshot_quiesce", e.target.value)}>
+                          {SNAPSHOT_QUIESCE_OPTIONS.map((item) => <option key={item.value || "default"} value={item.value}>{item.label}</option>)}
+                        </select>
+                      </StrategyField>
+                      <StrategyField label="Start Imported VM" helpKey="start_vm_after_import" openHelpKey={openHelpKey} onToggleHelp={(key) => setOpenHelpKey((current) => current === key ? "" : key)} className="checkbox-field checkbox-field-with-help">
+                        <span className="checkbox-inline batch-checkbox-inline">
+                          <input type="checkbox" checked={Boolean(batchDraft.migration.start_vm_after_import)} onChange={(e) => updateBatchMigrationField("start_vm_after_import", e.target.checked)} />
+                          <span>Start imported VM after CloudStack import</span>
+                        </span>
+                      </StrategyField>
+                    </div>
+                    <div className="actions">
+                      <button onClick={applyBatchToSelected}>Apply to Selected VMs ({selectedVmNames.length})</button>
+                      <button className="secondary" onClick={seedBatchFromActive}>Copy Active VM Settings</button>
+                    </div>
+                    <p className="hint small">Primary NIC Network applies to the first NIC on each VM. VMs with additional NICs still need per-VM NIC review to keep mappings unique.</p>
+                  </>
+                ) : null}
+              </section>
+            ) : null}
 
             {activeDraft ? (
               <>
@@ -1603,6 +1908,7 @@ export default function App() {
             onShutdownManual={(vmName) => shutdownVm(vmName, "manual")}
             onRetry={retryVm}
             onRetryDebug={(job) => retryVm(job, true)}
+            onClearJobHistory={clearJobHistory}
             logsSection={
               <div className="logs-pane">
                 <div className="subsection-title-row">

@@ -50,15 +50,15 @@ type apiJob struct {
 	Error      string     `json:"error,omitempty"`
 	RuntimeDir string     `json:"runtime_dir,omitempty"`
 
-	StageSnapshot               string    `json:"-"`
-	NextStageSnapshot           string    `json:"-"`
-	ProgressSnapshot            float64   `json:"-"`
-	TransferSpeedSnapshot       float64   `json:"-"`
-	FinalizeRequestedSnapshot   bool      `json:"-"`
-	FinalizeNowRequestedSnapshot bool     `json:"-"`
-	UpdatedAtSnapshot           time.Time `json:"-"`
-	EnvOverrides                runEnvOverrides `json:"-"`
-	DebugVirtV2V                bool      `json:"debug_virt_v2v,omitempty"`
+	StageSnapshot                string          `json:"-"`
+	NextStageSnapshot            string          `json:"-"`
+	ProgressSnapshot             float64         `json:"-"`
+	TransferSpeedSnapshot        float64         `json:"-"`
+	FinalizeRequestedSnapshot    bool            `json:"-"`
+	FinalizeNowRequestedSnapshot bool            `json:"-"`
+	UpdatedAtSnapshot            time.Time       `json:"-"`
+	EnvOverrides                 runEnvOverrides `json:"-"`
+	DebugVirtV2V                  bool            `json:"debug_virt_v2v,omitempty"`
 }
 
 type runEnvOverrides struct {
@@ -86,6 +86,33 @@ type apiServer struct {
 	jobs       map[string]*apiJob
 	jobsByVM   map[string][]string
 	httpServer *http.Server
+}
+
+type environmentProfileStore struct {
+	Version              int                            `json:"version"`
+	UpdatedAt            time.Time                      `json:"updated_at"`
+	SelectedVCenterID    string                         `json:"selectedVcenterId"`
+	SelectedCloudStackID string                         `json:"selectedCloudstackId"`
+	VCenters             []vcenterEnvironmentProfile    `json:"vcenters"`
+	CloudStacks          []cloudStackEnvironmentProfile `json:"cloudstacks"`
+}
+
+type vcenterEnvironmentProfile struct {
+	ID       string `json:"id"`
+	Name     string `json:"name"`
+	Host     string `json:"host"`
+	Username string `json:"username"`
+	Password string `json:"password"`
+	Source   string `json:"source,omitempty"`
+}
+
+type cloudStackEnvironmentProfile struct {
+	ID        string `json:"id"`
+	Name      string `json:"name"`
+	APIURL    string `json:"apiUrl"`
+	APIKey    string `json:"apiKey"`
+	SecretKey string `json:"secretKey"`
+	Source    string `json:"source,omitempty"`
 }
 
 type vmwareDiskInfo struct {
@@ -299,6 +326,7 @@ func cmdServe(args []string) error {
 func (s *apiServer) serve(listenAddr string) error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", s.handleHealth)
+	mux.HandleFunc("/environments", s.handleEnvironments)
 	mux.HandleFunc("/environments/defaults", s.handleEnvironmentDefaults)
 	mux.HandleFunc("/vmware/vms", s.handleVMwareVMs)
 	mux.HandleFunc("/cloudstack/zones", s.handleCloudStackZones)
@@ -313,6 +341,7 @@ func (s *apiServer) serve(listenAddr string) error {
 	mux.HandleFunc("/migration/start", s.handleMigrationStart)
 	mux.HandleFunc("/migration/retry/", s.handleMigrationRetry)
 	mux.HandleFunc("/migration/jobs", s.handleMigrationJobs)
+	mux.HandleFunc("/migration/jobs/clear", s.handleMigrationJobsClear)
 	mux.HandleFunc("/migration/status/", s.handleMigrationStatus)
 	mux.HandleFunc("/migration/finalize/", s.handleMigrationFinalize)
 	mux.HandleFunc("/migration/shutdown/", s.handleMigrationShutdown)
@@ -350,7 +379,7 @@ func (s *apiServer) withCORS(next http.Handler) http.Handler {
 				w.Header().Set("Access-Control-Allow-Origin", origin)
 			}
 		}
-		w.Header().Set("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
+		w.Header().Set("Access-Control-Allow-Methods", "GET,POST,PUT,OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type,Authorization,X-VCenter-Host,X-VCenter-User,X-VCenter-Password,X-VCenter-Port,X-VCenter-Verify-SSL,X-CloudStack-Endpoint,X-CloudStack-API-Key,X-CloudStack-Secret-Key,X-CloudStack-Timeout-Seconds")
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
@@ -366,6 +395,173 @@ func (s *apiServer) handleHealth(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+func (s *apiServer) handleEnvironments(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		s.handleEnvironmentsGet(w, r)
+	case http.MethodPut:
+		s.handleEnvironmentsPut(w, r)
+	default:
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+	}
+}
+
+func (s *apiServer) handleEnvironmentsGet(w http.ResponseWriter, r *http.Request) {
+	store, err := s.loadEnvironmentProfiles()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("failed to read environments: %v", err))
+		return
+	}
+	writeJSON(w, http.StatusOK, store)
+}
+
+func (s *apiServer) handleEnvironmentsPut(w http.ResponseWriter, r *http.Request) {
+	var req environmentProfileStore
+	if err := decodeJSONBody(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	store := sanitizeEnvironmentProfiles(req)
+	if err := s.saveEnvironmentProfiles(store); err != nil {
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("failed to save environments: %v", err))
+		return
+	}
+	writeJSON(w, http.StatusOK, store)
+}
+
+func (s *apiServer) environmentProfilesPath() string {
+	return filepath.Join(s.controlDir, "environments.json")
+}
+
+func (s *apiServer) loadEnvironmentProfiles() (environmentProfileStore, error) {
+	path := s.environmentProfilesPath()
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return environmentProfileStore{
+				Version:     1,
+				UpdatedAt: time.Now().UTC(),
+				VCenters:    []vcenterEnvironmentProfile{},
+				CloudStacks: []cloudStackEnvironmentProfile{},
+			}, nil
+		}
+		return environmentProfileStore{}, err
+	}
+	var store environmentProfileStore
+	if err := json.Unmarshal(raw, &store); err != nil {
+		return environmentProfileStore{}, err
+	}
+	return sanitizeEnvironmentProfiles(store), nil
+}
+
+func (s *apiServer) saveEnvironmentProfiles(store environmentProfileStore) error {
+	store = sanitizeEnvironmentProfiles(store)
+	if err := os.MkdirAll(s.controlDir, 0o755); err != nil {
+		return err
+	}
+	raw, err := json.MarshalIndent(store, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(s.environmentProfilesPath(), raw, 0o600)
+}
+
+func sanitizeEnvironmentProfiles(store environmentProfileStore) environmentProfileStore {
+	out := environmentProfileStore{
+		Version:              1,
+		UpdatedAt:            time.Now().UTC(),
+		SelectedVCenterID:    strings.TrimSpace(store.SelectedVCenterID),
+		SelectedCloudStackID: strings.TrimSpace(store.SelectedCloudStackID),
+		VCenters:             make([]vcenterEnvironmentProfile, 0, len(store.VCenters)),
+		CloudStacks:          make([]cloudStackEnvironmentProfile, 0, len(store.CloudStacks)),
+	}
+	seenVC := map[string]struct{}{}
+	for _, item := range store.VCenters {
+		if strings.EqualFold(strings.TrimSpace(item.Source), "config") {
+			continue
+		}
+		item.ID = strings.TrimSpace(item.ID)
+		item.Name = strings.TrimSpace(item.Name)
+		item.Host = strings.TrimSpace(item.Host)
+		item.Username = strings.TrimSpace(item.Username)
+		if item.ID == "" || item.Name == "" || item.Host == "" || item.Username == "" || item.Password == "" {
+			continue
+		}
+		if _, ok := seenVC[item.ID]; ok {
+			continue
+		}
+		item.Source = ""
+		seenVC[item.ID] = struct{}{}
+		out.VCenters = append(out.VCenters, item)
+	}
+	seenCS := map[string]struct{}{}
+	for _, item := range store.CloudStacks {
+		if strings.EqualFold(strings.TrimSpace(item.Source), "config") {
+			continue
+		}
+		item.ID = strings.TrimSpace(item.ID)
+		item.Name = strings.TrimSpace(item.Name)
+		item.APIURL = strings.TrimSpace(item.APIURL)
+		item.APIKey = strings.TrimSpace(item.APIKey)
+		if item.ID == "" || item.Name == "" || item.APIURL == "" || item.APIKey == "" || item.SecretKey == "" {
+			continue
+		}
+		if _, ok := seenCS[item.ID]; ok {
+			continue
+		}
+		item.Source = ""
+		seenCS[item.ID] = struct{}{}
+		out.CloudStacks = append(out.CloudStacks, item)
+	}
+	if !environmentProfileIDExists(out.SelectedVCenterID, out.VCenters) {
+		out.SelectedVCenterID = firstVCenterProfileID(out.VCenters)
+	}
+	if !cloudStackProfileIDExists(out.SelectedCloudStackID, out.CloudStacks) {
+		out.SelectedCloudStackID = firstCloudStackProfileID(out.CloudStacks)
+	}
+	return out
+}
+
+func environmentProfileIDExists(id string, items []vcenterEnvironmentProfile) bool {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return false
+	}
+	for _, item := range items {
+		if item.ID == id {
+			return true
+		}
+	}
+	return false
+}
+
+func cloudStackProfileIDExists(id string, items []cloudStackEnvironmentProfile) bool {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return false
+	}
+	for _, item := range items {
+		if item.ID == id {
+			return true
+		}
+	}
+	return false
+}
+
+func firstVCenterProfileID(items []vcenterEnvironmentProfile) string {
+	if len(items) == 0 {
+		return ""
+	}
+	return items[0].ID
+}
+
+func firstCloudStackProfileID(items []cloudStackEnvironmentProfile) string {
+	if len(items) == 0 {
+		return ""
+	}
+	return items[0].ID
 }
 
 func (s *apiServer) handleEnvironmentDefaults(w http.ResponseWriter, r *http.Request) {
@@ -969,6 +1165,60 @@ func (s *apiServer) handleMigrationJobs(w http.ResponseWriter, r *http.Request) 
 		})
 	}
 	writeJSON(w, http.StatusOK, out)
+}
+
+func (s *apiServer) handleMigrationJobsClear(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	vmName := strings.TrimSpace(r.URL.Query().Get("vm"))
+	includeRunning := parseBool(strings.TrimSpace(r.URL.Query().Get("include_running")), false)
+	removed := 0
+	skippedActive := 0
+
+	s.mu.Lock()
+	for id, job := range s.jobs {
+		if job == nil {
+			delete(s.jobs, id)
+			removed++
+			continue
+		}
+		if vmName != "" && job.VMName != vmName {
+			continue
+		}
+		status := strings.ToLower(strings.TrimSpace(job.Status))
+		active := status == "queued" || status == "running"
+		if active && !includeRunning {
+			skippedActive++
+			continue
+		}
+		delete(s.jobs, id)
+		removed++
+	}
+	for vm, ids := range s.jobsByVM {
+		if vmName != "" && vm != vmName {
+			continue
+		}
+		kept := ids[:0]
+		for _, id := range ids {
+			if _, ok := s.jobs[id]; ok {
+				kept = append(kept, id)
+			}
+		}
+		if len(kept) == 0 {
+			delete(s.jobsByVM, vm)
+		} else {
+			s.jobsByVM[vm] = kept
+		}
+	}
+	s.mu.Unlock()
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"removed":        removed,
+		"skipped_active": skippedActive,
+		"message":        fmt.Sprintf("Cleared %d job history entr%s.", removed, pluralY(removed)),
+	})
 }
 
 func (s *apiServer) handleMigrationFinalize(w http.ResponseWriter, r *http.Request) {
@@ -2603,6 +2853,13 @@ func writeJSON(w http.ResponseWriter, status int, payload any) {
 
 func writeError(w http.ResponseWriter, status int, message string) {
 	writeJSON(w, status, map[string]any{"detail": message})
+}
+
+func pluralY(n int) string {
+	if n == 1 {
+		return "y"
+	}
+	return "ies"
 }
 
 func tailFile(path string, lines int) string {

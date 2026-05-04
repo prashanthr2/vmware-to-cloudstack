@@ -406,6 +406,19 @@ textarea:focus {
   gap: 14px;
 }
 
+.batch-panel {
+  border-color: #b7c9f5;
+  background: linear-gradient(180deg, #ffffff 0%, #f6f9ff 100%);
+}
+
+.batch-toggle {
+  min-width: max-content;
+}
+
+.batch-checkbox-inline {
+  color: var(--text-secondary);
+}
+
 .env-card {
   border: 1px solid var(--line);
   border-radius: var(--radius-md);
@@ -571,6 +584,14 @@ tbody tr:hover {
 .status-stack {
   display: grid;
   gap: 6px;
+}
+
+.progress-header-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 10px;
 }
 
 .pending-actions-panel {

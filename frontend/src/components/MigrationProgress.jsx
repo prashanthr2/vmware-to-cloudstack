@@ -56,6 +56,7 @@ export default function MigrationProgress({
   onShutdownManual,
   onRetry,
   onRetryDebug,
+  onClearJobHistory,
   logsSection,
 }) {
   const pendingJobs = jobs
@@ -73,14 +74,19 @@ export default function MigrationProgress({
     <section className="panel">
       <div className="panel-header">
         <h2>Migration Progress</h2>
-        <label className="checkbox-field">
-          <input
-            type="checkbox"
-            checked={Boolean(showJobHistory)}
-            onChange={(e) => onToggleShowJobHistory(e.target.checked)}
-          />
-          Show History
-        </label>
+        <div className="progress-header-actions">
+          <label className="checkbox-field">
+            <input
+              type="checkbox"
+              checked={Boolean(showJobHistory)}
+              onChange={(e) => onToggleShowJobHistory(e.target.checked)}
+            />
+            Show History
+          </label>
+          <button className="secondary" onClick={onClearJobHistory} disabled={!jobs.length}>
+            Clear Finished History
+          </button>
+        </div>
       </div>
 
       {pendingJobs.length > 0 ? (

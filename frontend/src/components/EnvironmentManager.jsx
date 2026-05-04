@@ -18,7 +18,7 @@ const defaultCloudstackForm = {
   secretKey: "",
 };
 
-export default function EnvironmentManager({ envState, onChange, onToast }) {
+export default function EnvironmentManager({ envState, onChange, onToast, storageMessage }) {
   const [vcForm, setVcForm] = useState(defaultVcenterForm);
   const [csForm, setCsForm] = useState(defaultCloudstackForm);
   const [vcEditId, setVcEditId] = useState("");
@@ -151,7 +151,7 @@ export default function EnvironmentManager({ envState, onChange, onToast }) {
     <section className="panel">
       <div className="panel-header">
         <h2>Environment Manager</h2>
-        <p className="hint">Profiles are stored locally in this browser.</p>
+        <p className="hint">{storageMessage || "Profiles are shared from the migration server."}</p>
       </div>
 
       <div className="env-grid">
